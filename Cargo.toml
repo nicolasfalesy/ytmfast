@@ -1,0 +1,25 @@
+[package]
+name = "ytmfast"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A headless YouTube Music engine for bar widgets, with no browser"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ytmfast"
+path = "src/main.rs"
+
+[dependencies]
+# getuid() for the /run/user/$UID fallback; libc is already in the tree through reqwest.
+libc = "0.2"
+# rustls only (no OpenSSL); http2 because the YouTube hosts speak it and it saves connections.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+thiserror = "2"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"

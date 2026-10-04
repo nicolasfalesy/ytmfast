@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Arch, not the Ubuntu image: it matches the system ytmfast targets, and Ubuntu's
+    # libpipewire is too old for the pipewire crate later steps use.
+    container: archlinux:latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Install toolchain and libraries
+        # git first, so actions/checkout makes a real clone instead of a tarball download.
+        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git
+
+      - uses: actions/checkout@v7
+
+      - name: Note the compiler version
+        id: rustc
+        # Arch's rust package moves often; keying the cache on its version stops a new
+        # compiler from restoring a target folder it can't reuse.
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ steps.rustc.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ steps.rustc.outputs.version }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
