@@ -48,6 +48,7 @@ url = "2.5"
 [dev-dependencies]
 tempfile = "3"
 # net + io-util: a raw TCP test server for the endless chunked answer that wiremock can't send.
-tokio = { version = "1.53.2", features = ["net", "io-util", "rt", "macros", "time"] }
+# test-util: the paused clock for the download backoff test.
+tokio = { version = "1.53.2", features = ["net", "io-util", "rt", "macros", "time", "test-util"] }
 # A local HTTP server standing in for the InnerTube API.
 wiremock = "0.6.5"

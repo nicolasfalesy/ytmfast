@@ -63,6 +63,24 @@ fn redirect_allowed(next: &Url, hops_so_far: usize) -> bool {
 /// Panics only if the TLS backend can't start, which is a broken build, not a runtime
 /// condition worth an error path in every caller.
 pub fn client(user_agent: &str) -> reqwest::Client {
+    builder(user_agent)
+        .timeout(TIMEOUT)
+        .build()
+        .expect("the rustls HTTP client should always build")
+}
+
+/// The client for track downloads: the same allowlist and redirect policy, but no total
+/// deadline. A 10 MiB burst on a slow link can take longer than 10 s and still be healthy;
+/// what must fail fast is a stall, so the 10 s applies to connecting and to each read.
+pub fn stream_client(user_agent: &str) -> reqwest::Client {
+    builder(user_agent)
+        .connect_timeout(TIMEOUT)
+        .read_timeout(TIMEOUT)
+        .build()
+        .expect("the rustls HTTP client should always build")
+}
+
+fn builder(user_agent: &str) -> reqwest::ClientBuilder {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if redirect_allowed(attempt.url(), attempt.previous().len()) {
             attempt.follow()
@@ -74,10 +92,7 @@ pub fn client(user_agent: &str) -> reqwest::Client {
     });
     reqwest::Client::builder()
         .user_agent(user_agent)
-        .timeout(TIMEOUT)
         .redirect(policy)
-        .build()
-        .expect("the rustls HTTP client should always build")
 }
 
 /// Reads `resp`'s body, refusing it once it passes `cap` bytes. The cap is checked on every
@@ -161,5 +176,6 @@ mod tests {
         // Building must not panic outside a tokio runtime (the CLI builds it before
         // starting one in later tasks).
         let _ = client("ytmfast-test/0");
+        let _ = stream_client("ytmfast-test/0");
     }
 }
