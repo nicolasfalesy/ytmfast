@@ -34,9 +34,9 @@ pub struct Innertube {
     session: Arc<Mutex<Session>>,
     store: Arc<dyn SessionStore>,
     base: Url,
-    /// Held across "copy the session, save it" so two answers that both rotate a cookie can't
-    /// save out of order and leave the older copy in the store.
-    save_lock: tokio::sync::Mutex<()>,
+    /// Held across "copy the session, save it" by each background save, so two answers that
+    /// both rotate a cookie can't save out of order and leave the older copy in the store.
+    save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Innertube {
@@ -50,7 +50,7 @@ impl Innertube {
             session,
             store,
             base,
-            save_lock: tokio::sync::Mutex::new(()),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -126,7 +126,7 @@ impl Innertube {
             .await?;
 
         // Before the status check: a 401 can carry cookie deletions worth keeping.
-        self.absorb_set_cookies(&resp).await;
+        self.absorb_set_cookies(&resp);
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -141,9 +141,10 @@ impl Innertube {
         net::read_capped(resp, net::MAX_ANSWER).await
     }
 
-    /// Applies the answer's `Set-Cookie` headers to the session (when the answer came from a
-    /// cookie domain, ruling R10) and saves the session when one of them changed it.
-    async fn absorb_set_cookies(&self, resp: &reqwest::Response) {
+    /// Applies the answer's `Set-Cookie` headers to the in-memory session at once (when the
+    /// answer came from a cookie domain, ruling R10), and starts a background save when one
+    /// of them changed it.
+    fn absorb_set_cookies(&self, resp: &reqwest::Response) {
         let from = resp.url();
         if !cookie_source_allowed(from, &self.base) {
             return;
@@ -159,21 +160,29 @@ impl Innertube {
             }
             changed
         };
-        if !changed {
-            return;
+        if changed {
+            self.save_in_background();
         }
-        let _order = self.save_lock.lock().await;
-        // Copied under the save lock, so the last save always writes the newest session.
-        let snapshot = self
-            .session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Err(e) = self.store.save(&snapshot).await {
-            // The answer itself is fine and the rotation is live in memory, so the request
-            // goes on; the next rotation saves again. The error text is fixed (no secrets).
-            eprintln!("ytmfast: could not save the refreshed session: {e}");
-        }
+    }
+
+    /// Saves the session from a spawned task. Never on the request path: the request's 10 s
+    /// deadline covers reading the body, and a keyring save opens a D-Bus connection and can
+    /// be slow, so an awaited save could turn a good answer into a timeout. The save uses the
+    /// no-prompt path: nobody is waiting to unlock a keyring for a cookie rotation, so a
+    /// locked keyring skips the save (logged) and the session stays current in memory.
+    fn save_in_background(&self) {
+        let session = self.session.clone();
+        let store = self.store.clone();
+        let order = self.save_lock.clone();
+        tokio::spawn(async move {
+            let _order = order.lock().await;
+            // Copied under the save lock, so the last save always writes the newest session.
+            let snapshot = session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Err(e) = store.save_without_prompt(&snapshot).await {
+                // The error text is fixed (no secrets). The next rotation saves again.
+                eprintln!("ytmfast: could not save the refreshed session: {e}");
+            }
+        });
     }
 }
 

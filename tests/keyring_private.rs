@@ -146,4 +146,25 @@ async fn keyring_store_roundtrip_on_a_private_secret_service() {
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label().await.unwrap(), "ytmfast session");
+
+    // The background (cookie rotation) path saves to an unlocked keyring like `save` does...
+    store.save_without_prompt(&session("third")).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), session("third"));
+    // ...but on a locked one it refuses at once instead of raising an unlock prompt. Nothing
+    // here can answer a prompt (no prompter can start on this bus), so a prompt would hang.
+    let collection = service.default_collection().await.unwrap();
+    collection.lock(None).await.unwrap();
+    assert!(collection.is_locked().await.unwrap());
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.save_without_prompt(&session("fourth")),
+    )
+    .await
+    .expect("the no-prompt save waited on a prompt");
+    assert_eq!(
+        refused,
+        Err(Error::Internal(
+            "keyring locked; the refreshed session was not saved".into()
+        ))
+    );
 }

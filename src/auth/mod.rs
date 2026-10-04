@@ -364,6 +364,12 @@ pub trait SessionStore: Send + Sync {
     async fn load(&self) -> Result<Session, Error>;
     /// Stores `s`, replacing any earlier session.
     async fn save(&self, s: &Session) -> Result<(), Error>;
+    /// Stores `s` only if that needs nothing from the user: no unlock prompt. For saves in
+    /// the background (cookie rotations), where nobody is waiting to answer a prompt and a
+    /// prompt would hold the save open. A store with no prompts just saves.
+    async fn save_without_prompt(&self, s: &Session) -> Result<(), Error> {
+        self.save(s).await
+    }
 }
 
 /// An in-memory store, for tests.
@@ -471,30 +477,46 @@ impl SessionStore for KeyringStore {
     }
 
     async fn save(&self, s: &Session) -> Result<(), Error> {
-        let service = oo7::dbus::Service::new()
-            .await
-            .map_err(keyring_unavailable)?;
-        let collection = service
-            .default_collection()
-            .await
-            .map_err(keyring_unavailable)?;
-        unlock(&collection).await?;
-        let json = serde_json::to_string(s)
-            .map_err(|_| Error::Internal("could not encode the session".into()))?;
-        // replace = true: the item with the same attributes is overwritten, so there is
-        // only ever one ytmfast session in the keyring.
-        collection
-            .create_item(
-                KEYRING_LABEL,
-                &KEYRING_ATTRIBUTES,
-                oo7::Secret::text(json),
-                true,
-                None,
-            )
-            .await
-            .map_err(keyring_unavailable)?;
-        Ok(())
+        keyring_save(s, true).await
     }
+
+    async fn save_without_prompt(&self, s: &Session) -> Result<(), Error> {
+        keyring_save(s, false).await
+    }
+}
+
+/// Writes the session to the login keyring. With `prompt` false, a locked collection is an
+/// error instead of an unlock prompt; the caller keeps the session in memory and logs it.
+async fn keyring_save(s: &Session, prompt: bool) -> Result<(), Error> {
+    let service = oo7::dbus::Service::new()
+        .await
+        .map_err(keyring_unavailable)?;
+    let collection = service
+        .default_collection()
+        .await
+        .map_err(keyring_unavailable)?;
+    if prompt {
+        unlock(&collection).await?;
+    } else if collection.is_locked().await.map_err(keyring_unavailable)? {
+        return Err(Error::Internal(
+            "keyring locked; the refreshed session was not saved".into(),
+        ));
+    }
+    let json = serde_json::to_string(s)
+        .map_err(|_| Error::Internal("could not encode the session".into()))?;
+    // replace = true: the item with the same attributes is overwritten, so there is
+    // only ever one ytmfast session in the keyring.
+    collection
+        .create_item(
+            KEYRING_LABEL,
+            &KEYRING_ATTRIBUTES,
+            oo7::Secret::text(json),
+            true,
+            None,
+        )
+        .await
+        .map_err(keyring_unavailable)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -701,6 +723,17 @@ mod tests {
         // Works as the trait object the engine holds (ruling R1).
         let dyn_store: std::sync::Arc<dyn SessionStore> = std::sync::Arc::new(store);
         assert_eq!(dyn_store.load().await.unwrap(), s);
+    }
+
+    #[tokio::test]
+    async fn save_without_prompt_defaults_to_save() {
+        // A store with no prompts (the memory one) saves as usual on the no-prompt path.
+        let store = MemoryStore::new();
+        let s = Session {
+            cookies: vec![cookie(".youtube.com", "SAPISID", "v", "/", true)],
+        };
+        store.save_without_prompt(&s).await.unwrap();
+        assert_eq!(store.load().await.unwrap(), s);
     }
 
     #[tokio::test]

@@ -311,6 +311,24 @@ async fn endless_chunked_answer_is_cut_while_streaming() {
     assert!(started.elapsed() < std::time::Duration::from_secs(8));
 }
 
+fn rotated(s: &Session) -> Option<String> {
+    s.cookies
+        .iter()
+        .find(|c| c.name == "ROTATE")
+        .map(|c| c.value.clone())
+}
+
+/// The session `store` holds once the background save has landed (polls for up to 5 s).
+async fn saved_eventually(store: &dyn SessionStore) -> Session {
+    for _ in 0..500 {
+        if let Ok(s) = store.load().await {
+            return s;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the rotation was never saved");
+}
+
 #[tokio::test]
 async fn set_cookie_saved() {
     let rig = rig().await;
@@ -320,19 +338,115 @@ async fn set_cookie_saved() {
 
     rig.api.player("FAKEVID0001", STS).await.unwrap();
 
-    let saved = rig.store.load().await.expect("the rotation was saved");
-    let rotated = |s: &Session| {
-        s.cookies
-            .iter()
-            .find(|c| c.name == "ROTATE")
-            .map(|c| c.value.clone())
-    };
-    assert_eq!(rotated(&saved).as_deref(), Some("new"));
-    // The live session the next request uses has it too.
+    // The live session the next request uses has it at once.
     assert_eq!(
         rotated(&rig.session.lock().unwrap()).as_deref(),
         Some("new")
     );
+    // The store gets it from a background task, after the answer is back.
+    let saved = saved_eventually(rig.store.as_ref()).await;
+    assert_eq!(rotated(&saved).as_deref(), Some("new"));
+}
+
+#[tokio::test]
+async fn cookie_deletion_on_401_is_saved() {
+    // A rejected session's cookie deletions are applied and saved even though the request
+    // fails.
+    let rig = rig().await;
+    player_mock(
+        ResponseTemplate::new(401).append_header("set-cookie", "ROTATE=; Path=/; Max-Age=0"),
+    )
+    .mount(&rig.server)
+    .await;
+    assert_eq!(
+        rig.api.player("FAKEVID0001", STS).await,
+        Err(Error::SignedOut)
+    );
+    assert_eq!(rotated(&rig.session.lock().unwrap()), None);
+    let saved = saved_eventually(rig.store.as_ref()).await;
+    assert_eq!(rotated(&saved), None);
+    assert_eq!(saved.cookies.len(), 2);
+}
+
+/// A store whose saves take a minute, like a keyring sitting on an unlock prompt.
+struct SlowStore;
+
+#[async_trait::async_trait]
+impl SessionStore for SlowStore {
+    async fn load(&self) -> Result<Session, Error> {
+        Err(Error::SignedOut)
+    }
+    async fn save(&self, _: &Session) -> Result<(), Error> {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn slow_save_does_not_block_player() {
+    let server = MockServer::start().await;
+    player_mock(json_answer(PREMIUM).append_header("set-cookie", "ROTATE=new; Path=/"))
+        .mount(&server)
+        .await;
+    let api = Innertube::new(
+        Arc::new(Mutex::new(session())),
+        Arc::new(SlowStore),
+        Url::parse(&server.uri()).unwrap(),
+    );
+    // Well under the request's 10 s deadline: a save awaited on the request path would
+    // hold the answer for the whole minute (and then fail it as timed out).
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        api.player("FAKEVID0001", STS),
+    )
+    .await
+    .expect("player waited for the save");
+    assert_eq!(answer.unwrap().video_id, "FAKEVID0001");
+}
+
+/// Records which save method was called.
+#[derive(Default)]
+struct RecordingStore {
+    calls: Mutex<Vec<&'static str>>,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for RecordingStore {
+    async fn load(&self) -> Result<Session, Error> {
+        Err(Error::SignedOut)
+    }
+    async fn save(&self, _: &Session) -> Result<(), Error> {
+        self.calls.lock().unwrap().push("save");
+        Ok(())
+    }
+    async fn save_without_prompt(&self, _: &Session) -> Result<(), Error> {
+        self.calls.lock().unwrap().push("save_without_prompt");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn background_save_never_prompts() {
+    // Nobody is there to answer a keyring unlock prompt for a cookie rotation, so the
+    // background save must use the no-prompt path.
+    let server = MockServer::start().await;
+    player_mock(json_answer(PREMIUM).append_header("set-cookie", "ROTATE=new; Path=/"))
+        .mount(&server)
+        .await;
+    let store = Arc::new(RecordingStore::default());
+    let api = Innertube::new(
+        Arc::new(Mutex::new(session())),
+        store.clone(),
+        Url::parse(&server.uri()).unwrap(),
+    );
+    api.player("FAKEVID0001", STS).await.unwrap();
+    for _ in 0..500 {
+        if !store.calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(*store.calls.lock().unwrap(), vec!["save_without_prompt"]);
 }
 
 #[tokio::test]
@@ -342,6 +456,8 @@ async fn unchanged_cookie_is_not_saved() {
         .mount(&rig.server)
         .await;
     rig.api.player("FAKEVID0001", STS).await.unwrap();
+    // Time for a background save to land, if one had been started.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     // Nothing changed, so nothing was written to the store.
     assert_eq!(rig.store.load().await, Err(Error::SignedOut));
 }
