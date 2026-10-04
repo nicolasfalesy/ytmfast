@@ -3,7 +3,8 @@
 //! yt-dlp gets the session from a cookie file in Netscape format, written from the in-memory
 //! session only: the file is created 0600 (with that mode, never chmod-ed after) in a fresh
 //! 0700 folder under the runtime folder (a tmpfs, so the cookies never touch a disk), and the
-//! folder is removed when yt-dlp exits, is killed at the 30 s timeout, or the call is dropped.
+//! folder is removed when yt-dlp exits, is killed at the 30 s timeout, or the call is dropped;
+//! the last two also kill everything yt-dlp started (its process group).
 //! `--ignore-config` and `--no-cookies-from-browser` stop a yt-dlp config file from pointing it
 //! at a browser profile instead.
 
@@ -89,29 +90,27 @@ impl YtDlp for YtDlpCommand {
             // Not read: yt-dlp's messages can quote stream links (ruling R6), and the exit
             // status says enough.
             .stderr(Stdio::null())
-            // Its own process group, so the timeout kills yt-dlp's children too (it runs a JS
-            // runtime for the same challenges).
+            // Its own process group, so stopping it (timeout or cancel) kills yt-dlp's
+            // children too: it runs a JS runtime for the same challenges.
             .process_group(0)
             .kill_on_drop(true);
         let child = cmd
             .spawn()
             .map_err(|_| Error::StreamFailed("could not run yt-dlp".into()))?;
-        let pgid = child.id();
+        // From here until yt-dlp is reaped, dropping this (timeout, error, or the caller
+        // dropping the call when the user skips) kills yt-dlp's whole process group.
+        // `kill_on_drop` alone would kill only yt-dlp and orphan the JS runtime it started.
+        let mut group = GroupKill(child.id().and_then(|p| i32::try_from(p).ok()));
 
         let result = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
         let output = match result {
-            Ok(Ok(output)) => output,
+            Ok(Ok(output)) => {
+                // Reaped: the group id may be reused from now on, so it must not be killed.
+                group.0 = None;
+                output
+            }
             Ok(Err(_)) => return Err(Error::StreamFailed("yt-dlp failed".into())),
             Err(_) => {
-                // The dropped wait already SIGKILLed yt-dlp itself (kill_on_drop); this gets
-                // anything it started.
-                if let Some(pgid) = pgid.and_then(|p| i32::try_from(p).ok()) {
-                    // SAFETY: kill has no memory-safety preconditions; a stale group id at
-                    // worst fails with ESRCH.
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
-                }
                 return Err(Error::StreamFailed(format!(
                     "yt-dlp took over {} s",
                     self.timeout.as_secs()
@@ -129,6 +128,21 @@ impl YtDlp for YtDlpCommand {
             return Err(Error::StreamFailed("yt-dlp's answer is too large".into()));
         }
         Ok(output.stdout)
+    }
+}
+
+/// Kills a process group when dropped, unless its id was taken out (`None`).
+struct GroupKill(Option<i32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: kill has no memory-safety preconditions. The group's leader is not
+            // reaped yet (the id is cleared once it is), so the id can't name another group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
     }
 }
 

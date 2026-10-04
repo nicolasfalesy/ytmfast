@@ -150,6 +150,19 @@ pub fn load_cached(dir: &Path, id: &str, suffix: &str) -> Option<String> {
     Some(text)
 }
 
+/// When a cache file was last written or used (its mtime), without touching it.
+pub fn modified(dir: &Path, id: &str, suffix: &str) -> Option<SystemTime> {
+    let path = cache_path(dir, id, suffix)?;
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Deletes a cache file, if it is there.
+pub fn remove_cached(dir: &Path, id: &str, suffix: &str) {
+    if let Some(path) = cache_path(dir, id, suffix) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Writes a cache file (whole or not at all: written to a temp name, then renamed, so a
 /// crash can't leave a cut-off script that would later fail to solve), then prunes the folder
 /// to the newest `KEEP_PLAYERS` versions.

@@ -38,6 +38,16 @@ const EXPIRY_MARGIN_SECS: u64 = 30 * 60;
 /// link stops working) always asks again.
 const PLAYER_ID_TTL: Duration = Duration::from_secs(3600);
 
+/// How long a player version the solver failed on is skipped (straight to yt-dlp) before the
+/// own-code path tries it again. The frozen solver scripts may simply not handle a newer
+/// player, and each try costs a cold solve (seconds of CPU and a ~190 MiB spike); but the
+/// failure may also have been a deadline hit on a throttled CPU, so it isn't forever.
+const FAILED_PLAYER_RETRY: Duration = Duration::from_secs(6 * 3600);
+
+/// The marker file `players/{id}.failed`: its mtime is when the solver failed on that
+/// version, so a restarted engine doesn't pay for the failure again.
+const FAILED_SUFFIX: &str = "failed";
+
 /// The most links kept. A queue rarely holds more songs than this; expired links go first.
 const MAX_CACHED_LINKS: usize = 64;
 
@@ -114,6 +124,8 @@ pub struct Streams {
     /// The current player version and its signature timestamp, and when they were read.
     player: Mutex<Option<(String, u32, Instant)>>,
     links: Mutex<HashMap<String, Stream>>,
+    /// Player versions the solver failed on, and when (mirrors the marker files).
+    failed_players: Mutex<HashMap<String, SystemTime>>,
 }
 
 impl Streams {
@@ -136,6 +148,7 @@ impl Streams {
             players_dir: cache_dir.join("players"),
             player: Mutex::new(None),
             links: Mutex::new(HashMap::new()),
+            failed_players: Mutex::new(HashMap::new()),
         }
     }
 
@@ -152,6 +165,10 @@ impl Streams {
             Ok(stream) => return Ok(stream),
             Err(e) => e,
         };
+        // Forget the player version: the next resolve asks for the current one instead of
+        // reusing a version that may be why this failed, for up to `PLAYER_ID_TTL`. If it is
+        // the same version and the solver failed on it, `current_player` skips it at once.
+        *self.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The code only: messages are short and fixed, but the code is all a log needs.
         eprintln!(
             "ytmfast: own stream link failed ({}); trying yt-dlp",
@@ -202,7 +219,16 @@ impl Streams {
                 .iter()
                 .map(|(kind, challenges)| (*kind, challenges[0].clone()))
                 .collect();
-            let answers = self.solver.solve_batch(&player_id, code, requests).await?;
+            let answers = match self.solver.solve_batch(&player_id, code, requests).await {
+                Ok(answers) => {
+                    self.clear_player_failed(&player_id);
+                    answers
+                }
+                Err(e) => {
+                    self.mark_player_failed(&player_id);
+                    return Err(e);
+                }
+            };
             for ((kind, challenge), answer) in asked.into_iter().zip(answers) {
                 let value = answer.get(&challenge).cloned();
                 match kind {
@@ -219,14 +245,21 @@ impl Streams {
     /// read for them (so a cold solve doesn't read it twice).
     async fn current_player(&self, fresh: bool) -> Result<(String, u32, Option<String>), Error> {
         if !fresh {
-            let memo = self.player.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((id, sts, at)) = memo.as_ref()
+            let memo = self
+                .player
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some((id, sts, at)) = memo
                 && at.elapsed() < PLAYER_ID_TTL
             {
-                return Ok((id.clone(), *sts, None));
+                self.check_player_not_failed(&id)?;
+                return Ok((id, sts, None));
             }
         }
         let id = player_js::current_player_id_at(&self.http, &self.web_base).await?;
+        // Before reading the 3 MB script: a version the solver failed on needs none of it.
+        self.check_player_not_failed(&id)?;
         let code = self.player_code(&id).await?;
         let sts = player_js::sts(&code).ok_or_else(|| {
             Error::StreamFailed("the player script has no signature timestamp".into())
@@ -234,6 +267,63 @@ impl Streams {
         *self.player.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((id.clone(), sts, Instant::now()));
         Ok((id, sts, Some(code)))
+    }
+
+    /// `StreamFailed` when the solver failed on player `id` less than `FAILED_PLAYER_RETRY`
+    /// ago, in this process or (from the marker file) an earlier one.
+    fn check_player_not_failed(&self, id: &str) -> Result<(), Error> {
+        let mut failed = self
+            .failed_players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let at = match failed.get(id) {
+            Some(at) => Some(*at),
+            None => {
+                let at = player_js::modified(&self.players_dir, id, FAILED_SUFFIX);
+                if let Some(at) = at {
+                    failed.insert(id.to_string(), at);
+                }
+                at
+            }
+        };
+        // A mark from the future (the clock was set back) counts as stale: better one retry
+        // than a version skipped for good.
+        let recent = at.is_some_and(|at| {
+            SystemTime::now()
+                .duration_since(at)
+                .is_ok_and(|age| age < FAILED_PLAYER_RETRY)
+        });
+        if recent {
+            return Err(Error::StreamFailed(
+                "the challenge solver failed on this player version".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mark_player_failed(&self, id: &str) {
+        self.failed_players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), SystemTime::now());
+        // A failed write only means a restarted engine tries this version once more.
+        if let Err(e) = player_js::store_cached(&self.players_dir, id, FAILED_SUFFIX, "") {
+            eprintln!("ytmfast: could not note the failed player version: {e}");
+        }
+    }
+
+    /// Clears a mark after the solver worked on `id` (a stale mark that was retried).
+    fn clear_player_failed(&self, id: &str) {
+        let was_marked = self
+            .failed_players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+            .is_some();
+        // Only then: an unmarked version (the usual case) costs no file system call.
+        if was_marked {
+            player_js::remove_cached(&self.players_dir, id, FAILED_SUFFIX);
+        }
     }
 
     /// Player `id`'s script, from the cache folder or downloaded (and then cached).

@@ -83,6 +83,8 @@ type SolveCall = (String, Option<String>, Vec<(ChallengeKind, Vec<String>)>);
 struct FakeSolver {
     answers: HashMap<String, String>,
     fail: bool,
+    /// Player versions it fails on (as the frozen scripts would on a newer player).
+    fail_players: Vec<String>,
     /// What `has_player` says: true means `Streams` need not send the player code.
     cached: bool,
     calls: Mutex<Vec<SolveCall>>,
@@ -123,7 +125,7 @@ impl ChallengeSolver for FakeSolver {
             .lock()
             .unwrap()
             .push((player_id.into(), player_code, requests.clone()));
-        if self.fail {
+        if self.fail || self.fail_players.iter().any(|p| p == player_id) {
             return Err(Error::StreamFailed("challenge solver: fake failure".into()));
         }
         Ok(requests
@@ -230,27 +232,50 @@ struct Rig {
     streams: Streams,
     solver: Arc<FakeSolver>,
     ytdlp: Arc<FakeYtDlp>,
-    _cache: tempfile::TempDir,
+    api: Arc<Innertube>,
+    session: Arc<Mutex<Session>>,
+    cache: tempfile::TempDir,
+}
+
+impl Rig {
+    /// A new `Streams` on the same cache folder, server and fakes: a restarted engine.
+    fn restart(&self) -> Streams {
+        Streams::new(
+            self.api.clone(),
+            self.session.clone(),
+            self.solver.clone(),
+            self.ytdlp.clone(),
+            self.cache.path().to_path_buf(),
+        )
+        .with_web_base(Url::parse(&self.server.uri()).unwrap())
+    }
+}
+
+/// Serves `id` as the current player version, for the next `times` asks (all, if `None`).
+async fn mount_player_version(server: &MockServer, id: &str, times: Option<u64>) {
+    let mock = Mock::given(method("GET"))
+        .and(path("/iframe_api"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r"var scriptUrl = 'https:\/\/www.youtube.com\/s\/player\/{id}\/www-widgetapi.vflset\/www-widgetapi.js';"
+        )));
+    match times {
+        Some(n) => mock.up_to_n_times(n).mount(server).await,
+        None => mock.mount(server).await,
+    }
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/s/player/{id}/player_ias.vflset/en_US/base.js"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(PLAYER_JS))
+        .mount(server)
+        .await;
 }
 
 /// Mounts the player version and script; the `player` answer is mounted by each test (so it
 /// can count calls) unless `player` is given.
 async fn rig(player: Option<Value>, solver: FakeSolver, ytdlp: FakeYtDlp) -> Rig {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/iframe_api"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            r"var scriptUrl = 'https:\/\/www.youtube.com\/s\/player\/{PLAYER}\/www-widgetapi.vflset\/www-widgetapi.js';"
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/s/player/{PLAYER}/player_ias.vflset/en_US/base.js"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_string(PLAYER_JS))
-        .mount(&server)
-        .await;
+    mount_player_version(&server, PLAYER, None).await;
     if let Some(p) = player {
         mount_player(&server, p, None).await;
     }
@@ -265,8 +290,8 @@ async fn rig(player: Option<Value>, solver: FakeSolver, ytdlp: FakeYtDlp) -> Rig
     let ytdlp = Arc::new(ytdlp);
     let cache = tempfile::tempdir().unwrap();
     let streams = Streams::new(
-        api,
-        session,
+        api.clone(),
+        session.clone(),
         solver.clone(),
         ytdlp.clone(),
         cache.path().to_path_buf(),
@@ -277,7 +302,9 @@ async fn rig(player: Option<Value>, solver: FakeSolver, ytdlp: FakeYtDlp) -> Rig
         streams,
         solver,
         ytdlp,
-        _cache: cache,
+        api,
+        session,
+        cache,
     }
 }
 
@@ -604,12 +631,142 @@ async fn ytdlp_answer_is_checked() {
     }
 }
 
+// ---- player versions the solver can't handle -------------------------------------------
+
+fn fallback_answer(expire: u64) -> Value {
+    json!({
+        "id": VIDEO,
+        "url": format!("https://rr2---sn-test.googlevideo.com/videoplayback?expire={expire}"),
+        "format_id": "251",
+    })
+}
+
+fn solver_failing_on(players: &[&str]) -> FakeSolver {
+    FakeSolver {
+        fail_players: players.iter().map(|p| p.to_string()).collect(),
+        ..FakeSolver::mapping(&[("abc", "def")])
+    }
+}
+
+#[tokio::test]
+async fn failed_player_goes_straight_to_ytdlp() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+        solver_failing_on(&[PLAYER]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(r.streams.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.solver.calls.lock().unwrap().len(), 1);
+    // Same player version: the solver is not tried again, yt-dlp answers.
+    assert_eq!(r.streams.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.solver.calls.lock().unwrap().len(), 1);
+    assert_eq!(r.ytdlp.calls(), 2);
+    // Nor after a restart: the failure is remembered next to the player cache.
+    let restarted = r.restart();
+    assert_eq!(restarted.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.solver.calls.lock().unwrap().len(), 1);
+    assert!(
+        r.cache
+            .path()
+            .join("players")
+            .join(format!("{PLAYER}.failed"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn stale_failure_is_retried() {
+    // Six hours on, a failed version is tried again (the failure may have been a deadline
+    // hit on a throttled CPU), and a success clears the mark.
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+        FakeSolver::mapping(&[("abc", "def")]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    let players = r.cache.path().join("players");
+    std::fs::create_dir_all(&players).unwrap();
+    let marker = players.join(format!("{PLAYER}.failed"));
+    std::fs::write(&marker, "").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&marker)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(7 * 3600))
+        .unwrap();
+    let s = r.streams.resolve_fresh(VIDEO).await.unwrap();
+    assert_eq!(s.url, stream_url(expire, "&n=def"));
+    assert_eq!(r.solver.calls.lock().unwrap().len(), 1);
+    assert!(!marker.exists(), "a success clears the mark");
+
+    // A fresh mark is honoured.
+    std::fs::write(&marker, "").unwrap();
+    let restarted = r.restart();
+    assert!(restarted.resolve_fresh(VIDEO).await.is_err());
+    assert_eq!(r.solver.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn new_player_id_retries_own_path() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+        solver_failing_on(&[PLAYER]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    // The old version for the first ask, then a new one.
+    r.server.reset().await;
+    mount_player_version(&r.server, PLAYER, Some(1)).await;
+    mount_player_version(&r.server, "0000000b", None).await;
+    mount_player(
+        &r.server,
+        answer(url_format(&stream_url(expire, "&n=abc"))),
+        None,
+    )
+    .await;
+
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    // The failure also dropped the remembered player version, so the next resolve asks for
+    // the current one at once instead of reusing the failed one for an hour.
+    let s = r.streams.resolve_fresh(VIDEO).await.unwrap();
+    assert_eq!(s.itag, 774);
+    assert_eq!(s.url, stream_url(expire, "&n=def"));
+    let calls = r.solver.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "0000000b");
+}
+
+#[tokio::test]
+async fn failure_forgets_the_player_version() {
+    // Any own-code failure drops the remembered version: the next resolve asks iframe_api
+    // again rather than reusing it for up to an hour.
+    let r = rig(None, FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    let a = json!({"playabilityStatus": {"status": "ERROR"}});
+    mount_player(&r.server, a, None).await;
+    assert!(r.streams.resolve(VIDEO).await.is_err());
+    assert!(r.streams.resolve(VIDEO).await.is_err());
+    let asks = r
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|q| q.url.path() == "/iframe_api")
+        .count();
+    assert_eq!(asks, 2);
+}
+
 /// A stand-in yt-dlp: a shell script that records how it was called and what the cookie file
 /// looked like while it ran, then prints a `-j` answer (or sleeps, for the timeout test).
 fn fake_ytdlp_script(dir: &std::path::Path, sleep: bool) -> PathBuf {
     let out = dir.display();
     let tail = if sleep {
-        "sleep 30".to_string()
+        // A child of its own, as yt-dlp starts a JS runtime: it must die with the run.
+        format!("sleep 30 &\nprintf '%s' \"$!\" > \"{out}/grandchild\"\nsleep 30")
     } else {
         r#"printf '{"id":"testvideo01","url":"https://rr2---sn-test.googlevideo.com/v","format_id":"141"}'"#.to_string()
     };
@@ -700,6 +857,55 @@ async fn ytdlp_timeout_kills_and_cleans_up() {
     let cookie_path = PathBuf::from(std::fs::read_to_string(tmp.path().join("path")).unwrap());
     assert!(!cookie_path.exists());
     assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0);
+    assert_gone(&grandchild(tmp.path())).await;
+}
+
+#[tokio::test]
+async fn ytdlp_cancel_kills_its_children() {
+    // The caller drops the call mid-run (the user skipped): yt-dlp and everything it started
+    // must go, and the cookie folder with them.
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = tmp.path().join("run");
+    std::fs::create_dir(&runtime).unwrap();
+    let script = fake_ytdlp_script(tmp.path(), true);
+    let ytdlp = YtDlpCommand::new(runtime.clone()).with_program(
+        "/bin/sh".into(),
+        vec![script.into()],
+        Duration::from_secs(30),
+    );
+    let session = session();
+    let call = ytdlp.info_json(VIDEO, &session);
+    // Long enough for the script to start its child and note it down.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), call)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(&runtime).unwrap().count(), 0);
+    assert_gone(&grandchild(tmp.path())).await;
+}
+
+fn grandchild(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("grandchild")).expect("the script noted its child")
+}
+
+/// Waits up to 3 s for process `pid` to be gone (or a zombie waiting for its new parent).
+async fn assert_gone(pid: &str) {
+    let stat = format!("/proc/{pid}/stat");
+    for _ in 0..60 {
+        match std::fs::read_to_string(&stat) {
+            Err(_) => return,
+            // The state is the field after the `(comm)`.
+            Ok(s)
+                if s.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z')) =>
+            {
+                return;
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("process {pid} is still running");
 }
 
 #[tokio::test]
