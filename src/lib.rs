@@ -2,5 +2,6 @@
 
 pub mod auth;
 pub mod error;
+pub mod innertube;
 pub mod net;
 pub mod paths;

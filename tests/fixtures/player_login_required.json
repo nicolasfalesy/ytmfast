@@ -1,0 +1,9 @@
+{
+  "responseContext": { "visitorData": "FAKEVISITORDATA0000" },
+  "playabilityStatus": {
+    "status": "LOGIN_REQUIRED",
+    "reason": "Sign in to confirm you're not a bot",
+    "contextParams": "FAKECONTEXTPARAMS"
+  },
+  "trackingParams": "FAKETRACKINGPARAMS"
+}

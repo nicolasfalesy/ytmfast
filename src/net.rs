@@ -8,6 +8,8 @@
 use std::time::Duration;
 use url::{Host, Url};
 
+use crate::error::Error;
+
 /// Domain suffixes we talk to. A host matches when it IS one of these or ends with
 /// `.` + one of these. The leading dot matters: it is what stops `evilyoutube.com`.
 const ALLOWED_SUFFIXES: &[&str] = &[
@@ -22,6 +24,10 @@ const ALLOWED_SUFFIXES: &[&str] = &[
 /// API timeout from the spec. Applies to the whole request, so a stalled server can't hang
 /// a command.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Size cap from the spec for one API answer: a server (or something in between) that sends
+/// an endless or huge body can't make the engine buffer it.
+pub const MAX_ANSWER: usize = 32 << 20;
 
 /// Same hop limit reqwest uses by default; a custom policy replaces the default one, so the
 /// limit has to be restated here.
@@ -72,6 +78,27 @@ pub fn client(user_agent: &str) -> reqwest::Client {
         .redirect(policy)
         .build()
         .expect("the rustls HTTP client should always build")
+}
+
+/// Reads `resp`'s body, refusing it once it passes `cap` bytes. The cap is checked on every
+/// chunk as it arrives, so an oversize body is dropped after at most `cap` bytes plus one
+/// chunk, never buffered whole first. A `Content-Length` over the cap is refused before
+/// reading at all.
+pub async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, Error> {
+    let too_large = || Error::Network(format!("answer too large (over {} MiB)", cap >> 20));
+    let declared = resp.content_length();
+    if declared.is_some_and(|n| n > cap as u64) {
+        return Err(too_large());
+    }
+    // `declared` is at most `cap` here; reserving it saves the regrowth copies.
+    let mut body = Vec::with_capacity(declared.unwrap_or(0) as usize);
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > cap {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

@@ -31,6 +31,30 @@ impl Error {
     }
 }
 
+/// The one mapping from an HTTP client error to ours (ruling R6). Every message is fixed
+/// text: reqwest's own `Display` names the request URL, and a signed stream link carries an
+/// access token, so not even `without_url()` text is passed on (its source chain is hyper's
+/// and rustls's wording, which is no help to the user anyway).
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        let what = if e.is_timeout() {
+            "timed out"
+        } else if e.is_connect() {
+            "could not connect"
+        } else if e.is_redirect() {
+            "redirect refused"
+        } else if e.is_body() || e.is_decode() {
+            "the connection dropped while reading the answer"
+        } else if e.is_builder() {
+            // A request we built badly is our bug, not the network's.
+            return Error::Internal("could not build the request".into());
+        } else {
+            "the request failed"
+        };
+        Error::Network(what.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Error;
@@ -51,5 +75,19 @@ mod tests {
             Error::Network("timed out".into()).to_string(),
             "network error: timed out"
         );
+    }
+
+    #[tokio::test]
+    async fn http_errors_never_carry_the_url() {
+        // Port 1 on loopback refuses the connection at once; the URL holds a fake token.
+        let e = crate::net::client("ytmfast-test/0")
+            .get("http://127.0.0.1:1/videoplayback?sig=FAKETOKEN")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("FAKETOKEN"), "reqwest names the URL");
+        let ours = Error::from(e);
+        assert_eq!(ours, Error::Network("could not connect".into()));
+        assert!(!format!("{ours} {ours:?}").contains("FAKETOKEN"));
     }
 }
