@@ -11,7 +11,7 @@ takes `EngineCmd`s from the socket and MPRIS, and broadcasts `EngineEvent`s back
 
 **Tech Stack:** Rust 2024 (rustc 1.98), tokio 1.53, reqwest 0.13 (rustls), rusqlite 0.40 (bundled), rquickjs 0.14,
 symphonia 0.6 (`mkv`, `isomp4`, `aac`), opus 0.4 (libopus), pipewire 0.10, mpris-server 0.10 (zbus 5),
-serde/serde_json, crossbeam-channel, sha1 0.11, pbkdf2 0.13 + aes 0.9 + cbc 0.2, thiserror 2, tracing + tracing-journald, wiremock 0.6
+serde/serde_json, crossbeam-channel, sha1 0.11, pbkdf2 0.13 + aes 0.9 + cbc 0.2, oo7 0.6 (keyring), thiserror 2, tracing + tracing-journald, wiremock 0.6
 and tempfile 3 and hyper 1 (tests).
 
 **Spec:** `docs/superpowers/specs/2026-10-04-ytmfast-design.md`. This plan covers its build step 1.
@@ -28,7 +28,8 @@ Steps 2 to 4 get their own plans.
   `*.ggpht.com`, `*.googleusercontent.com` (one allowlist function, used by every request).
 - Caps: 32 MiB per API answer and per track; 1 MiB per socket line; API timeout 10 s.
 - Session values and signed stream URLs never appear in logs, errors or test output.
-- State: `$XDG_STATE_HOME/ytmfast/` (0700); session file `session.json` (0600). Cache: `$XDG_CACHE_HOME/ytmfast/`.
+- Session: in the login keyring via Secret Service (`oo7` 0.6), label "ytmfast session", attribute `application=ytmfast`; never a plain file.
+- State: `$XDG_STATE_HOME/ytmfast/` (0700). Cache: `$XDG_CACHE_HOME/ytmfast/`.
   Socket: `$XDG_RUNTIME_DIR/ytmfast/socket` (folder 0700, socket 0600).
 - Format order: itag 774 (Opus), then 141 (AAC), then the highest-bitrate other audio-only format.
 - Loudness gain = 10^(−loudnessDb / 20) when loudnessDb > 0, else 1.0.
@@ -87,7 +88,7 @@ Steps 2 to 4 get their own plans.
 
 **Interfaces:**
 - Produces: `struct Session { cookies: Vec<Cookie> }`, where `Cookie { domain, name, value, path, secure, expires_utc: Option<i64> }`.
-- Produces: `Session::load() -> Result<Session, Error>` (`SignedOut` when the file is missing); `Session::save(&self) -> io::Result<()>` (atomic write, 0600, in `state_dir()`).
+- Produces: `trait SessionStore: Send + Sync { async fn load(&self) -> Result<Session, Error>; async fn save(&self, s: &Session) -> Result<(), Error>; }` with `KeyringStore` (oo7, tokio feature; the session is serialised to JSON as the secret) and `MemoryStore` (tests). `load` gives `SignedOut` when no item exists and `Internal("keyring locked or unavailable")` when the Secret Service can't be reached or unlocked.
 - Produces: `Session::cookie_header(&self, url: &Url) -> String`; `Session::apply_set_cookie(&mut self, url: &Url, header: &str) -> bool` (true when something changed, so the caller saves).
 - Produces: `sidhash::authorization(session: &Session, origin: &str, now_unix: u64) -> Option<String>`, which follows yt-dlp `_get_sid_authorization_header`: the schemes `SAPISIDHASH` (SAPISID, else `__Secure-3PAPISID`), `SAPISID1PHASH` (`__Secure-1PAPISID`) and `SAPISID3PHASH` (`__Secure-3PAPISID`). Each is `"{scheme} {ts}_{sha1_hex("{ts} {sid} {origin}")}"`, and they are joined by spaces.
 - Produces: `chromium::import(profile: &Path) -> Result<Session, Error>`.
@@ -98,13 +99,13 @@ Steps 2 to 4 get their own plans.
   - `import_v11_is_clear_error`: an Internal error naming v11.
   - `import_filters_hosts`: keeps only `.youtube.com`, `.google.com`, `accounts.google.com`.
   - `sidhash_vector`: SAPISID "abc", origin "https://www.youtube.com", ts 1700000000 gives `SAPISIDHASH 1700000000_` + the sha1 of `"1700000000 abc https://www.youtube.com"`.
-  - `save_is_0600`.
+  - `memory_store_roundtrip`.
   - `set_cookie_rotation_updates_value`.
-  - `missing_file_is_signed_out`.
+  - `missing_item_is_signed_out` (MemoryStore with no session).
 - [ ] **Step 2: Run** `cargo test auth`. Expected: FAIL.
 - [ ] **Step 3: Implement.** `import` copies the DB to a temp file first (Chromium may hold a lock), opens it read-only, and refuses with a clear message when a `pear-desktop` main process is running (look for `app.asar` with the profile path in `/proc/*/cmdline`). `main.rs import-session [--profile PATH]` defaults to `~/.config/YouTube Music` and prints only the cookie count.
 - [ ] **Step 4: Run** `cargo test auth`. Expected: PASS.
-- [ ] **Step 5: Live check:** `ytmfast import-session` with pear closed prints `Imported 50 cookies` (or near), and the file has mode 0600.
+- [ ] **Step 5: Live check:** `ytmfast import-session` with pear closed prints `Imported 50 cookies` (or near); `secret-tool search application ytmfast` shows the item (don't print the secret); no session file exists under `~/.local/state/ytmfast/`.
 - [ ] **Step 6: Commit** `feat(auth): import the pear-desktop session, SAPISIDHASH`.
 
 ### Task 4: InnerTube `player` request (`innertube`)
@@ -116,7 +117,7 @@ Steps 2 to 4 get their own plans.
 **Interfaces:**
 - Consumes: `Session`, `sidhash::authorization`, `net::client`.
 - Produces: `clients::TV: ClientInfo { name: "TVHTML5", version: "5.20260707", name_id: 7, user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version", origin: "https://www.youtube.com", api_host: "www.youtube.com" }`. That is the one table to edit when YouTube changes something. Also `clients::WEB_REMIX` for later steps (`"WEB_REMIX"`, name_id 67, origin `https://music.youtube.com`).
-- Produces: `Innertube::new(session: Arc<Mutex<Session>>, base: Url) -> Innertube` (base is overridable for tests) and `Innertube::player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error>`.
+- Produces: `Innertube::new(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>, base: Url) -> Innertube` (base is overridable for tests; a changed cookie from `Set-Cookie` is saved through `store`) and `Innertube::player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error>`.
 - Produces: `PlayerResponse { video_id, title, author, length_seconds: u32, thumbnail: Option<String>, loudness_db: Option<f32>, formats: Vec<AudioFormat>, tracking: Tracking }`, `AudioFormat { itag: u32, mime: String, bitrate: u32, content_length: Option<u64>, url: Option<String>, signature_cipher: Option<String> }` (audio-only formats, i.e. mime starting with `audio/`), `Tracking { playback_url: Option<String>, watchtime_url: Option<String> }`.
 
 - [ ] **Step 1: Write the fixtures by hand** in the shape of a real TV player answer, with made-up ids and URLs (`https://rr1---sn-test.googlevideo.com/videoplayback?...&n=abc`) and nothing from a real account.

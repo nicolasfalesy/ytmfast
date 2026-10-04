@@ -26,7 +26,7 @@ Success means:
 | Format | Opus 257k (itag 774). AAC 256k (itag 141) when a song has no Opus stream. |
 | Loudness | Normalise with YouTube's own per-song loudness value (turn down only, like the official player). |
 | History | Report plays to YouTube so history and recommendations stay accurate. |
-| Sign-in | Import once from the `pear-desktop` profile; the engine owns that session afterwards. |
+| Sign-in | Import once from the `pear-desktop` profile; the engine owns that session afterwards, stored in the login keyring. |
 | Lifecycle | systemd socket activation; quits after idle minutes. |
 | Widget | Uses ytmfast when installed, keeps the `pear-desktop` path otherwise. |
 | Cover click | With ytmfast there is no app window, so a cover click opens the playing song's album in the panel. |
@@ -66,8 +66,8 @@ media keys / desktop ──MPRIS (D-Bus)────┤
   (`~/.config/YouTube Music/Cookies`), decrypts it (v10 fixed key; v11 key from the Secret Service), and
   keeps only the `youtube.com` and `google.com` cookies that are needed.
 - It only runs while `pear-desktop` is closed, because Chromium holds the database open.
-- The session is stored in `$XDG_STATE_HOME/ytmfast/session.json`, mode 0600, in a 0700 folder.
-  It is never logged, never sent anywhere except Google hosts, and never part of a backup.
+- The session is stored encrypted in the user's login keyring (Secret Service, item label "ytmfast session",
+  attribute `application=ytmfast`), never in a plain file. A locked or missing keyring gives a clear error. It is never logged, never sent anywhere except Google hosts, and never part of a backup.
 - The engine builds the `SAPISIDHASH` authorisation header from the session, and saves every `Set-Cookie`
   rotation it receives, so the session stays valid after `pear-desktop` is removed.
 - A rejected session gives the error `signed_out`. The widget then tells the user to sign in again.
@@ -197,7 +197,7 @@ Radio; media keys; messages as notifications when the panel is closed; idle quit
 
 ## Security
 
-- The session file is 0600 in a 0700 folder; the socket is 0600 with a peer-uid check.
+- The session lives in the login keyring (no plain file); the yt-dlp fallback's temp cookie file is 0600 and deleted on exit; the socket is 0600 with a peer-uid check.
 - Network: https only, and only to Google hosts (`*.youtube.com`, `*.googlevideo.com`, `*.google.com`,
   `*.ytimg.com`, `*.ggpht.com`, `*.googleusercontent.com`).
 - QuickJS is sandboxed (no I/O) with memory and time limits.
