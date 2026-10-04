@@ -5,3 +5,5 @@ pub mod error;
 pub mod innertube;
 pub mod net;
 pub mod paths;
+pub mod solver;
+pub mod streams;
