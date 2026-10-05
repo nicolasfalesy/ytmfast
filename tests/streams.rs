@@ -87,6 +87,8 @@ struct FakeSolver {
     fail_players: Vec<String>,
     /// What `has_player` says: true means `Streams` need not send the player code.
     cached: bool,
+    /// The error a failing call returns (a JS failure, `stream_failed`, if `None`).
+    error: Option<Error>,
     calls: Mutex<Vec<SolveCall>>,
 }
 
@@ -108,6 +110,13 @@ impl FakeSolver {
             ..Default::default()
         }
     }
+    /// Fails every call with `error` (our own faults, not the scripts').
+    fn failing_with(error: Error) -> FakeSolver {
+        FakeSolver {
+            error: Some(error),
+            ..FakeSolver::failing()
+        }
+    }
 }
 
 #[async_trait]
@@ -126,7 +135,10 @@ impl ChallengeSolver for FakeSolver {
             .unwrap()
             .push((player_id.into(), player_code, requests.clone()));
         if self.fail || self.fail_players.iter().any(|p| p == player_id) {
-            return Err(Error::StreamFailed("challenge solver: fake failure".into()));
+            return Err(self
+                .error
+                .clone()
+                .unwrap_or_else(|| Error::StreamFailed("challenge solver: fake failure".into())));
         }
         Ok(requests
             .iter()
@@ -733,6 +745,36 @@ async fn failed_player_goes_straight_to_ytdlp() {
             .join(format!("{PLAYER}.failed"))
             .exists()
     );
+}
+
+#[tokio::test]
+async fn our_own_faults_do_not_mark_the_player() {
+    // A stopped solver thread, or a player script pruned between `has_player` and the call,
+    // says nothing about whether the scripts can solve this player: the next song tries the
+    // own-code path again, and nothing is written for a restarted engine to skip.
+    for fault in [
+        Error::Internal("the challenge solver stopped".into()),
+        Error::Internal("the player script is needed but was not given".into()),
+    ] {
+        let expire = now() + 6 * 3600;
+        let r = rig(
+            Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+            FakeSolver::failing_with(fault.clone()),
+            FakeYtDlp::answering(fallback_answer(expire)),
+        )
+        .await;
+        assert_eq!(r.streams.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+        assert_eq!(r.streams.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+        assert_eq!(r.solver.calls.lock().unwrap().len(), 2, "{fault:?}");
+        assert!(
+            !r.cache
+                .path()
+                .join("players")
+                .join(format!("{PLAYER}.failed"))
+                .exists(),
+            "{fault:?}"
+        );
+    }
 }
 
 #[tokio::test]

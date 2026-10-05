@@ -98,6 +98,11 @@ pub trait ChallengeSolver: Send + Sync {
     /// Solves every request in one `jsc` call. The answers come back in the order of
     /// `requests`. `player_code` is only needed when `has_player` is false; without either the
     /// call fails. Any challenge left unanswered fails the whole call.
+    ///
+    /// Errors: `StreamFailed` only when the scripts failed on this player (a thrown error, a
+    /// missing answer, the deadline or the memory limit), which `Streams` remembers for the
+    /// player version; `Internal` for our own faults (the solver thread gone, no player
+    /// script given), which say nothing about the player and are not remembered.
     async fn solve_batch(
         &self,
         player_id: &str,
@@ -193,6 +198,10 @@ impl Solver {
     fn send(&self, job: Job) -> Result<(), Error> {
         self.jobs.send(job).map_err(|_| solver_gone())
     }
+}
+
+fn quickjs_failed() -> Error {
+    Error::Internal("could not start QuickJS".into())
 }
 
 fn solver_gone() -> Error {
@@ -307,8 +316,10 @@ impl Worker {
         let input = match (&cached, &player_code) {
             (Some(pre), _) => Input::Preprocessed(pre),
             (None, Some(code)) => Input::Player(code),
+            // Internal, not StreamFailed: the caller's slip (or the cache pruned since it
+            // asked `has_player`), which says nothing about this player (see the trait).
             (None, None) => {
-                return Err(Error::StreamFailed(
+                return Err(Error::Internal(
                     "the player script is needed but was not given".into(),
                 ));
             }
@@ -364,7 +375,8 @@ struct Js {
 
 impl Js {
     fn new(lib: &str, core: &str) -> Result<Js, Error> {
-        let rt = Runtime::new().map_err(|_| js_failed("could not start QuickJS"))?;
+        // Internal: QuickJS failing to start is ours, not the player's (see the trait).
+        let rt = Runtime::new().map_err(|_| quickjs_failed())?;
         rt.set_memory_limit(MEMORY_LIMIT);
         rt.set_max_stack_size(JS_STACK);
         let deadline: Rc<Cell<Option<Instant>>> = Rc::default();
@@ -396,7 +408,7 @@ impl Js {
             intrinsic::TypedArrays,
             intrinsic::Promise,
         )>(&rt)
-        .map_err(|_| js_failed("could not start QuickJS"))?;
+        .map_err(|_| quickjs_failed())?;
         let js = Js {
             ctx,
             rt,
@@ -689,12 +701,14 @@ mod tests {
             "preprocessed|undefined|sig|s2|PRE(CODE)|lib-loaded"
         );
 
-        // Cold with no code is an error, not a guess.
-        assert!(
-            s.solve("0000000b", None, ChallengeKind::N, &[])
-                .await
-                .is_err()
-        );
+        // Cold with no code is an error, not a guess. `internal`: the caller's slip (or the
+        // cache pruned between `has_player` and the call), not a sign the scripts fail on
+        // this player, so `Streams` doesn't mark the player as failed for it.
+        let e = s
+            .solve("0000000b", None, ChallengeKind::N, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "internal");
         // A malformed id never names a file.
         assert!(
             s.solve("../../etc", Some("x"), ChallengeKind::N, &[])

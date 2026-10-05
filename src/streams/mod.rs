@@ -243,7 +243,13 @@ impl Streams {
                     answers
                 }
                 Err(e) => {
-                    self.mark_player_failed(&player_id);
+                    // Only a failure of the scripts on this player is remembered (for six
+                    // hours, on disk). Our own faults (`Internal`: the solver thread gone, a
+                    // script pruned mid-call) say nothing about the player, and marking it
+                    // would send every song to yt-dlp for no reason.
+                    if matches!(e, Error::StreamFailed(_)) {
+                        self.mark_player_failed(&player_id);
+                    }
                     return Err(e);
                 }
             };
