@@ -16,7 +16,7 @@ const WAIT: Duration = Duration::from_secs(10);
 
 fn spawn_daemon(root: &Path) -> Child {
     let run = root.join("run");
-    std::fs::create_dir(&run).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
     Command::new(env!("CARGO_BIN_EXE_ytmfast"))
         .args(["daemon", "--null-sink"])
         .env_clear()
@@ -89,4 +89,31 @@ fn sigterm_stops_the_daemon_cleanly() {
 #[test]
 fn sigint_stops_the_daemon_cleanly() {
     stops_cleanly_on(libc::SIGINT);
+}
+
+#[test]
+fn start_sweeps_a_dead_engines_cookie_folders() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("run/ytmfast");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .unwrap();
+    // A process that has exited and been collected: its pid is free.
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    let stale = dir.join(format!("yt-dlp-{dead}-0"));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("cookies.txt"), "fake").unwrap();
+
+    let mut child = spawn_daemon(root.path());
+    wait_until_serving(&dir.join("socket"));
+    let swept = !stale.exists();
+    // SAFETY: kill with a pid we spawned and still own (not yet reaped).
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.wait();
+    assert!(swept, "the stale cookie folder is still there");
 }

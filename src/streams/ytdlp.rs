@@ -175,6 +175,44 @@ impl Drop for CookieFolder {
     }
 }
 
+/// Removes cookie folders (`yt-dlp-{pid}-{n}`) left in `runtime_dir` by an engine that died
+/// without cleaning up (killed, or crashed mid-run): they hold a copy of the session. Run at
+/// daemon start. A folder whose process still runs (this one, or another user of the folder)
+/// is left alone, and so is anything that isn't a plain folder with that name.
+pub fn sweep_stale(runtime_dir: &Path) {
+    let Ok(entries) = fs::read_dir(runtime_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(folder_pid) else {
+            continue;
+        };
+        // `file_type` doesn't follow symlinks: a link named like a folder is never followed.
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && pid != std::process::id() && !alive(pid) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The pid in a cookie folder's name, `yt-dlp-{pid}-{n}`.
+fn folder_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix("yt-dlp-")?.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok().filter(|p| *p > 0)
+}
+
+/// True while process `pid` exists (`EPERM` means it does, as someone else's).
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Writes `session` as a Netscape cookie file, the format `--cookies` reads. Created with
 /// mode 0600 and `create_new`, so it is never readable by others, not even for a moment.
 fn write_cookie_file(path: &Path, session: &Session) -> io::Result<()> {
@@ -231,6 +269,52 @@ mod tests {
             secure: true,
             expires_utc: Some(1_900_000_000),
         }
+    }
+
+    #[test]
+    fn stale_cookie_folders_are_swept() {
+        let run = tempfile::tempdir().unwrap();
+        let r = run.path();
+        // A process that has exited and been collected: its pid is free.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let own = std::process::id();
+        let dir = |name: String| {
+            let p = r.join(name);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("cookies.txt"), "fake").unwrap();
+            p
+        };
+        let stale = dir(format!("yt-dlp-{dead}-0"));
+        let stale2 = dir(format!("yt-dlp-{dead}-17"));
+        let mine = dir(format!("yt-dlp-{own}-3"));
+        // pid 1 always runs (as another user here: EPERM still means alive).
+        let other = dir("yt-dlp-1-0".into());
+        let unrelated = dir("ytmfast-something".into());
+        let odd = dir(format!("yt-dlp-{dead}-x"));
+        let file = r.join(format!("yt-dlp-{dead}-99"));
+        fs::write(&file, "not a folder").unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("keep"), "x").unwrap();
+        let link = r.join(format!("yt-dlp-{dead}-98"));
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        sweep_stale(r);
+
+        assert!(
+            !stale.exists() && !stale2.exists(),
+            "a dead engine's folders go"
+        );
+        for kept in [&mine, &other, &unrelated, &odd, &file, &link] {
+            assert!(fs::symlink_metadata(kept).is_ok(), "{kept:?} was kept");
+        }
+        assert!(
+            target.path().join("keep").exists(),
+            "a link is never followed"
+        );
+        // A missing runtime folder is no error.
+        sweep_stale(&r.join("missing"));
     }
 
     #[test]

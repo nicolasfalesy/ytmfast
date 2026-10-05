@@ -23,7 +23,7 @@ use ytmfast::innertube::{API_BASE, Innertube, clients};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
 use ytmfast::streams::lazy::{self, LazyResolver};
-use ytmfast::streams::ytdlp::YtDlpCommand;
+use ytmfast::streams::ytdlp::{self, YtDlpCommand};
 use ytmfast::streams::{Resolver, Streams, TrackMeta};
 
 const USAGE: &str = "\
@@ -359,6 +359,11 @@ async fn serve(
         control::termination().map_err(|e| format!("could not watch for signals: {e}"))?;
     let listener = tokio::net::UnixListener::from_std(listener)
         .map_err(|e| format!("could not use the socket: {e}"))?;
+    // Cookie folders an earlier engine left behind when it was killed mid-run: each holds a
+    // copy of the session.
+    if let Ok(dir) = paths::runtime_dir() {
+        ytdlp::sweep_stale(&dir);
+    }
     let resolver = resolver()?;
     let sink: Box<dyn Sink> = if null_sink {
         Box::new(NullSink::realtime())
