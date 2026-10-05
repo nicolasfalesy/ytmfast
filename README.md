@@ -5,7 +5,32 @@ takes commands over a local socket, with no browser running.
 
 ## Status
 
-Step 1 is in progress: the goal is to play one song. Nothing is usable yet.
+Step 1 is done: the engine plays one song in YouTube Music Premium quality (Opus, about 256 kbps), with pause,
+seek, volume and status over the socket and over MPRIS. It replaces the Electron app behind a bar widget at a
+fraction of the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
+
+| Measure | YouTube Music desktop app (Electron) | ytmfast |
+|---|---|---|
+| RAM while playing | 677 MB | 31.5 MB |
+| Processes | 10 | 1 |
+| CPU while playing | 3.9% of one core | 0.51% |
+| Time from play to sound | 2.5 s | 0.68 s |
+
+Coming next:
+
+1. **Queue:** albums, playlists, radio when the queue runs out, gapless playback, resume, play history.
+2. **Browsing:** Home, Library, search, like and dislike, lyrics.
+3. **Widget:** the Omarchy bar widget switches to the engine.
+
+## Sign in
+
+ytmfast reuses the sign-in of the YouTube Music desktop app. Close that app, then run:
+
+```sh
+ytmfast import-session
+```
+
+It copies the session into the login keyring (never into a plain file) and prints how many cookies it took.
 
 ## Build
 
@@ -13,7 +38,7 @@ Step 1 is in progress: the goal is to play one song. Nothing is usable yet.
 cargo build --release
 ```
 
-Building needs Rust, clang, pkg-config and the PipeWire and Opus development files.
+Building needs Rust, clang, pkg-config, cmake, make and the PipeWire development files. `yt-dlp` is used as a fallback for stream links when it is installed.
 
 ## Run with systemd
 
