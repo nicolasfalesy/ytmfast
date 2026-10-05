@@ -376,7 +376,9 @@ impl Engine {
         if let Some(len) = self.status.meta.as_ref().map(|m| m.length_seconds)
             && len > 0
         {
-            at = at.min(f64::from(len));
+            // The decoder lands at most 1 s before the end (so a seek never lands on
+            // silence); the reported position must match where the audio really goes.
+            at = at.min((f64::from(len) - 1.0).max(0.0));
         }
         if self.loaded {
             self.player.seek(at);
@@ -946,6 +948,47 @@ mod tests {
             }
         });
         (guard, rx)
+    }
+
+    #[tokio::test]
+    async fn seek_past_end_reports_length_minus_one() {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let Built {
+            mut engine, events, ..
+        } = engine_for(&server, fake.clone(), true);
+        let mut rx = events.subscribe();
+        engine.handle(EngineCmd::Play {
+            video_id: Some("AAAAAAAAAAA".into()),
+            start_seconds: 0.0,
+        });
+        // A 318 s song, loaded (not yet started, so the status shows the engine's own
+        // position rather than the audio thread's on the 2 s fixture).
+        let mut stream = fake.stream("AAAAAAAAAAA");
+        stream.meta.length_seconds = 318;
+        engine.on_resolved(Resolved {
+            generation: engine.generation,
+            result: Ok(stream),
+        });
+        while rx.try_recv().is_ok() {}
+        // The decoder lands at most 1 s before the end; the report must say the same.
+        engine.handle(EngineCmd::Seek(9999.0));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            EngineEvent::Position { seconds: 317.0 }
+        );
+        assert!((engine.snapshot().position - 317.0).abs() < 1e-9);
+        // Below zero still clamps to the start.
+        engine.handle(EngineCmd::Seek(-5.0));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            EngineEvent::Position { seconds: 0.0 }
+        );
     }
 
     #[tokio::test(start_paused = true)]
