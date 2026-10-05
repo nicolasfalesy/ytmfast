@@ -6,6 +6,7 @@ pub mod control;
 pub mod engine;
 pub mod error;
 pub mod innertube;
+pub mod mpris;
 pub mod net;
 pub mod paths;
 pub mod solver;

@@ -50,6 +50,9 @@ sha2 = "0.10"
 # Demux only the two containers YouTube serves audio in (WebM, MP4), and decode AAC.
 symphonia = { version = "0.6", default-features = false, features = ["mkv", "isomp4", "aac"] }
 thiserror = "2"
+# MPRIS, on zbus directly (already in the tree through oo7): the connection can be pointed at
+# a private test bus by address, with no process-wide DBUS_SESSION_BUS_ADDRESS change.
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 # sync: the async lock that keeps session saves in order (innertube), and the solver thread's
 # reply channel. process + time: the yt-dlp fallback, killed after 30 s. net + io-util: the
 # control socket. signal: a clean stop on SIGTERM/SIGINT.
@@ -57,6 +60,8 @@ tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "process", "ti
 url = "2.5"
 
 [dev-dependencies]
+# StreamExt for the MPRIS tests' signal streams (already in the tree through reqwest and zbus).
+futures-util = { version = "0.3", default-features = false }
 tempfile = "3"
 # net + io-util: a raw TCP test server for the endless chunked answer that wiremock can't send.
 # test-util: the paused clock for the download backoff test.

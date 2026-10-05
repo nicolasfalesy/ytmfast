@@ -32,6 +32,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 
 use crate::engine::{Engine, EngineCmd, EngineEvent, Status};
+use crate::mpris;
 use idle::IdlePolicy;
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
 
@@ -71,6 +72,10 @@ pub struct Options {
     pub idle: IdlePolicy,
     /// `/sys/class/power_supply` in production; tests point it at a folder they fill.
     pub power_supply_root: PathBuf,
+    /// Where to serve MPRIS, if anywhere. Off by default, so a test (or any other caller)
+    /// never registers a player on the user's real session bus by accident; the daemon
+    /// asks for the session bus.
+    pub mpris: Option<mpris::Bus>,
 }
 
 impl Default for Options {
@@ -78,6 +83,7 @@ impl Default for Options {
         Options {
             idle: IdlePolicy::default(),
             power_supply_root: PathBuf::from(idle::POWER_SUPPLY_ROOT),
+            mpris: None,
         }
     }
 }
@@ -109,6 +115,43 @@ pub fn termination() -> io::Result<impl Future<Output = ()>> {
     })
 }
 
+/// The hub's two doors for front ends other than the socket (MPRIS): the same idle clock
+/// and the same quit path the socket's clients use, so neither is duplicated.
+#[derive(Debug, Clone, Default)]
+pub struct Hub {
+    inner: Arc<HubDoors>,
+}
+
+#[derive(Debug, Default)]
+struct HubDoors {
+    /// A command came in: the idle clock starts again.
+    activity: Notify,
+    /// Someone asked the daemon to quit (after its reply is out).
+    quit: Notify,
+}
+
+impl Hub {
+    /// A command came in (ruling R21: every command counts).
+    pub fn touch(&self) {
+        self.inner.activity.notify_one();
+    }
+
+    /// Resolves at the next `touch` (or at once for one since the last wait).
+    pub async fn touched(&self) {
+        self.inner.activity.notified().await;
+    }
+
+    /// Ends the daemon the way the socket's `quit` does.
+    pub fn quit(&self) {
+        self.inner.quit.notify_one();
+    }
+
+    /// Resolves once `quit` was called.
+    pub async fn quit_requested(&self) {
+        self.inner.quit.notified().await;
+    }
+}
+
 /// Runs the engine and serves the socket until `quit`, idle, `shutdown` resolving (a
 /// signal), or the engine dying; then stops the engine and waits for it to finish (which
 /// joins the audio thread).
@@ -121,13 +164,31 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> Exit {
     let engine_task = tokio::spawn(engine.run());
-    // Task 10: MPRIS starts here, with its own `cmds.clone()` and `events.subscribe()`.
+    let hub = Hub::default();
+    // MPRIS beside the socket, with its own command sender and event receiver. In a task of
+    // its own: a slow or missing session bus must not hold up the socket.
+    let (stop_mpris, mpris_stopped) = oneshot::channel();
+    let mpris_task = options.mpris.clone().map(|bus| {
+        tokio::spawn(mpris::run(
+            bus,
+            cmds.clone(),
+            events.subscribe(),
+            hub.clone(),
+            mpris_stopped,
+        ))
+    });
     // A signal takes the same way out as idle: dropping `serve` closes the listener and
     // every client, then the engine is told to quit below.
     let exit = tokio::select! {
-        exit = serve(listener, cmds.clone(), events, options) => exit,
+        exit = serve_with(listener, cmds.clone(), events, options, hub) => exit,
         () = shutdown => Exit::Signal,
     };
+    // The bus name goes first, while the process surely still runs: desktop widgets drop
+    // the player at once instead of showing a dead one until the connection closes.
+    let _ = stop_mpris.send(());
+    if let Some(task) = mpris_task {
+        let _ = task.await;
+    }
     // Fails only when the engine is already gone.
     let _ = cmds.send(EngineCmd::Quit).await;
     match engine_task.await {
@@ -140,10 +201,8 @@ pub async fn run(
 struct Shared {
     cmds: mpsc::Sender<EngineCmd>,
     events: broadcast::Sender<EngineEvent>,
-    /// A client sent a command: the idle clock starts again.
-    activity: Notify,
-    /// A client sent `quit` (and its reply is out).
-    quit: Notify,
+    /// Activity and quit, shared with MPRIS.
+    hub: Hub,
 }
 
 /// Serves the socket until `quit`, idle, or the engine stopping. Leaves the engine running.
@@ -153,14 +212,20 @@ pub async fn serve(
     events: broadcast::Sender<EngineEvent>,
     options: Options,
 ) -> Exit {
+    serve_with(listener, cmds, events, options, Hub::default()).await
+}
+
+/// `serve`, with a hub other front ends share.
+async fn serve_with(
+    listener: UnixListener,
+    cmds: mpsc::Sender<EngineCmd>,
+    events: broadcast::Sender<EngineEvent>,
+    options: Options,
+    hub: Hub,
+) -> Exit {
     let my_uid = current_uid();
     let mut monitor = events.subscribe();
-    let shared = Arc::new(Shared {
-        cmds,
-        events,
-        activity: Notify::new(),
-        quit: Notify::new(),
-    });
+    let shared = Arc::new(Shared { cmds, events, hub });
     // Dropping the set when this returns aborts every client task.
     let mut clients = JoinSet::new();
     let policy = options.idle;
@@ -210,13 +275,13 @@ pub async fn serve(
                     idle_timer = (!playing).then(|| idle_sleep(last_active + policy.earliest()));
                 }
             }
-            () = shared.activity.notified() => {
+            () = shared.hub.touched() => {
                 last_active = Instant::now();
                 if !playing {
                     idle_timer = Some(idle_sleep(last_active + policy.earliest()));
                 }
             }
-            () = shared.quit.notified() => return Exit::Quit,
+            () = shared.hub.quit_requested() => return Exit::Quit,
             // The engine task ended (a panic drops its command receiver). The events channel
             // can't say so, since `shared` holds a sender, and while the last state was
             // playing there is no idle timer: without this the daemon would never exit.
@@ -323,7 +388,7 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
         Close::Now => writer.abort(),
     }
     if quit {
-        shared.quit.notify_one();
+        shared.hub.quit();
     }
 }
 
@@ -344,7 +409,7 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
             );
         }
     };
-    shared.activity.notify_one();
+    shared.hub.touch();
     let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
     let cmd = match request {
         Request::Status => {

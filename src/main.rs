@@ -314,8 +314,12 @@ async fn serve(
     };
     let player = AudioPlayer::spawn(sink);
     let (engine, cmds, events) = Engine::new(resolver, player);
-    // MPRIS (Task 10) joins inside `control::run`, next to the engine.
-    let options = control::Options::default();
+    // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
+    // session bus it logs one line and the socket carries on alone.
+    let options = control::Options {
+        mpris: Some(ytmfast::mpris::Bus::Session),
+        ..control::Options::default()
+    };
     Ok(control::run(listener, engine, cmds, events, options, shutdown).await)
 }
 

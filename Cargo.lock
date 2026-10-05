@@ -2901,6 +2901,7 @@ dependencies = [
  "async-trait",
  "cbc",
  "crossbeam-channel",
+ "futures-util",
  "libc",
  "oo7",
  "opus",
@@ -2920,6 +2921,7 @@ dependencies = [
  "tokio",
  "url",
  "wiremock",
+ "zbus",
 ]
 
 [[package]]
