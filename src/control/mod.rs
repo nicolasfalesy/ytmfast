@@ -91,20 +91,43 @@ pub enum Exit {
     Quit,
     /// The engine task ended by itself, which only a panic does.
     EngineGone,
+    /// SIGTERM (`systemctl stop`) or SIGINT.
+    Signal,
 }
 
-/// Runs the engine and serves the socket until `quit`, idle, or the engine dying; then
-/// stops the engine and waits for it to finish.
+/// Resolves on the first SIGTERM or SIGINT. Registered up front: until it is, either signal
+/// still kills the process the default way, without the clean stop.
+pub fn termination() -> io::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    })
+}
+
+/// Runs the engine and serves the socket until `quit`, idle, `shutdown` resolving (a
+/// signal), or the engine dying; then stops the engine and waits for it to finish (which
+/// joins the audio thread).
 pub async fn run(
     listener: UnixListener,
     engine: Engine,
     cmds: mpsc::Sender<EngineCmd>,
     events: broadcast::Sender<EngineEvent>,
     options: Options,
+    shutdown: impl Future<Output = ()>,
 ) -> Exit {
     let engine_task = tokio::spawn(engine.run());
     // Task 10: MPRIS starts here, with its own `cmds.clone()` and `events.subscribe()`.
-    let exit = serve(listener, cmds.clone(), events, options).await;
+    // A signal takes the same way out as idle: dropping `serve` closes the listener and
+    // every client, then the engine is told to quit below.
+    let exit = tokio::select! {
+        exit = serve(listener, cmds.clone(), events, options) => exit,
+        () = shutdown => Exit::Signal,
+    };
     // Fails only when the engine is already gone.
     let _ = cmds.send(EngineCmd::Quit).await;
     match engine_task.await {
@@ -177,6 +200,8 @@ pub async fn serve(
                         Some(s) => idle::is_playing(s.state),
                         None => return Exit::EngineGone,
                     },
+                    // Can't happen while this runs: `shared.events` is a sender too. An engine
+                    // that dies is caught by the `closed()` arm below instead.
                     Err(RecvError::Closed) => return Exit::EngineGone,
                 };
                 if now_playing != playing {
@@ -192,6 +217,10 @@ pub async fn serve(
                 }
             }
             () = shared.quit.notified() => return Exit::Quit,
+            // The engine task ended (a panic drops its command receiver). The events channel
+            // can't say so, since `shared` holds a sender, and while the last state was
+            // playing there is no idle timer: without this the daemon would never exit.
+            () = shared.cmds.closed() => return Exit::EngineGone,
             () = wait(&mut idle_timer) => {
                 let on_battery = idle::on_battery_in(&root);
                 if idle::should_quit(last_active, Instant::now(), playing, on_battery, policy) {
@@ -271,6 +300,8 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                         Some(s) => protocol::event_line(&EngineEvent::State(s)),
                         None => break Close::Flush,
                     },
+                    // Can't happen while the hub's `shared.events` sender lives; kept so a
+                    // closed channel ends the client rather than spinning.
                     Err(RecvError::Closed) => break Close::Flush,
                 };
                 if !push(&out, line) {

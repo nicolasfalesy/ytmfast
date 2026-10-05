@@ -264,6 +264,10 @@ fn daemon(null_sink: bool) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(Exit::Quit) => ExitCode::SUCCESS,
+            Ok(Exit::Signal) => {
+                eprintln!("ytmfast: stopping on a signal");
+                ExitCode::SUCCESS
+            }
             Ok(Exit::EngineGone) => {
                 eprintln!("ytmfast: the engine stopped unexpectedly");
                 ExitCode::from(1)
@@ -288,6 +292,9 @@ async fn serve(
     listener: std::os::unix::net::UnixListener,
     null_sink: bool,
 ) -> Result<Exit, String> {
+    // First, so a stop that comes while the session loads still ends cleanly.
+    let shutdown =
+        control::termination().map_err(|e| format!("could not watch for signals: {e}"))?;
     let listener = tokio::net::UnixListener::from_std(listener)
         .map_err(|e| format!("could not use the socket: {e}"))?;
     let resolver = match resolver().await? {
@@ -308,7 +315,8 @@ async fn serve(
     let player = AudioPlayer::spawn(sink);
     let (engine, cmds, events) = Engine::new(resolver, player);
     // MPRIS (Task 10) joins inside `control::run`, next to the engine.
-    Ok(control::run(listener, engine, cmds, events, control::Options::default()).await)
+    let options = control::Options::default();
+    Ok(control::run(listener, engine, cmds, events, options, shutdown).await)
 }
 
 async fn play_track(args: PlayArgs) -> Result<(), String> {

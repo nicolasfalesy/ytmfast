@@ -52,8 +52,8 @@ symphonia = { version = "0.6", default-features = false, features = ["mkv", "iso
 thiserror = "2"
 # sync: the async lock that keeps session saves in order (innertube), and the solver thread's
 # reply channel. process + time: the yt-dlp fallback, killed after 30 s. net + io-util: the
-# control socket.
-tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "process", "time", "net", "io-util"] }
+# control socket. signal: a clean stop on SIGTERM/SIGINT.
+tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "process", "time", "net", "io-util", "signal"] }
 url = "2.5"
 
 [dev-dependencies]

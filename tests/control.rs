@@ -74,7 +74,14 @@ fn daemon(on_ac: bool) -> Daemon {
         power_supply_root: power.path().to_path_buf(),
         ..Options::default()
     };
-    let task = tokio::spawn(control::run(listener, engine, cmds, events, options));
+    let task = tokio::spawn(control::run(
+        listener,
+        engine,
+        cmds,
+        events,
+        options,
+        std::future::pending(),
+    ));
     Daemon {
         path,
         task,
@@ -497,4 +504,38 @@ async fn client_that_stops_reading_is_dropped() {
         .await
         .expect("the stuck client was never dropped");
     f.serve.abort();
+}
+
+/// The engine task died (a panic drops its command receiver) while the last state was
+/// playing, so no idle timer runs: the hub must still notice and end, or the daemon would
+/// stay up for good answering "the engine stopped".
+#[tokio::test]
+async fn engine_gone_while_playing_ends_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let power = power(true);
+    let (listener, _path) = listener(dir.path());
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let (events, _) = broadcast::channel(64);
+    let options = Options {
+        power_supply_root: power.path().to_path_buf(),
+        ..Options::default()
+    };
+    let serve = tokio::spawn(control::serve(listener, cmd_tx, events.clone(), options));
+    // Wait until the hub listens, so it really sees the playing state.
+    while events.receiver_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    events
+        .send(EngineEvent::State(Status {
+            state: PlayState::Playing,
+            ..paused_status(SONG)
+        }))
+        .unwrap();
+    tokio::task::yield_now().await;
+    drop(cmd_rx);
+    let exit = tokio::time::timeout(WAIT, serve)
+        .await
+        .expect("the hub never noticed the engine was gone")
+        .unwrap();
+    assert_eq!(exit, Exit::EngineGone);
 }
