@@ -18,9 +18,10 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         # git first, so actions/checkout makes a real clone instead of a tarball download.
-        # cmake + make: the opus crate (0.4) builds its own libopus from source; clang: the pipewire
-        # crate's bindgen. dbus: the MPRIS tests start a private dbus-daemon.
-        run: pacman -Syu --noconfirm rust clang cmake make pkgconf pipewire opus sqlite ffmpeg git dbus
+        # clang: the pipewire crate's bindgen. opus: the system libopus the decoder links.
+        # dbus: the MPRIS tests start a private dbus-daemon. No cmake or make: nothing in the
+        # tree runs them since the bundled libopus went (a clean build with both blocked passes).
+        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git dbus
 
       - uses: actions/checkout@v7
 

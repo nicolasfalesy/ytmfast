@@ -1,7 +1,7 @@
 //! Decoding a track into interleaved stereo `f32` frames.
 //!
-//! Demux is symphonia (WebM for Opus, MP4 for AAC). Opus packets go to libopus (the `opus`
-//! crate) at 48 kHz; AAC goes to symphonia's own decoder at the track's rate.
+//! Demux is symphonia (WebM for Opus, MP4 for AAC). Opus packets go to the system's libopus
+//! (`audio::opus`) at 48 kHz; AAC goes to symphonia's own decoder at the track's rate.
 //!
 //! Trimming, so a track is exactly its music (gapless playback later depends on it):
 //! - Start: the encoder's priming frames are dropped. Opus: the OpusHead pre-skip (312 frames
@@ -33,6 +33,7 @@ use symphonia::core::units::{TimeBase, Timestamp};
 use symphonia::default::formats::{IsoMp4Reader, MkvReader};
 
 use crate::audio::fetch::TrackReader;
+use crate::audio::opus::OpusDecoder;
 use crate::error::Error;
 
 /// YouTube's loudness normalisation: songs louder than the reference are turned down by the
@@ -87,7 +88,7 @@ impl MediaSource for TrackReader {
 }
 
 enum Codec {
-    Opus(opus::Decoder),
+    Opus(OpusDecoder),
     Symphonia(Box<dyn AudioDecoder>),
 }
 
@@ -174,7 +175,7 @@ impl Decoder {
 
         let (codec, rate, priming) = if params.codec == CODEC_ID_OPUS {
             let head = OpusHead::parse(params.extra_data.as_deref())?;
-            let mut dec = opus::Decoder::new(OPUS_RATE, opus::Channels::Stereo)
+            let mut dec = OpusDecoder::new(OPUS_RATE, 2)
                 .map_err(|_| Error::Internal("could not start the Opus decoder".into()))?;
             if head.output_gain != 0 {
                 // The header's gain (Q7.8 dB) is part of the stream: RFC 7845 says apply it.
@@ -350,7 +351,7 @@ impl Decoder {
         self.cursor = None;
         match &mut self.codec {
             Codec::Opus(d) => d
-                .reset_state()
+                .reset()
                 .map_err(|_| Error::Internal("could not reset the Opus decoder".into()))?,
             Codec::Symphonia(d) => d.reset(),
         }
@@ -401,7 +402,7 @@ impl Decoder {
         let frames = match &mut self.codec {
             Codec::Opus(dec) => {
                 self.out.resize(OPUS_MAX_FRAMES * 2, 0.0);
-                dec.decode_float(&packet.data, &mut self.out, false)
+                dec.decode_float(&packet.data, &mut self.out)
                     .map_err(|_| ())
             }
             Codec::Symphonia(dec) => match dec.decode(packet) {

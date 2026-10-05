@@ -29,8 +29,6 @@ libc = "0.2"
 oo7 = "0.6"
 # rustls only (no OpenSSL); http2 because the YouTube hosts speak it and it saves connections.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
-# Opus decode (libopus). The crate builds its own libopus from source (needs cmake).
-opus = "0.4"
 # Audio output. v0_3_50: pw_stream_get_time_n, for the delay that the position subtracts.
 pipewire = { version = "0.10", features = ["v0_3_50"] }
 # The challenge solver: yt-dlp's ejs scripts run in an embedded QuickJS (quickjs-ng). Default

@@ -220,3 +220,62 @@ fn length_hint_caps_a_runaway_end() {
     let frames = decode_all(&mut dec).len() / 2;
     assert_eq!(frames, 66_150, "0.5 s + 1 s at 44.1 kHz");
 }
+
+/// FNV-1a over every sample's bits: equal only when the output is bit-identical.
+fn fingerprint(samples: &[f32]) -> u64 {
+    samples.iter().fold(0xcbf2_9ce4_8422_2325, |h, s| {
+        s.to_bits()
+            .to_le_bytes()
+            .iter()
+            .fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    })
+}
+
+/// The Opus fixture with its OpusHead output gain set to `gain` (Q7.8 dB), in place: the
+/// header is the WebM track's CodecPrivate, and the gain is its bytes 16..18.
+fn opus_with_gain(gain: i16) -> TrackReader {
+    let path = format!(
+        "{}/tests/fixtures/sine440_48k.webm",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = bytes
+        .windows(8)
+        .position(|w| w == b"OpusHead")
+        .expect("the fixture has an OpusHead");
+    bytes[at + 16..at + 18].copy_from_slice(&gain.to_le_bytes());
+    TrackBuffer::from_bytes(bytes).reader()
+}
+
+/// libopus's output, pinned: the samples of a whole decode, of a decode after a seek (which
+/// resets the decoder), and of a decode with a header gain (a decoder control) must stay
+/// bit-identical. The values were taken from the libopus the `opus` crate built itself, and
+/// guard the move to the system's libopus (and any later libopus update) against a silent
+/// change in what the user hears.
+#[test]
+fn opus_output_is_pinned() {
+    let mut dec = Decoder::open(fixture("sine440_48k.webm"), OPUS_MIME).unwrap();
+    let all = decode_all(&mut dec);
+
+    let mut dec = Decoder::open(fixture("sine440_48k.webm"), OPUS_MIME).unwrap();
+    dec.next_frames().unwrap();
+    dec.seek(0.73).unwrap();
+    let after_seek = decode_all(&mut dec);
+
+    let mut dec = Decoder::open(opus_with_gain(-512), OPUS_MIME).unwrap();
+    let with_gain = decode_all(&mut dec);
+
+    let got = [
+        (all.len(), fingerprint(&all)),
+        (after_seek.len(), fingerprint(&after_seek)),
+        (with_gain.len(), fingerprint(&with_gain)),
+    ];
+    assert_eq!(
+        got,
+        [
+            (192_048, 0x8083_c2d6_e201_d721),
+            (122_064, 0xbcab_d8dc_4cd1_6d69),
+            (192_048, 0xa0ad_ff4b_f4e1_02f4),
+        ]
+    );
+}
