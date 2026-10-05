@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use url::Url;
 use ytmfast::audio::decode::loudness_gain;
@@ -16,18 +17,22 @@ use ytmfast::audio::player::{AudioEvent, AudioPlayer};
 use ytmfast::audio::pw::PipeWireSink;
 use ytmfast::audio::sink::{NullSink, Sink};
 use ytmfast::auth::{KeyringStore, SessionStore, chromium};
+use ytmfast::control::{self, Exit};
+use ytmfast::engine::Engine;
 use ytmfast::error::Error;
 use ytmfast::innertube::{API_BASE, Innertube};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
 use ytmfast::streams::ytdlp::YtDlpCommand;
-use ytmfast::streams::{Resolver, Streams, TrackMeta};
+use ytmfast::streams::{Resolver, Stream, Streams, TrackMeta};
 
 const USAGE: &str = "\
 usage: ytmfast <command>
 
 commands:
-  daemon            run the engine and its control socket
+  daemon [--null-sink]
+                    run the engine and its control socket (systemd starts it through
+                    ytmfast.socket); --null-sink plays into nothing (benchmarks)
   import-session [--profile PATH]
                     store a YouTube Music session in the login keyring, read from the
                     pear-desktop profile (default: ~/.config/YouTube Music)
@@ -42,7 +47,10 @@ options:
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    Daemon,
+    /// `null_sink`: play into a real-time `NullSink` instead of PipeWire.
+    Daemon {
+        null_sink: bool,
+    },
     /// The profile folder, when `--profile` gave one.
     ImportSession(Option<PathBuf>),
     Play(PlayArgs),
@@ -65,7 +73,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Command {
     let args: Vec<String> = args.into_iter().collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
-        ["daemon"] => Command::Daemon,
+        ["daemon"] => Command::Daemon { null_sink: false },
+        ["daemon", "--null-sink"] => Command::Daemon { null_sink: true },
         ["import-session"] => Command::ImportSession(None),
         ["import-session", "--profile", path] => Command::ImportSession(Some(path.into())),
         ["play", rest @ ..] => parse_play(rest).map_or(Command::Usage, Command::Play),
@@ -100,12 +109,6 @@ fn parse_play(args: &[&str]) -> Option<PlayArgs> {
         null_sink,
         seconds,
     })
-}
-
-/// Subcommands later steps wire up: each task wires the part it owns.
-fn not_built_yet(name: &str) -> ExitCode {
-    eprintln!("ytmfast: {name} is not built yet");
-    ExitCode::from(1)
 }
 
 /// The `pear-desktop` profile: Electron keeps an app's data in
@@ -187,20 +190,129 @@ fn describe(e: Error) -> String {
     format!("{e} [{}]", e.code())
 }
 
-async fn play_track(args: PlayArgs) -> Result<(), String> {
+/// The real resolver over the session in the login keyring: an `Error` when there is no
+/// session, a message when a folder is missing.
+async fn resolver() -> Result<Result<Arc<dyn Resolver>, Error>, String> {
     let store: Arc<dyn SessionStore> = Arc::new(KeyringStore::new());
-    let session = Arc::new(Mutex::new(store.load().await.map_err(describe)?));
+    let session = match store.load().await {
+        Ok(s) => Arc::new(Mutex::new(s)),
+        Err(e) => return Ok(Err(e)),
+    };
     let base = Url::parse(API_BASE).map_err(|_| "bad API address".to_string())?;
     let api = Arc::new(Innertube::new(session.clone(), store, base));
     let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
     let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
-    let resolver: Arc<dyn Resolver> = Arc::new(Streams::new(
+    Ok(Ok(Arc::new(Streams::new(
         api,
         session,
         Arc::new(Solver::new(cache.clone())),
         Arc::new(YtDlpCommand::new(runtime_dir)),
         cache,
-    ));
+    ))))
+}
+
+/// Stands in for the resolver when the session couldn't be loaded: every play reports why
+/// (usually `signed_out`) as an error event, instead of the daemon refusing to start. A
+/// daemon that exits at once would just be started again by the next connection, and the
+/// widget would never learn the reason.
+struct NoSession(Error);
+
+#[async_trait]
+impl Resolver for NoSession {
+    async fn resolve(&self, _: &str) -> Result<Stream, Error> {
+        Err(self.0.clone())
+    }
+    async fn resolve_fresh(&self, _: &str) -> Result<Stream, Error> {
+        Err(self.0.clone())
+    }
+}
+
+/// Runs the engine behind the control socket until `quit` or idle.
+fn daemon(null_sink: bool) -> ExitCode {
+    // First, while this is the only thread: taking systemd's socket clears the LISTEN_*
+    // variables, and changing the environment is only sound before other threads exist.
+    // SAFETY: `main` calls this before anything has started a thread.
+    let passed = match unsafe { control::take_systemd_listener() } {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ytmfast: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Not started by systemd: bind the socket ourselves (refused if a daemon answers there).
+    let (listener, bound) = match passed {
+        Some(l) => (l, None),
+        None => {
+            let bound = paths::runtime_dir()
+                .and_then(|dir| control::bind_socket(&dir.join(control::SOCKET_NAME)));
+            match bound {
+                Ok((l, b)) => (l, Some(b)),
+                Err(e) => {
+                    eprintln!("ytmfast: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    };
+    let code = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => match runtime.block_on(serve(listener, null_sink)) {
+            Ok(Exit::Idle) => {
+                eprintln!("ytmfast: nothing played for a while; quitting");
+                ExitCode::SUCCESS
+            }
+            Ok(Exit::Quit) => ExitCode::SUCCESS,
+            Ok(Exit::EngineGone) => {
+                eprintln!("ytmfast: the engine stopped unexpectedly");
+                ExitCode::from(1)
+            }
+            Err(message) => {
+                eprintln!("ytmfast: {message}");
+                ExitCode::from(1)
+            }
+        },
+        Err(_) => {
+            eprintln!("ytmfast: could not start the async runtime");
+            ExitCode::from(1)
+        }
+    };
+    if let Some(b) = bound {
+        b.remove();
+    }
+    code
+}
+
+async fn serve(
+    listener: std::os::unix::net::UnixListener,
+    null_sink: bool,
+) -> Result<Exit, String> {
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .map_err(|e| format!("could not use the socket: {e}"))?;
+    let resolver = match resolver().await? {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "ytmfast: no usable session ({}); plays will fail",
+                describe(e.clone())
+            );
+            Arc::new(NoSession(e))
+        }
+    };
+    let sink: Box<dyn Sink> = if null_sink {
+        Box::new(NullSink::realtime())
+    } else {
+        Box::new(PipeWireSink::new())
+    };
+    let player = AudioPlayer::spawn(sink);
+    let (engine, cmds, events) = Engine::new(resolver, player);
+    // MPRIS (Task 10) joins inside `control::run`, next to the engine.
+    Ok(control::run(listener, engine, cmds, events, control::Options::default()).await)
+}
+
+async fn play_track(args: PlayArgs) -> Result<(), String> {
+    let resolver = resolver().await?.map_err(describe)?;
 
     let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
     println!("{}", song_line(&stream.meta, &args.video_id));
@@ -282,7 +394,7 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
 
 fn main() -> ExitCode {
     match parse(std::env::args().skip(1)) {
-        Command::Daemon => not_built_yet("daemon"),
+        Command::Daemon { null_sink } => daemon(null_sink),
         Command::ImportSession(profile) => import_session(profile),
         Command::Play(args) => play(args),
         Command::Version => {
@@ -310,7 +422,11 @@ mod tests {
 
     #[test]
     fn cli_parses_subcommands() {
-        assert_eq!(p(&["daemon"]), Command::Daemon);
+        assert_eq!(p(&["daemon"]), Command::Daemon { null_sink: false });
+        assert_eq!(
+            p(&["daemon", "--null-sink"]),
+            Command::Daemon { null_sink: true }
+        );
         assert_eq!(p(&["import-session"]), Command::ImportSession(None));
         assert_eq!(
             p(&["import-session", "--profile", "/x/YouTube Music"]),
@@ -407,6 +523,7 @@ mod tests {
         assert_eq!(p(&["play"]), Command::Usage);
         assert_eq!(p(&["play", "a", "b"]), Command::Usage);
         assert_eq!(p(&["daemon", "extra"]), Command::Usage);
+        assert_eq!(p(&["daemon", "--null-sink", "--null-sink"]), Command::Usage);
         assert_eq!(p(&["import-session", "--profile"]), Command::Usage);
         assert_eq!(p(&["import-session", "/x"]), Command::Usage);
     }
