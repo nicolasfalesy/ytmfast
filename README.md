@@ -6,8 +6,8 @@ takes commands over a local socket, with no browser running.
 ## Status
 
 Step 1 is done: the engine plays one song in YouTube Music Premium quality (Opus, about 256 kbps), with pause,
-seek, volume and status over the socket and over MPRIS. It replaces the Electron app behind a bar widget at a
-fraction of the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
+seek, volume and status over the socket and over MPRIS. It is built to replace the Electron app behind a bar widget
+(the widget switches over in step 4), at a fraction of the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
 
 | Measure | YouTube Music desktop app (Electron) | ytmfast |
 |---|---|---|
@@ -15,6 +15,7 @@ fraction of the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
 | Processes | 10 | 1 |
 | CPU while playing | 3.9% of one core | 0.51% |
 | Time from play to sound | 2.5 s | 0.68 s |
+| Power while playing | not measured yet | not measured yet |
 
 Coming next:
 

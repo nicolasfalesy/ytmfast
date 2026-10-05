@@ -1,8 +1,9 @@
 //! Private folders for state, cache and the socket.
 //!
 //! Each folder is created 0700 and tightened to 0700 if something made it wider: the state
-//! folder holds the database and the runtime folder holds the control socket, and neither
-//! should be readable by other users.
+//! folder is for the engine's saved state (unused in step 1; the queue and history come in
+//! step 2), the cache folder holds player scripts, and the runtime folder holds the control
+//! socket and yt-dlp's cookie folders. None should be readable by other users.
 //!
 //! The public functions read the real environment. The `*_in` variants take the
 //! environment as a function so tests never have to mutate process env (which would race

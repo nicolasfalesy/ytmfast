@@ -44,7 +44,8 @@ failing) arrives as events.
 | `quit`   | none                                        | `{}`, then the engine stops |
 
 `play` without `videoId` resumes a paused song, or plays the last song again once it has
-ended. A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`.
+ended. With only `startSeconds` (above 0) it seeks the current song there, and resumes it if
+it was paused; once the song has ended, it plays it again from there. A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`.
 
 ## Events
 

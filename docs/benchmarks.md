@@ -41,10 +41,21 @@ decoded sample, so the CPU figure is the full decode-and-output cost).
 | Time to first sound (from closed) | 0.68 s | 0.65 to 0.70 s |
 | Idle | 0 processes (quits after 5 idle minutes on AC, 2 on battery; the systemd socket costs nothing) | |
 | Idle engine, before it quits | 9.3 MB PSS | |
+| Decode cost alone (into a null output, no PipeWire) | Opus 256k: about 0.14% of a performance core; AAC 256k: about 0.05 to 0.06% | |
 | Power | not measured yet | |
 
-Stream link resolution (own code against the yt-dlp fallback, same song, signed in): own code 462 ms the first
-time and 310 ms warm; yt-dlp 3.9 s. A new YouTube player version costs one cold solve of 3 to 5.5 s, once.
+The decode-cost row comes from a release build decoding 3 minutes of each format into the engine's null output as
+fast as it can (CPU time over audio time, median of 3 rounds); on an efficiency core Opus costs about 0.2%. The
+difference to the 0.51% above is mostly the cost of waking at real time and of the PipeWire stream's own processing.
+
+Stream link resolution, same song, signed in:
+
+| Path | Time |
+|---|---|
+| Own code, the first time | 462 ms |
+| Own code, warm | 310 ms |
+| Own code, a new YouTube player version (one cold solve, once per version, about weekly) | 3 to 5.5 s |
+| yt-dlp fallback | 3.9 s |
 
 ## Side by side
 
