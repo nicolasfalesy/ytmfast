@@ -14,6 +14,8 @@ name = "ytmfast"
 path = "src/main.rs"
 
 [dependencies]
+# The audio thread's events (AudioPlayer): a channel any number of listeners can clone.
+crossbeam-channel = "0.5"
 # Chromium "v10" cookie decryption: AES-128-CBC with a PBKDF2-SHA1 key (same versions oo7 already pulls in).
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
@@ -27,9 +29,15 @@ libc = "0.2"
 oo7 = "0.6"
 # rustls only (no OpenSSL); http2 because the YouTube hosts speak it and it saves connections.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# Opus decode (libopus). The crate builds its own libopus from source (needs cmake).
+opus = "0.4"
+# Audio output. v0_3_50: pw_stream_get_time_n, for the delay that the position subtracts.
+pipewire = { version = "0.10", features = ["v0_3_50"] }
 # The challenge solver: yt-dlp's ejs scripts run in an embedded QuickJS (quickjs-ng). Default
 # features only: no loader, no std/os modules, so the scripts get no file, network or OS access.
 rquickjs = "0.14"
+# The lock-free ring between the audio thread and PipeWire's real-time callback.
+rtrb = "0.4"
 # Reads the Chromium Cookies database. bundled: no system libsqlite needed at build time. serialize: the
 # database is opened from an in-memory copy, so the cookie values are never written to a temp file.
 rusqlite = { version = "0.40.2", features = ["bundled", "serialize"] }
@@ -39,6 +47,8 @@ serde_json = "1.0.151"
 # SAPISIDHASH is a SHA-1; Chromium v24+ cookies start with a SHA-256 of the host.
 sha1 = "0.10"
 sha2 = "0.10"
+# Demux only the two containers YouTube serves audio in (WebM, MP4), and decode AAC.
+symphonia = { version = "0.6", default-features = false, features = ["mkv", "isomp4", "aac"] }
 thiserror = "2"
 # sync: the async lock that keeps session saves in order (innertube), and the solver thread's
 # reply channel. process + time: the yt-dlp fallback, killed after 30 s.

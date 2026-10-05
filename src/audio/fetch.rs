@@ -276,6 +276,24 @@ impl TrackBuffer {
         }
     }
 
+    /// A track that is already whole in memory: no download, readers see `bytes` and then
+    /// EOF. For tests and benchmarks (fixture files), and later for a cached track.
+    pub fn from_bytes(bytes: Vec<u8>) -> TrackBuffer {
+        let total = bytes.len() as u64;
+        TrackBuffer {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    data: bytes,
+                    total: Some(total),
+                    end: Some(End::Done),
+                    waiting: 0,
+                }),
+                wake: Condvar::new(),
+            }),
+            owner: Arc::new(Owner { task: None }),
+        }
+    }
+
     /// A new cursor at the start of the track. It keeps the download going while it lives.
     pub fn reader(&self) -> TrackReader {
         TrackReader {

@@ -18,7 +18,9 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         # git first, so actions/checkout makes a real clone instead of a tarball download.
-        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git
+        # cmake: the opus crate (0.4) builds its own libopus from source; clang: the pipewire
+        # crate's bindgen.
+        run: pacman -Syu --noconfirm rust clang cmake pkgconf pipewire opus sqlite ffmpeg git
 
       - uses: actions/checkout@v7
 
