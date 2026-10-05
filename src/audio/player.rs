@@ -268,7 +268,16 @@ impl Worker {
                 length_hint,
             } => self.load(reader, &mime, gain, start, length_hint),
             Command::Play => {
-                let Some(t) = self.track.as_mut().filter(|t| !t.playing && !t.ended) else {
+                if self.track.as_ref().is_none_or(|t| t.playing || t.ended) {
+                    return;
+                }
+                // The sound server went away while paused: resuming would write into a dead
+                // stream and fail with a vaguer error (the user's live finding). Say what
+                // happened instead; the engine plays the song again from here on a new one.
+                if self.sink.lost() {
+                    return self.fail(Error::OutputRestarted);
+                }
+                let Some(t) = self.track.as_mut() else {
                     return;
                 };
                 t.playing = true;
@@ -372,10 +381,15 @@ impl Worker {
     /// Drops the track; the output is emptied and paused (an idle stream would keep the
     /// audio graph, and the CPU, awake).
     fn unload(&mut self) {
+        self.drop_track();
+        self.position.store(0f64.to_bits(), Ordering::Release);
+    }
+
+    /// `unload`, keeping the last position: after a failure it says where the song stopped.
+    fn drop_track(&mut self) {
         self.track = None;
         self.sink.flush();
         self.sink.pause(true);
-        self.position.store(0f64.to_bits(), Ordering::Release);
     }
 
     /// One unit of work while playing: decode and write a packet, or check the drain.
@@ -434,9 +448,10 @@ impl Worker {
         self.position.store(seconds.to_bits(), Ordering::Release);
     }
 
-    /// A failed track: report it and go idle.
+    /// A failed track: report it and go idle. The position stays where the song stopped, for
+    /// the engine's status and its replay after an output restart.
     fn fail(&mut self, e: Error) {
-        self.unload();
+        self.drop_track();
         self.emit(AudioEvent::Error(e));
     }
 
@@ -713,6 +728,46 @@ mod tests {
         assert_eq!(raw_event(&events), AudioEvent::Loading);
         assert_eq!(raw_event(&events), AudioEvent::Started);
         assert_eq!(raw_event(&events), AudioEvent::Ended);
+    }
+
+    #[test]
+    fn output_lost_while_playing_is_reported_where_it_was() {
+        let (p, events, stats) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(300));
+        stats.lose_output();
+        assert_eq!(
+            next_event(&events),
+            AudioEvent::Error(Error::OutputRestarted)
+        );
+        // The position stays where the song was, so the engine can play it again from there.
+        let at = p.position();
+        assert!(at > 0.05 && at < 0.4, "position {at}");
+    }
+
+    #[test]
+    fn play_after_the_output_was_lost_while_paused_reports_it() {
+        let (p, events, stats) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(200));
+        p.pause();
+        assert_eq!(next_event(&events), AudioEvent::Paused);
+        stats.lose_output();
+        // Not `Resumed` into a dead stream (the user's live finding): the restart, at once.
+        p.play();
+        assert_eq!(
+            next_event(&events),
+            AudioEvent::Error(Error::OutputRestarted)
+        );
+        // The next song opens a new output and plays.
+        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        assert_eq!(next_event(&events), AudioEvent::Ended);
     }
 
     #[test]

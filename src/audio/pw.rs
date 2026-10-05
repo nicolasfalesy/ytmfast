@@ -62,7 +62,8 @@ struct Shared {
     cycle_frames: AtomicU64,
     /// Set when the writer queues audio, cleared when the ring runs dry.
     primed: AtomicBool,
-    /// The stream errored or was disconnected.
+    /// The stream is gone for good: it errored, or the sound server went away (see
+    /// `stream_gone` and `core_gone`).
     failed: AtomicBool,
 }
 
@@ -130,6 +131,8 @@ impl PipeWireSink {
         while out.shared.flush_done.load(Ordering::Acquire)
             != out.shared.flush_request.load(Ordering::Acquire)
         {
+            // A dead stream never runs the flush: say why now, not after the stall timeout.
+            out.check_alive()?;
             watch.check()?;
             // The next cycle does the flush.
             std::thread::sleep(out.wait_for_room(1));
@@ -194,9 +197,7 @@ impl Sink for PipeWireSink {
         // Whole frames only, so the ring always holds whole frames.
         frames = &frames[..frames.len() & !1];
         while !frames.is_empty() {
-            if out.shared.failed.load(Ordering::Acquire) {
-                return Err(Error::Internal("the audio output stopped".into()));
-            }
+            out.check_alive()?;
             let room = (out.producer.slots() & !1).min(frames.len());
             if room > 0 {
                 let (taken, _) = out.producer.push_partial_slice(&frames[..room]);
@@ -240,6 +241,27 @@ impl Sink for PipeWireSink {
         let ring = (out.capacity - out.producer.slots()) / 2;
         out.shared.pipeline_delay.load(Ordering::Acquire) + ring as u64
     }
+
+    fn lost(&self) -> bool {
+        self.out
+            .as_ref()
+            .is_some_and(|o| o.shared.failed.load(Ordering::Acquire))
+    }
+}
+
+/// The stream states that mean it is gone for good. A sound server restart closes the core's
+/// socket, and libpipewire then moves every stream on it to Unconnected; a stream PipeWire
+/// refused or broke ends in Error. Neither comes back: only a new stream plays again.
+fn stream_gone(state: &StreamState) -> bool {
+    matches!(state, StreamState::Unconnected | StreamState::Error(_))
+}
+
+/// Whether a core `error` event about object `id` means the connection itself is gone. Errors
+/// about the core object (EPIPE when the daemon goes away) are the connection's, whatever the
+/// code; one about another object is that object's, and the stream reports its own through
+/// its state.
+fn core_gone(id: u32) -> bool {
+    id == pw::core::PW_ID_CORE
 }
 
 /// A wait for a cycle that is late, or before the first one: short, but no spin.
@@ -350,6 +372,14 @@ impl Output {
         }
     }
 
+    /// `OutputRestarted` once the stream is gone (see `stream_gone`, `core_gone`).
+    fn check_alive(&self) -> Result<(), Error> {
+        if self.shared.failed.load(Ordering::Acquire) {
+            return Err(Error::OutputRestarted);
+        }
+        Ok(())
+    }
+
     /// How long until the callback has freed room for `frames` (see `cycle_wait`).
     fn wait_for_room(&self, frames: usize) -> Duration {
         cycle_wait(
@@ -400,6 +430,18 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(no_pipewire)?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(no_pipewire)?;
     let core = context.connect_rc(None).map_err(no_pipewire)?;
+    // The connection's own errors. libpipewire also moves the stream to Unconnected when the
+    // daemon goes away, but this does not depend on that: any fatal error on the core marks
+    // the output gone, so the next `open` connects again.
+    let core_shared = setup.shared.clone();
+    let _core = core
+        .add_listener_local()
+        .error(move |id, _seq, _res, _message| {
+            if core_gone(id) {
+                core_shared.failed.store(true, Ordering::Release);
+            }
+        })
+        .register();
     let stream = StreamRc::new(
         core,
         APP_NAME,
@@ -435,15 +477,13 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     let state_shared = setup.shared.clone();
     let _state = stream
         .add_local_listener_with_user_data(())
-        .state_changed(move |s, _, _, new| match new {
-            StreamState::Error(_) | StreamState::Unconnected => {
+        .state_changed(move |s, _, _, new| {
+            if stream_gone(&new) {
                 state_shared.failed.store(true, Ordering::Release);
-            }
-            // Controls only stick once the stream is negotiated: apply the volume then.
-            StreamState::Paused | StreamState::Streaming => {
+            } else if matches!(new, StreamState::Paused | StreamState::Streaming) {
+                // Controls only stick once the stream is negotiated: apply the volume then.
                 set_volume(s, state_volume.get());
             }
-            StreamState::Connecting => {}
         })
         .register()
         .map_err(no_pipewire)?;
@@ -664,7 +704,7 @@ mod tests {
     #[test]
     fn failed_stream_is_reconnected() {
         // After a PipeWire restart the old stream is gone for good: the next song must get a
-        // new one, not keep failing with "the audio output stopped" on the dead one.
+        // new one, not keep failing on the dead one.
         let mut sink = PipeWireSink::new();
         sink.connect = fake_connect;
         sink.open(48_000, 2).unwrap();
@@ -683,6 +723,41 @@ mod tests {
                 .failed
                 .load(Ordering::Acquire)
         );
+    }
+
+    #[test]
+    fn stream_states_that_mean_the_server_is_gone() {
+        // A sound server restart leaves the stream Unconnected (the core's socket closed),
+        // a refused or broken stream ends in Error: both are gone for good.
+        assert!(stream_gone(&StreamState::Unconnected));
+        assert!(stream_gone(&StreamState::Error("broken".into())));
+        assert!(!stream_gone(&StreamState::Connecting));
+        assert!(!stream_gone(&StreamState::Paused));
+        assert!(!stream_gone(&StreamState::Streaming));
+    }
+
+    #[test]
+    fn core_errors_that_mean_the_server_is_gone() {
+        // An error on the core object itself is the connection's (EPIPE: the daemon went
+        // away); an error about another object is that object's, which its owner handles.
+        assert!(core_gone(pw::core::PW_ID_CORE));
+        assert!(!core_gone(42));
+    }
+
+    #[test]
+    fn a_lost_output_says_so_until_reopened() {
+        let mut sink = PipeWireSink::new();
+        sink.connect = fake_connect;
+        assert!(!sink.lost(), "nothing open is nothing lost");
+        sink.open(48_000, 2).unwrap();
+        assert!(!sink.lost());
+        let shared = sink.out.as_ref().unwrap().shared.clone();
+        shared.failed.store(true, Ordering::Release);
+        assert!(sink.lost());
+        // A write into the dead stream names the restart, so the engine can act on it.
+        assert_eq!(sink.write(&[0.0; 4]), Err(Error::OutputRestarted));
+        sink.open(48_000, 2).unwrap();
+        assert!(!sink.lost(), "open made a new stream");
     }
 
     #[test]

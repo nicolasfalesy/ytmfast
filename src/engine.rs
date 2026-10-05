@@ -119,6 +119,9 @@ pub struct Engine {
     loaded: bool,
     /// The audio thread has said `Started` for the current song.
     started: bool,
+    /// The current play already started its song again after an output restart. Once per
+    /// play: an output that keeps dying under the song must not loop for ever.
+    replayed: bool,
     /// Loads handed to the audio thread, and `Loading` events back from it.
     loads_sent: u64,
     loads_seen: u64,
@@ -171,6 +174,7 @@ impl Engine {
             start_seconds: 0.0,
             loaded: false,
             started: false,
+            replayed: false,
             loads_sent: 0,
             loads_seen: 0,
             ticker: None,
@@ -273,6 +277,7 @@ impl Engine {
         self.player.stop();
         self.loaded = false;
         self.started = false;
+        self.replayed = false;
         self.ticker = None;
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
@@ -436,6 +441,17 @@ impl Engine {
             AudioEvent::Error(e) => {
                 self.status.position = self.player.position();
                 self.fail(&e);
+                // The sound server restarted under the song (often a `systemctl restart` or
+                // an update): after reporting it, play the song again from where it was, on
+                // a new stream. The link is usually still cached, so this is quick.
+                if e == Error::OutputRestarted
+                    && !self.replayed
+                    && let Some(id) = self.status.video_id.clone()
+                {
+                    let at = self.status.position;
+                    self.start(id, at);
+                    self.replayed = true;
+                }
             }
         }
     }
@@ -817,6 +833,64 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(3), "{what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_restarted_output_plays_the_song_again_once_where_it_was() {
+        let mut r = rig(Setup::default()).await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Playing).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        r.stats.lose_output();
+        let seen = r.until(PlayState::Playing).await;
+        // The restart is reported, then the same song plays again from where it was.
+        let errors: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Error { code, message } => Some((*code, message.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [(
+                "internal",
+                "internal error: the audio output restarted".into()
+            )]
+        );
+        let states = states(&seen);
+        let mut kinds: Vec<_> = states.iter().map(|s| s.state).collect();
+        // A play reports Buffering twice: when asked, and again with the song's details.
+        kinds.dedup();
+        assert_eq!(
+            kinds,
+            [PlayState::Stopped, PlayState::Buffering, PlayState::Playing]
+        );
+        let at = states[1].position;
+        assert!(at > 0.3 && at < 0.7, "restarted at {at}");
+        assert_eq!(r.started(), ["AAAAAAAAAAA", "AAAAAAAAAAA"]);
+
+        // Once per play: a second restart in the same song is only reported.
+        r.stats.lose_output();
+        let seen = r.until(PlayState::Stopped).await;
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            EngineEvent::Error {
+                code: "internal",
+                ..
+            }
+        )));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.started().len(), 2, "no second retry");
+        assert_eq!(r.status().await.state, PlayState::Stopped);
+
+        // A new play is a new song: its own restart gets its own retry.
+        r.play("BBBBBBBBBBB").await;
+        r.until(PlayState::Playing).await;
+        r.stats.lose_output();
+        r.until(PlayState::Stopped).await;
+        r.until(PlayState::Playing).await;
+        assert_eq!(r.started().len(), 4);
     }
 
     #[tokio::test]

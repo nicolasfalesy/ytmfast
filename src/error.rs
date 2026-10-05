@@ -17,6 +17,11 @@ pub enum Error {
     StreamFailed(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// The sound server went away under the output (restarted, or crashed): the stream is
+    /// gone for good, and the next `open` makes a new one. Its own variant, not `Internal`
+    /// text, because the engine acts on it (it plays the song again once, where it was).
+    #[error("internal error: the audio output restarted")]
+    OutputRestarted,
 }
 
 impl Error {
@@ -26,7 +31,7 @@ impl Error {
             Error::Unavailable(_) => "unavailable",
             Error::Network(_) => "network",
             Error::StreamFailed(_) => "stream_failed",
-            Error::Internal(_) => "internal",
+            Error::Internal(_) | Error::OutputRestarted => "internal",
         }
     }
 }
@@ -66,6 +71,7 @@ mod tests {
         assert_eq!(Error::Network("x".into()).code(), "network");
         assert_eq!(Error::StreamFailed("x".into()).code(), "stream_failed");
         assert_eq!(Error::Internal("x".into()).code(), "internal");
+        assert_eq!(Error::OutputRestarted.code(), "internal");
     }
 
     #[test]

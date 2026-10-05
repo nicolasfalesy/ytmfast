@@ -23,6 +23,12 @@ pub trait Sink: Send {
     fn set_volume(&mut self, v: f32);
     /// Frames written but not yet heard: queued in the sink plus the output's latency.
     fn delay_frames(&self) -> u64;
+    /// The output's connection is gone (the sound server restarted or crashed): writes fail
+    /// with `Error::OutputRestarted` until `open` makes a new one. The audio thread asks before
+    /// resuming, because a paused song never writes and so would never find out.
+    fn lost(&self) -> bool {
+        false
+    }
 }
 
 /// What a `NullSink` saw. Shared, so a test keeps reading it after the sink moves to the
@@ -36,6 +42,8 @@ pub struct NullStats {
     /// f32 bits.
     volume: AtomicU32,
     rate: AtomicU32,
+    /// Set by `lose_output`, cleared by the next `open`.
+    lost: AtomicBool,
 }
 
 impl NullStats {
@@ -58,6 +66,11 @@ impl NullStats {
     /// The rate it was last opened at (0 = never opened).
     pub fn rate(&self) -> u32 {
         self.rate.load(Ordering::SeqCst)
+    }
+    /// Plays a sound server restart: the sink acts like a `PipeWireSink` whose stream died
+    /// (writes fail, `lost` is true) until it is opened again.
+    pub fn lose_output(&self) {
+        self.lost.store(true, Ordering::SeqCst);
     }
 }
 
@@ -147,12 +160,17 @@ impl Sink for NullSink {
         self.rate = rate;
         self.channels = channels;
         self.stats.rate.store(rate, Ordering::SeqCst);
+        // A new output: whatever the old one lost, this one has.
+        self.stats.lost.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     fn write(&mut self, frames: &[f32]) -> Result<(), Error> {
         if self.rate == 0 {
             return Err(Error::Internal("the output is not open".into()));
+        }
+        if self.lost() {
+            return Err(Error::OutputRestarted);
         }
         let n = (frames.len() / usize::from(self.channels)) as u64;
         if let Pace::Realtime { capacity_secs } = self.pace {
@@ -164,6 +182,9 @@ impl Sink for NullSink {
                 }
                 if self.paused {
                     return Err(Error::Internal("write while paused".into()));
+                }
+                if self.lost() {
+                    return Err(Error::OutputRestarted);
                 }
                 // Sleep for as long as the deficit takes to play: no busy wait.
                 let deficit = self.queued + n - capacity.max(n);
@@ -200,6 +221,10 @@ impl Sink for NullSink {
             Pace::Realtime { .. } => self.fill_now(),
         }
     }
+
+    fn lost(&self) -> bool {
+        self.stats.lost.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +242,20 @@ mod tests {
         assert_eq!(s.delay_frames(), 4800);
         s.set_volume(0.5);
         assert_eq!(stats.volume(), 0.5);
+    }
+
+    #[test]
+    fn a_lost_output_fails_writes_until_reopened() {
+        let mut s = NullSink::new();
+        let stats = s.stats();
+        s.open(48_000, 2).unwrap();
+        assert!(!s.lost());
+        stats.lose_output();
+        assert!(s.lost());
+        assert_eq!(s.write(&[0.0; 4]), Err(Error::OutputRestarted));
+        s.open(48_000, 2).unwrap();
+        assert!(!s.lost(), "open reconnects");
+        s.write(&[0.0; 4]).unwrap();
     }
 
     #[test]

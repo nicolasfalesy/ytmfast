@@ -79,6 +79,11 @@ An error:
 
 Error codes: `signed_out`, `unavailable`, `network`, `stream_failed`, `internal`.
 
+When the sound server restarts under a song, the engine sends `internal` with the message
+`internal error: the audio output restarted`, then plays the same song again from where it
+was (`stopped`, then `buffering`, then `playing`). It does this once per play; a second
+restart in the same song leaves it stopped.
+
 ## Connections
 
 - A client that falls behind on events gets a fresh `state` event in place of the ones it
