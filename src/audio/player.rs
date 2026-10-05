@@ -22,14 +22,20 @@ use crate::error::Error;
 /// What the audio thread reports.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioEvent {
+    /// The audio thread took the next `load` and is opening it: every event after this one is
+    /// about that track. One per `load`, in order, so a listener that counts its loads can
+    /// tell a late event from an earlier track (an `Ended` already on its way when a new song
+    /// was picked) from one about the newest track.
+    Loading,
     /// The loaded track's first `play`.
     Started,
     Paused,
     Resumed,
     /// The track played to its end (all of it heard, not just decoded).
     Ended,
-    /// The track failed; the player is idle. The text is the error's `Display`.
-    Error(String),
+    /// The track failed; the player is idle. The error itself, so its `code()` reaches the
+    /// user (its `Display` is URL-free, ruling R6).
+    Error(Error),
 }
 
 enum Command {
@@ -325,6 +331,7 @@ impl Worker {
         start: f64,
         length_hint: Option<f64>,
     ) {
+        self.emit(AudioEvent::Loading);
         self.unload();
         let cancel = reader.canceller();
         // Opening reads the track's headers, so it waits for the first bytes to arrive.
@@ -430,7 +437,7 @@ impl Worker {
     /// A failed track: report it and go idle.
     fn fail(&mut self, e: Error) {
         self.unload();
-        self.emit(AudioEvent::Error(e.to_string()));
+        self.emit(AudioEvent::Error(e));
     }
 
     /// Like `fail`, but quiet when the engine cancelled the track's reader on purpose (stop,
@@ -471,7 +478,17 @@ mod tests {
         (p, events, stats)
     }
 
+    /// The next event, skipping `Loading` (most tests are about what follows it).
     fn next_event(events: &Receiver<AudioEvent>) -> AudioEvent {
+        loop {
+            match raw_event(events) {
+                AudioEvent::Loading => continue,
+                e => return e,
+            }
+        }
+    }
+
+    fn raw_event(events: &Receiver<AudioEvent>) -> AudioEvent {
         events
             .recv_timeout(Duration::from_secs(5))
             .expect("an event within 5 s")
@@ -602,7 +619,11 @@ mod tests {
         p.load(garbage, OPUS_MIME, 1.0, 0.0, None);
         p.play();
         match next_event(&events) {
-            AudioEvent::Error(m) => assert!(m.contains("not a recognised audio file"), "{m}"),
+            AudioEvent::Error(e) => {
+                // The error itself, so the engine can report its code.
+                assert_eq!(e.code(), "stream_failed");
+                assert!(e.to_string().contains("not a recognised audio file"), "{e}");
+            }
             e => panic!("wanted an error, got {e:?}"),
         }
     }
@@ -678,6 +699,20 @@ mod tests {
         assert_eq!(next_event(&events), AudioEvent::Started);
         assert_eq!(next_event(&events), AudioEvent::Ended);
         assert_eq!(stats.frames(), 88_200);
+    }
+
+    #[test]
+    fn each_load_is_announced_before_its_events() {
+        let (p, events, _) = player(NullSink::new());
+        p.load(stalled("sine440_48k.webm", 100), OPUS_MIME, 1.0, 0.0, None);
+        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.0, None);
+        p.play();
+        // One `Loading` per load, in order, and the second track's events after its own:
+        // the engine counts them to drop events that belong to an earlier track.
+        assert_eq!(raw_event(&events), AudioEvent::Loading);
+        assert_eq!(raw_event(&events), AudioEvent::Loading);
+        assert_eq!(raw_event(&events), AudioEvent::Started);
+        assert_eq!(raw_event(&events), AudioEvent::Ended);
     }
 
     #[test]

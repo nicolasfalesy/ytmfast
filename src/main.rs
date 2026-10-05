@@ -271,8 +271,11 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
         };
         match event {
             AudioEvent::Ended => return Ok(()),
-            AudioEvent::Error(message) => return Err(message),
-            AudioEvent::Started | AudioEvent::Paused | AudioEvent::Resumed => {}
+            AudioEvent::Error(e) => return Err(e.to_string()),
+            AudioEvent::Loading
+            | AudioEvent::Started
+            | AudioEvent::Paused
+            | AudioEvent::Resumed => {}
         }
     }
 }
@@ -381,7 +384,7 @@ mod tests {
         tx.send(AudioEvent::Ended).unwrap();
         assert_eq!(wait_for_end(&rx, None), Ok(()));
 
-        tx.send(AudioEvent::Error("stream failed: x".into()))
+        tx.send(AudioEvent::Error(Error::StreamFailed("x".into())))
             .unwrap();
         assert_eq!(wait_for_end(&rx, None), Err("stream failed: x".into()));
 
