@@ -5,9 +5,23 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use url::Url;
+use ytmfast::audio::decode::loudness_gain;
+use ytmfast::audio::fetch::{Relink, TrackBuffer};
+use ytmfast::audio::player::{AudioEvent, AudioPlayer};
+use ytmfast::audio::pw::PipeWireSink;
+use ytmfast::audio::sink::{NullSink, Sink};
 use ytmfast::auth::{KeyringStore, SessionStore, chromium};
 use ytmfast::error::Error;
+use ytmfast::innertube::{API_BASE, Innertube};
+use ytmfast::paths;
+use ytmfast::solver::Solver;
+use ytmfast::streams::ytdlp::YtDlpCommand;
+use ytmfast::streams::{Resolver, Streams};
 
 const USAGE: &str = "\
 usage: ytmfast <command>
@@ -17,22 +31,34 @@ commands:
   import-session [--profile PATH]
                     store a YouTube Music session in the login keyring, read from the
                     pear-desktop profile (default: ~/.config/YouTube Music)
-  play <videoId>    play one song to the default output and exit (debug helper)
+  play <videoId> [--null-sink] [--seconds N]
+                    play one song to the default output and exit (debug helper);
+                    --null-sink plays in real time into nothing (benchmarks),
+                    --seconds stops after N seconds
 
 options:
   -h, --help        show this help
   -V, --version     show the version";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Command {
     Daemon,
     /// The profile folder, when `--profile` gave one.
     ImportSession(Option<PathBuf>),
-    Play(String),
+    Play(PlayArgs),
     Version,
     Help,
     /// Anything we don't understand: print usage and exit 2.
     Usage,
+}
+
+#[derive(Debug, PartialEq)]
+struct PlayArgs {
+    video_id: String,
+    /// Play into a `NullSink` paced in real time instead of PipeWire.
+    null_sink: bool,
+    /// Stop after this long.
+    seconds: Option<f64>,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Command {
@@ -42,11 +68,38 @@ fn parse(args: impl IntoIterator<Item = String>) -> Command {
         ["daemon"] => Command::Daemon,
         ["import-session"] => Command::ImportSession(None),
         ["import-session", "--profile", path] => Command::ImportSession(Some(path.into())),
-        ["play", id] => Command::Play((*id).to_string()),
+        ["play", rest @ ..] => parse_play(rest).map_or(Command::Usage, Command::Play),
         ["-V" | "--version"] => Command::Version,
         ["-h" | "--help"] => Command::Help,
         _ => Command::Usage,
     }
+}
+
+/// `play`'s arguments, in any order: the id once, each option at most once.
+fn parse_play(args: &[&str]) -> Option<PlayArgs> {
+    let mut video_id = None;
+    let mut null_sink = false;
+    let mut seconds = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match *arg {
+            "--null-sink" if !null_sink => null_sink = true,
+            "--seconds" if seconds.is_none() => {
+                let n: f64 = it.next()?.parse().ok()?;
+                if !(n.is_finite() && n > 0.0) {
+                    return None;
+                }
+                seconds = Some(n);
+            }
+            a if !a.starts_with('-') && video_id.is_none() => video_id = Some(a.to_string()),
+            _ => return None,
+        }
+    }
+    Some(PlayArgs {
+        video_id: video_id?,
+        null_sink,
+        seconds,
+    })
 }
 
 /// Subcommands later steps wire up: each task wires the part it owns.
@@ -107,11 +160,112 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
     }
 }
 
+/// Plays one song to the end (or for `--seconds`). Prints the song's title and artist, and
+/// errors; never a link (they carry access tokens).
+fn play(args: PlayArgs) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("ytmfast: could not start the async runtime");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(play_track(args)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("ytmfast: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// An `Error` for the terminal: its text and its code.
+fn describe(e: Error) -> String {
+    format!("{e} [{}]", e.code())
+}
+
+async fn play_track(args: PlayArgs) -> Result<(), String> {
+    let store: Arc<dyn SessionStore> = Arc::new(KeyringStore::new());
+    let session = Arc::new(Mutex::new(store.load().await.map_err(describe)?));
+    let base = Url::parse(API_BASE).map_err(|_| "bad API address".to_string())?;
+    let api = Arc::new(Innertube::new(session.clone(), store, base));
+    let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
+    let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
+    let resolver: Arc<dyn Resolver> = Arc::new(Streams::new(
+        api,
+        session,
+        Arc::new(Solver::new(cache.clone())),
+        Arc::new(YtDlpCommand::new(runtime_dir)),
+        cache,
+    ));
+
+    let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
+    println!("{} - {}", stream.meta.title, stream.meta.artist);
+    let gain = loudness_gain(stream.loudness_db);
+    let mime = stream.mime.clone();
+
+    // A link that stops working mid-song is replaced by a fresh one, never a cached one
+    // (ruling R2).
+    let relink: Relink = {
+        let resolver = resolver.clone();
+        let id = args.video_id.clone();
+        Box::new(move || {
+            let resolver = resolver.clone();
+            let id = id.clone();
+            Box::pin(async move { resolver.resolve_fresh(&id).await.map(|s| s.url) })
+        })
+    };
+    let buffer = TrackBuffer::start(stream, relink);
+
+    let sink: Box<dyn Sink> = if args.null_sink {
+        Box::new(NullSink::realtime())
+    } else {
+        Box::new(PipeWireSink::new())
+    };
+    let player = AudioPlayer::spawn(sink);
+    let events = player.events();
+    player.load(buffer.reader(), &mime, gain, 0.0);
+    player.play();
+    // The wait is blocking; the download runs on this runtime meanwhile.
+    let seconds = args.seconds;
+    let outcome = tokio::task::spawn_blocking(move || wait_for_end(&events, seconds))
+        .await
+        .map_err(|_| "the wait for the song failed".to_string())?;
+    drop(player);
+    drop(buffer);
+    outcome
+}
+
+/// Waits for the song to end: `Ok` at its end or once `seconds` have passed, `Err` with the
+/// message of an audio error.
+fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(), String> {
+    let gone = || "the audio thread stopped".to_string();
+    let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
+    loop {
+        let event = match deadline {
+            Some(d) => match events.recv_deadline(d) {
+                Ok(e) => e,
+                Err(RecvTimeoutError::Timeout) => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => return Err(gone()),
+            },
+            None => events.recv().map_err(|_| gone())?,
+        };
+        match event {
+            AudioEvent::Ended => return Ok(()),
+            AudioEvent::Error(message) => return Err(message),
+            AudioEvent::Started | AudioEvent::Paused | AudioEvent::Resumed => {}
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match parse(std::env::args().skip(1)) {
         Command::Daemon => not_built_yet("daemon"),
         Command::ImportSession(profile) => import_session(profile),
-        Command::Play(_video_id) => not_built_yet("play"),
+        Command::Play(args) => play(args),
         Command::Version => {
             println!("ytmfast {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -145,12 +299,74 @@ mod tests {
         );
         assert_eq!(
             p(&["play", "dQw4w9WgXcQ"]),
-            Command::Play("dQw4w9WgXcQ".into())
+            Command::Play(play("dQw4w9WgXcQ"))
         );
         assert_eq!(p(&["--version"]), Command::Version);
         assert_eq!(p(&["-V"]), Command::Version);
         assert_eq!(p(&["--help"]), Command::Help);
         assert_eq!(p(&["-h"]), Command::Help);
+    }
+
+    fn play(id: &str) -> PlayArgs {
+        PlayArgs {
+            video_id: id.into(),
+            null_sink: false,
+            seconds: None,
+        }
+    }
+
+    #[test]
+    fn cli_parses_play_options() {
+        assert_eq!(
+            p(&["play", "dQw4w9WgXcQ", "--null-sink"]),
+            Command::Play(PlayArgs {
+                null_sink: true,
+                ..play("dQw4w9WgXcQ")
+            })
+        );
+        assert_eq!(
+            p(&["play", "--seconds", "2.5", "--null-sink", "dQw4w9WgXcQ"]),
+            Command::Play(PlayArgs {
+                null_sink: true,
+                seconds: Some(2.5),
+                ..play("dQw4w9WgXcQ")
+            })
+        );
+        for bad in [
+            &["play", "id", "--seconds"][..],
+            &["play", "id", "--seconds", "x"],
+            &["play", "id", "--seconds", "0"],
+            &["play", "id", "--seconds", "-1"],
+            &["play", "id", "--seconds", "inf"],
+            &["play", "id", "--null-sink", "--null-sink"],
+            &["play", "--null-sink"],
+            &["play", "id", "--loud"],
+        ] {
+            assert_eq!(p(bad), Command::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_ends_on_ended_error_or_time() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(AudioEvent::Started).unwrap();
+        tx.send(AudioEvent::Ended).unwrap();
+        assert_eq!(wait_for_end(&rx, None), Ok(()));
+
+        tx.send(AudioEvent::Error("stream failed: x".into()))
+            .unwrap();
+        assert_eq!(wait_for_end(&rx, None), Err("stream failed: x".into()));
+
+        // Nothing comes: --seconds stops it.
+        let t = std::time::Instant::now();
+        assert_eq!(wait_for_end(&rx, Some(0.1)), Ok(()));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(100));
+
+        drop(tx);
+        assert!(
+            wait_for_end(&rx, None).is_err(),
+            "the audio thread went away"
+        );
     }
 
     #[test]
