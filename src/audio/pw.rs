@@ -55,6 +55,11 @@ struct Shared {
     underruns: AtomicU64,
     /// Bumped every cycle, so a waiting writer can tell a stalled output from a full one.
     cycles: AtomicU64,
+    /// When the last cycle ran (CLOCK_MONOTONIC ns) and how many frames it took: a writer
+    /// waiting for room sleeps until the cycle that frees it, so it wakes once per write
+    /// instead of polling while PipeWire drains the ring in quantum-sized bursts.
+    cycle_ns: AtomicU64,
+    cycle_frames: AtomicU64,
     /// Set when the writer queues audio, cleared when the ring runs dry.
     primed: AtomicBool,
     /// The stream errored or was disconnected.
@@ -120,7 +125,8 @@ impl PipeWireSink {
             != out.shared.flush_request.load(Ordering::Acquire)
         {
             watch.check()?;
-            std::thread::sleep(Duration::from_millis(2));
+            // The next cycle does the flush.
+            std::thread::sleep(out.wait_for_room(1));
         }
         Ok(())
     }
@@ -191,10 +197,9 @@ impl Sink for PipeWireSink {
                 continue;
             }
             watch.check()?;
-            // Full: sleep about as long as the missing room takes to play.
+            // Full: sleep until the cycle that frees room for the rest.
             let missing = frames.len().min(out.capacity) / 2;
-            let wait = Duration::from_secs_f64(missing as f64 / f64::from(out.rate));
-            std::thread::sleep(wait.clamp(Duration::from_millis(1), Duration::from_millis(50)));
+            std::thread::sleep(out.wait_for_room(missing));
         }
         Ok(())
     }
@@ -223,6 +228,41 @@ impl Sink for PipeWireSink {
         let ring = (out.capacity - out.producer.slots()) / 2;
         out.shared.pipeline_delay.load(Ordering::Acquire) + ring as u64
     }
+}
+
+/// A wait for a cycle that is late, or before the first one: short, but no spin.
+const RECHECK: Duration = Duration::from_millis(5);
+
+/// Wakes this long after the cycle's expected start, so its callback has run.
+const CYCLE_MARGIN_NS: u64 = 300_000;
+
+/// How long a writer needing room for `frames` sleeps: until the callback has run often
+/// enough to free it, from when the last cycle ran (`last_ns`) and its size. PipeWire frees
+/// room a quantum at a time, so this is one wake per write where a deficit-sized sleep woke
+/// several times per quantum.
+fn cycle_wait(last_ns: u64, now_ns: u64, cycle_frames: u64, rate: u32, frames: usize) -> Duration {
+    if last_ns == 0 || cycle_frames == 0 || rate == 0 {
+        return RECHECK;
+    }
+    let period_ns = cycle_frames * 1_000_000_000 / u64::from(rate);
+    let cycles = (frames as u64).div_ceil(cycle_frames).max(1);
+    let wake = last_ns + cycles * period_ns + CYCLE_MARGIN_NS;
+    if wake <= now_ns {
+        return RECHECK;
+    }
+    // At most the ring's length: room is always free by then.
+    Duration::from_nanos(wake - now_ns).min(Duration::from_secs_f64(RING_SECS))
+}
+
+/// CLOCK_MONOTONIC in ns: the clock `pw_time.now` uses.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec to write into; CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 /// Notices a writer that is waiting on a stream PipeWire no longer runs.
@@ -296,6 +336,17 @@ impl Output {
                 Err(Error::Internal("PipeWire did not answer".into()))
             }
         }
+    }
+
+    /// How long until the callback has freed room for `frames` (see `cycle_wait`).
+    fn wait_for_room(&self, frames: usize) -> Duration {
+        cycle_wait(
+            self.shared.cycle_ns.load(Ordering::Acquire),
+            monotonic_ns(),
+            self.shared.cycle_frames.load(Ordering::Acquire),
+            self.rate,
+            frames,
+        )
     }
 
     fn close(mut self) {
@@ -472,6 +523,9 @@ fn process(stream: &pw::stream::Stream, rt: &mut Rt) {
                     0 => room,
                     r => r.min(room),
                 };
+                rt.shared
+                    .cycle_frames
+                    .store(wanted as u64, Ordering::Release);
                 let bytes = std::slice::from_raw_parts_mut(data.data.cast::<u8>(), wanted * STRIDE);
                 let filled = fill(&mut rt.consumer, bytes);
                 if filled < wanted && rt.shared.primed.swap(false, Ordering::AcqRel) {
@@ -503,6 +557,9 @@ fn process(stream: &pw::stream::Stream, rt: &mut Rt) {
         let delay = (device + t.queued() + t.buffered()).saturating_sub(rt.trailing_silence);
         rt.shared.pipeline_delay.store(delay, Ordering::Release);
     }
+    // The cycle's time from our own clock read (a vDSO call, no syscall): `pw_time.now` can
+    // be stale when the stream's time isn't updated every cycle.
+    rt.shared.cycle_ns.store(monotonic_ns(), Ordering::Release);
     rt.shared.cycles.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -544,6 +601,25 @@ mod tests {
             .collect();
         assert_eq!(samples, [0.5, -0.5, 0.25, -0.25, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(c.slots(), 1, "the odd sample waits for its pair");
+    }
+
+    #[test]
+    fn writer_sleeps_until_the_cycle_that_frees_room() {
+        let ms = |n: f64| Duration::from_secs_f64(n / 1000.0);
+        // 1024-frame cycles at 48 kHz are 21.33 ms; the last ran 5 ms ago. One packet (960
+        // frames) needs one cycle: wake just after the next, about 16.6 ms from now.
+        let last = 1_000_000_000;
+        let now = last + 5_000_000;
+        let w = cycle_wait(last, now, 1024, 48_000, 960);
+        assert!(w >= ms(16.3) && w <= ms(16.9), "{w:?}");
+        // 3000 frames need three cycles.
+        let w = cycle_wait(last, now, 1024, 48_000, 3000);
+        assert!(w >= ms(59.0) && w <= ms(59.6), "{w:?}");
+        // Overdue (the callback is late): a short re-check, not a spin.
+        let w = cycle_wait(last, last + 30_000_000, 1024, 48_000, 960);
+        assert_eq!(w, ms(5.0));
+        // No cycle seen yet: a fixed short wait.
+        assert_eq!(cycle_wait(0, now, 0, 48_000, 960), ms(5.0));
     }
 
     #[test]
