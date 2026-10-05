@@ -578,17 +578,40 @@ pub unsafe fn take_systemd_listener() -> io::Result<Option<std::os::unix::net::U
 pub struct BoundSocket {
     pub path: PathBuf,
     /// Which file we made: on exit, a socket another daemon put there since is left alone.
+    id: SocketId,
+}
+
+/// A socket file's identity. The inode number alone isn't one: a filesystem hands an
+/// unlinked file's number to the next new file, so the change time (set by our chmod right
+/// after bind) is compared too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketId {
     dev: u64,
     ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl SocketId {
+    fn of(m: &std::fs::Metadata) -> SocketId {
+        use std::os::unix::fs::MetadataExt;
+        SocketId {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
 }
 
 impl BoundSocket {
+    /// Removes the socket on exit, once our listener is closed. Left alone when it isn't
+    /// ours any more, and when anything answers on it: file times come from a coarse clock
+    /// (about a millisecond), so a socket re-bound right after ours can share both its inode
+    /// number and its change time, and only a live listener tells them apart.
     pub fn remove(self) {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(m) = std::fs::symlink_metadata(&self.path)
-            && m.dev() == self.dev
-            && m.ino() == self.ino
-        {
+        let ours = std::fs::symlink_metadata(&self.path).is_ok_and(|m| SocketId::of(&m) == self.id);
+        if ours && std::os::unix::net::UnixStream::connect(&self.path).is_err() {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -598,7 +621,7 @@ impl BoundSocket {
 /// that answers means another daemon is running: refused. One that doesn't answer is left
 /// over from a crash and is replaced. Anything else at the path is refused.
 pub fn bind_socket(path: &Path) -> io::Result<(std::os::unix::net::UnixListener, BoundSocket)> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     match std::fs::symlink_metadata(path) {
@@ -625,11 +648,9 @@ pub fn bind_socket(path: &Path) -> io::Result<(std::os::unix::net::UnixListener,
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let m = std::fs::symlink_metadata(path)?;
     let bound = BoundSocket {
         path: path.to_path_buf(),
-        dev: m.dev(),
-        ino: m.ino(),
+        id: SocketId::of(&std::fs::symlink_metadata(path)?),
     };
     Ok((listener, bound))
 }
@@ -693,13 +714,50 @@ mod tests {
 
         // The daemon died without cleaning up: nothing answers, so it is replaced.
         drop(listener);
-        let (_listener2, bound2) = bind_socket(&path).unwrap();
+        let (listener2, bound2) = bind_socket(&path).unwrap();
 
         // The first daemon's late cleanup doesn't remove the second one's socket.
         bound.remove();
         assert!(path.exists());
+        // The second one's own cleanup does, once its listener is closed (as `daemon` does).
+        drop(listener2);
         bound2.remove();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn socket_identity_sees_inode_reuse() {
+        let a = SocketId {
+            dev: 1,
+            ino: 42,
+            ctime: 1_000,
+            ctime_nsec: 5,
+        };
+        assert_eq!(a, a);
+        // The same inode number handed to a newer socket: its change time differs.
+        assert_ne!(a, SocketId { ctime_nsec: 6, ..a });
+        assert_ne!(a, SocketId { ctime: 1_001, ..a });
+        assert_ne!(a, SocketId { ino: 43, ..a });
+        assert_ne!(a, SocketId { dev: 2, ..a });
+    }
+
+    /// The worst case of inode reuse: a newer socket with the same inode number AND the same
+    /// change time (file times come from a coarse clock, so a socket re-bound within a
+    /// millisecond or so can share it). A live socket is still never removed.
+    #[test]
+    fn late_cleanup_never_removes_a_live_socket_even_with_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let (old_listener, _old) = bind_socket(&path).unwrap();
+        drop(old_listener);
+        let (_new_listener, new) = bind_socket(&path).unwrap();
+        // The old daemon's record, forged to match the new socket exactly.
+        let forged = BoundSocket {
+            path: path.clone(),
+            id: new.id,
+        };
+        forged.remove();
+        assert!(path.exists(), "a late cleanup removed a live socket");
     }
 
     #[test]
