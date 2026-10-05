@@ -5,7 +5,7 @@ Date: 2026-10-04. Status: approved design, awaiting spec review.
 ## Goal
 
 A small, headless Rust engine that plays YouTube Music, built to replace the Electron app
-(`pear-desktop`) behind the `nic.youtube-music` Omarchy bar widget. Same idea as Spotifast for Spotify:
+(`pear-desktop`) behind the YouTube Music Omarchy bar widget. Same idea as Spotifast for Spotify:
 no browser engine, a fraction of the memory, instant start. The widget stays the only UI.
 
 Success means:
@@ -162,7 +162,7 @@ The engine owns the queue (in `pear-desktop` the web page owned it).
   engine. It quits after `idle_minutes` with nothing playing (5 on AC, 2 on battery, both configurable),
   saving state first. The socket unit costs nothing while the engine is stopped.
 
-## Widget changes (`nic.youtube-music`)
+## Widget changes (the YouTube Music bar widget)
 
 - New backend file for ytmfast next to the existing `pear-desktop` code. The widget picks ytmfast when the
   `ytmfast.socket` unit exists. It checks once, lazily, never at plugin import (heavy work at import has

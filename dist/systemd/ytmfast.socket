@@ -1,0 +1,10 @@
+[Unit]
+Description=ytmfast control socket
+
+[Socket]
+ListenStream=%t/ytmfast/socket
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

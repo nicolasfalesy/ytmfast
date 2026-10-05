@@ -1,0 +1,20 @@
+{
+  "responseContext": { "visitorData": "FAKEVISITORDATA0000" },
+  "playabilityStatus": {
+    "status": "UNPLAYABLE",
+    "reason": "This video is not available in your country",
+    "errorScreen": {
+      "playerErrorMessageRenderer": {
+        "reason": { "simpleText": "This video is not available in your country" }
+      }
+    },
+    "contextParams": "FAKECONTEXTPARAMS"
+  },
+  "videoDetails": {
+    "videoId": "FAKEVID0002",
+    "title": "Blocked Song",
+    "lengthSeconds": "180",
+    "author": "Test Artist"
+  },
+  "trackingParams": "FAKETRACKINGPARAMS"
+}

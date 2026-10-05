@@ -11,7 +11,7 @@ takes `EngineCmd`s from the socket and MPRIS, and broadcasts `EngineEvent`s back
 
 **Tech Stack:** Rust 2024 (rustc 1.98), tokio 1.53, reqwest 0.13 (rustls), rusqlite 0.40 (bundled), rquickjs 0.14,
 symphonia 0.6 (`mkv`, `isomp4`, `aac`), opus 0.4 (libopus), pipewire 0.10, mpris-server 0.10 (zbus 5),
-serde/serde_json, crossbeam-channel, sha1 0.11, pbkdf2 0.13 + aes 0.9 + cbc 0.2, oo7 0.6 (keyring), thiserror 2, tracing + tracing-journald, wiremock 0.6
+serde/serde_json, crossbeam-channel, sha1 0.11, pbkdf2 0.13 + aes 0.9 + cbc 0.2, oo7 0.6 (keyring), thiserror 2, log lines as `eprintln!` to stderr (journald captures it under systemd), wiremock 0.6
 and tempfile 3 and hyper 1 (tests).
 
 **Spec:** `docs/superpowers/specs/2026-10-04-ytmfast-design.md`. This plan covers its build step 1.
@@ -22,8 +22,7 @@ Steps 2 to 4 get their own plans.
 - MIT licence. Public repo: no personal names, places or home paths in code, comments, fixtures or docs; say "the user".
 - Commits use the GitHub noreply address; `gitleaks detect --no-git --source .` must be clean before every push.
 - Never push red: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` before every push; watch CI after.
-- Local builds use `CARGO_TARGET_DIR=~/.cache/claude-builds/ytmfast/target` (never `/tmp`); on battery prefix with `nic-build`.
-  This is a local habit and is NOT written into the repo.
+- Builds go outside `/tmp` (the build folder is large, and `/tmp` is often in RAM).
 - Network: https only, hosts limited to `*.youtube.com`, `*.googlevideo.com`, `*.google.com`, `*.ytimg.com`,
   `*.ggpht.com`, `*.googleusercontent.com` (one allowlist function, used by every request).
 - Caps: 32 MiB per API answer and per track; 1 MiB per socket line; API timeout 10 s.
@@ -77,7 +76,7 @@ Steps 2 to 4 get their own plans.
   - **Power:** the average of `/sys/class/power_supply/BAT*/power_now` sampled every 1 s over 300 s, on battery, screen at a fixed brightness. This needs the user to unplug: ask first.
   - **Time to first sound:** from the play command to the PipeWire stream reaching state `running`, by polling `pw-dump` every 10 ms.
   - **Idle:** the number of processes and the PSS 10 minutes after pausing.
-- [ ] **Step 2:** Measure `pear-desktop` through the widget (`omarchy-shell nic.youtube-music playPause`, three runs each) and record median and spread.
+- [ ] **Step 2:** Measure the Electron app (`pear-desktop`) through its bar widget (play and pause from the widget, three runs each) and record median and spread.
 - [ ] **Step 3: Commit** `docs: pear-desktop baseline numbers`.
 
 ### Task 3: Session import (`auth`)

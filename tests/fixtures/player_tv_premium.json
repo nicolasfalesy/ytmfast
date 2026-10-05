@@ -1,0 +1,120 @@
+{
+  "responseContext": {
+    "visitorData": "FAKEVISITORDATA0000",
+    "serviceTrackingParams": [
+      { "service": "GFEEDBACK", "params": [{ "key": "logged_in", "value": "1" }] }
+    ]
+  },
+  "playabilityStatus": {
+    "status": "OK",
+    "playableInEmbed": true,
+    "contextParams": "FAKECONTEXTPARAMS"
+  },
+  "streamingData": {
+    "expiresInSeconds": "21540",
+    "formats": [
+      {
+        "itag": 18,
+        "url": "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1900000000&id=o-FAKE&itag=18&n=abc",
+        "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+        "bitrate": 500000,
+        "width": 640,
+        "height": 360,
+        "contentLength": "12000000",
+        "quality": "medium"
+      }
+    ],
+    "adaptiveFormats": [
+      {
+        "itag": 137,
+        "url": "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1900000000&id=o-FAKE&itag=137&n=abc",
+        "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+        "bitrate": 4000000,
+        "width": 1920,
+        "height": 1080,
+        "contentLength": "90000000",
+        "quality": "hd1080"
+      },
+      {
+        "itag": 774,
+        "url": "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1900000000&id=o-FAKE&itag=774&n=abc",
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "bitrate": 270000,
+        "contentLength": "7340032",
+        "quality": "tiny",
+        "audioQuality": "AUDIO_QUALITY_HIGH",
+        "loudnessDb": 5.1
+      },
+      {
+        "itag": 141,
+        "signatureCipher": "s=FAKESIGFAKESIG&sp=sig&url=https%3A%2F%2Frr1---sn-test.googlevideo.com%2Fvideoplayback%3Fexpire%3D1900000000%26id%3Do-FAKE%26itag%3D141%26n%3Dabc",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "bitrate": 262000,
+        "contentLength": "6815744",
+        "quality": "tiny",
+        "audioQuality": "AUDIO_QUALITY_HIGH"
+      },
+      {
+        "itag": 251,
+        "url": "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1900000000&id=o-FAKE&itag=251&n=abc",
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "bitrate": 140000,
+        "quality": "tiny",
+        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+      },
+      {
+        "itag": 140,
+        "url": "https://evil.example/videoplayback?itag=140",
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "bitrate": 130000,
+        "contentLength": "3407872",
+        "quality": "tiny",
+        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+      }
+    ]
+  },
+  "playbackTracking": {
+    "videostatsPlaybackUrl": {
+      "baseUrl": "https://s.youtube.com/api/stats/playback?cl=000000000&docid=FAKEVID0001&ei=FAKEEI&plid=FAKEPLID"
+    },
+    "videostatsDelayplayUrl": {
+      "baseUrl": "https://s.youtube.com/api/stats/delayplay?cl=000000000&docid=FAKEVID0001"
+    },
+    "videostatsWatchtimeUrl": {
+      "baseUrl": "https://s.youtube.com/api/stats/watchtime?cl=000000000&docid=FAKEVID0001&ei=FAKEEI&plid=FAKEPLID"
+    },
+    "ptrackingUrl": {
+      "baseUrl": "https://www.youtube.com/ptracking?video_id=FAKEVID0001"
+    }
+  },
+  "videoDetails": {
+    "videoId": "FAKEVID0001",
+    "title": "Test Song",
+    "lengthSeconds": "215",
+    "channelId": "UCFAKECHANNEL000000000",
+    "isOwnerViewing": false,
+    "shortDescription": "A made-up song for tests.",
+    "isCrawlable": true,
+    "thumbnail": {
+      "thumbnails": [
+        { "url": "https://i.ytimg.com/vi/FAKEVID0001/default.jpg", "width": 120, "height": 90 },
+        { "url": "https://i.ytimg.com/vi/FAKEVID0001/maxresdefault.jpg", "width": 1280, "height": 720 },
+        { "url": "https://i.ytimg.com/vi/FAKEVID0001/hqdefault.jpg", "width": 480, "height": 360 }
+      ]
+    },
+    "allowRatings": true,
+    "viewCount": "1234",
+    "author": "Test Artist",
+    "isPrivate": false,
+    "isLiveContent": false
+  },
+  "playerConfig": {
+    "audioConfig": {
+      "loudnessDb": 5.1,
+      "perceptualLoudnessDb": -8.9,
+      "enablePerFormatLoudness": true
+    },
+    "streamSelectionConfig": { "maxBitrate": "4000000" }
+  },
+  "trackingParams": "FAKETRACKINGPARAMS"
+}
