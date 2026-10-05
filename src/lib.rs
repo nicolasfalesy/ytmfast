@@ -11,3 +11,4 @@ pub mod net;
 pub mod paths;
 pub mod solver;
 pub mod streams;
+pub mod trace;

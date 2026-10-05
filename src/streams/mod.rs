@@ -29,6 +29,7 @@ use crate::error::Error;
 use crate::innertube::{AudioFormat, Innertube, PlayerResponse, Tracking, clients};
 use crate::net;
 use crate::solver::{ChallengeKind, ChallengeSolver, player_js};
+use crate::trace;
 use ytdlp::YtDlp;
 
 /// A link is used until this long before its `expire` time, so a song started on it has
@@ -198,7 +199,9 @@ impl Streams {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        match self.ytdlp.info_json(video_id, &session).await {
+        let answer = self.ytdlp.info_json(video_id, &session).await;
+        trace::mark("yt-dlp answered");
+        match answer {
             Ok(json) => match from_ytdlp(&json, video_id) {
                 Ok(stream) => Ok(stream),
                 Err(e) => {
@@ -216,6 +219,7 @@ impl Streams {
     async fn own(&self, video_id: &str, fresh: bool) -> Result<Stream, Error> {
         let (player_id, sts, mut code) = self.current_player(fresh).await?;
         let answer = self.api.player(video_id, sts).await?;
+        trace::mark("player request answered");
         let format = pick_format(&answer.formats)
             .ok_or_else(|| Error::Unavailable("no audio format".into()))?;
         let link = Link::of(format)?;
@@ -238,7 +242,9 @@ impl Streams {
                 .iter()
                 .map(|(kind, challenges)| (*kind, challenges[0].clone()))
                 .collect();
-            let answers = match self.solver.solve_batch(&player_id, code, requests).await {
+            let solved = self.solver.solve_batch(&player_id, code, requests).await;
+            trace::mark("solver answered");
+            let answers = match solved {
                 Ok(answers) => {
                     self.clear_player_failed(&player_id);
                     answers
@@ -267,7 +273,9 @@ impl Streams {
         if stream.meta.title.is_empty() {
             // The TV answer can come back without the song's details (seen live): ask oEmbed.
             // Best effort: a song without a title still plays.
-            if let Some((title, artist)) = self.oembed(video_id).await {
+            let details = self.oembed(video_id).await;
+            trace::mark("oEmbed answered");
+            if let Some((title, artist)) = details {
                 stream.meta.title = title;
                 if stream.meta.artist.is_empty() {
                     stream.meta.artist = artist;
@@ -316,10 +324,12 @@ impl Streams {
                 && at.elapsed() < PLAYER_ID_TTL
             {
                 self.check_player_not_failed(&id)?;
+                trace::mark("player version (remembered)");
                 return Ok((id, sts, None));
             }
         }
         let id = player_js::current_player_id_at(&self.http, &self.web_base).await?;
+        trace::mark("player version (iframe_api)");
         // Before reading the 3 MB script: a version the solver failed on needs none of it.
         self.check_player_not_failed(&id)?;
         let code = self.player_code(&id).await?;
@@ -392,9 +402,11 @@ impl Streams {
     async fn player_code(&self, id: &str) -> Result<String, Error> {
         let dir = &self.players_dir;
         if let Some(code) = player_js::load_cached(dir, id, player_js::BASE_SUFFIX) {
+            trace::mark("player script (base.js) from the cache");
             return Ok(code);
         }
         let code = player_js::fetch_player(&self.http, &self.web_base, id).await?;
+        trace::mark("player script (base.js) downloaded");
         // A failed write only means downloading it again next time.
         if let Err(e) = player_js::store_cached(dir, id, player_js::BASE_SUFFIX, &code) {
             eprintln!("ytmfast: could not cache the player script: {e}");
@@ -435,6 +447,7 @@ impl Resolver for Streams {
     async fn resolve(&self, video_id: &str) -> Result<Stream, Error> {
         check_video_id(video_id)?;
         if let Some(stream) = self.cached(video_id) {
+            trace::mark("link from the cache");
             return Ok(stream);
         }
         let stream = self.fetch(video_id, false).await?;

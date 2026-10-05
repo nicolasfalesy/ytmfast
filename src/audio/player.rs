@@ -348,6 +348,7 @@ impl Worker {
             Ok(d) => d.with_length_hint(length_hint),
             Err(e) => return self.fail_unless_cancelled(e, &cancel),
         };
+        crate::trace::mark("decoder open");
         let base = if start > 0.0 {
             match decoder.seek(start) {
                 Ok(at) => at,
@@ -359,6 +360,7 @@ impl Worker {
         if let Err(e) = self.sink.open(decoder.rate(), 2) {
             return self.fail(e);
         }
+        crate::trace::mark("output open");
         self.track = Some(Track {
             rate: f64::from(decoder.rate()),
             decoder,
@@ -433,6 +435,10 @@ impl Worker {
         };
         if let Err(e) = self.sink.write(out) {
             return self.fail(e);
+        }
+        if t.written == 0 {
+            // Also after a seek, which starts the count again: that is a start too.
+            crate::trace::mark("first frames written");
         }
         t.written += n;
         self.publish();

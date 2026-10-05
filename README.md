@@ -59,6 +59,17 @@ systemctl --user enable --now ytmfast.socket
 The first connection to `$XDG_RUNTIME_DIR/ytmfast/socket` then starts `ytmfast daemon`. The
 socket protocol is described in [docs/protocol.md](docs/protocol.md).
 
+## Startup trace
+
+With `YTMFAST_TRACE=1` in its environment, the engine prints one line to stderr per phase of
+each play (session load, player version, player script, solver, player request, download,
+decoder, output), in milliseconds since the play command. The lines name phases only, never a
+link or a session value.
+
+```sh
+YTMFAST_TRACE=1 ytmfast play dQw4w9WgXcQ --null-sink --seconds 3
+```
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

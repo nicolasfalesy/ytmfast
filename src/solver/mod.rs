@@ -313,6 +313,9 @@ impl Worker {
     ) -> Result<Vec<Answers>, Error> {
         let dir = self.players_dir.clone();
         let cached = player_js::load_cached(&dir, player_id, player_js::PREPROCESSED_SUFFIX);
+        if cached.is_some() {
+            crate::trace::mark("preprocessed player from the cache");
+        }
         let input = match (&cached, &player_code) {
             (Some(pre), _) => Input::Preprocessed(pre),
             (None, Some(code)) => Input::Player(code),
@@ -325,7 +328,11 @@ impl Worker {
             }
         };
         let cold = matches!(input, Input::Player(_));
+        let built = self.js.is_none();
         let js = self.js()?;
+        if built {
+            crate::trace::mark("solver runtime built");
+        }
         let output = if cold {
             js.rt.set_memory_limit(COLD_MEMORY_LIMIT);
             let output = js.call_jsc(input, requests, COLD_DEADLINE);

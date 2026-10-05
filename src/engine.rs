@@ -285,6 +285,7 @@ impl Engine {
         self.status.meta = None;
         self.status.position = start;
         self.emit_state();
+        crate::trace::play(&video_id);
 
         let resolver = self.resolver.clone();
         let tx = self.resolved_tx.clone();
@@ -303,8 +304,12 @@ impl Engine {
         self.resolving = None;
         let stream = match r.result {
             Ok(s) => s,
-            Err(e) => return self.fail(&e),
+            Err(e) => {
+                crate::trace::mark("resolve failed");
+                return self.fail(&e);
+            }
         };
+        crate::trace::mark("link resolved");
         self.status.meta = Some(stream.meta.clone());
         let gain = loudness_gain(stream.loudness_db);
         let mime = stream.mime.clone();

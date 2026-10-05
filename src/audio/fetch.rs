@@ -582,6 +582,11 @@ impl Download {
             .send()
             .await
             .map_err(request_failure)?;
+        // The start of the track only: later chunks and retries are not the start's cost.
+        let mut first = pos == 0;
+        if first {
+            crate::trace::mark("download answered");
+        }
         let status = resp.status();
         // How many leading body bytes to drop, and how many to keep.
         let (mut skip, mut want) = match status {
@@ -640,6 +645,10 @@ impl Download {
             }
             if !chunk.is_empty() {
                 self.shared.append(&chunk).map_err(Failure::Fatal)?;
+                if first {
+                    first = false;
+                    crate::trace::mark("first bytes of the download");
+                }
             }
         }
         if want.is_some_and(|w| w > 0) || skip > 0 {

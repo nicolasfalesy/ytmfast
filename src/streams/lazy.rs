@@ -66,6 +66,7 @@ impl LazyResolver {
                 return Err(Error::Internal("keyring locked or unavailable".into()));
             }
         };
+        crate::trace::mark("session loaded (keyring)");
         let r = (self.build)(session);
         *inner = Some(r.clone());
         Ok(r)

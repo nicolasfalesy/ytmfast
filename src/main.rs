@@ -384,7 +384,9 @@ async fn serve(
 async fn play_track(args: PlayArgs) -> Result<(), String> {
     let resolver = resolver()?;
 
+    ytmfast::trace::play(&args.video_id);
     let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
+    ytmfast::trace::mark("link resolved");
     println!("{}", song_line(&stream.meta, &args.video_id));
     let gain = loudness_gain(stream.loudness_db);
     let mime = stream.mime.clone();
@@ -463,6 +465,8 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
 }
 
 fn main() -> ExitCode {
+    // Read once, before anything can play.
+    ytmfast::trace::init_from_env();
     match parse(std::env::args().skip(1)) {
         Command::Daemon { null_sink } => daemon(null_sink),
         Command::ImportSession(profile) => import_session(profile),

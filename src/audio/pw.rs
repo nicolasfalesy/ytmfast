@@ -483,6 +483,9 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
             } else if matches!(new, StreamState::Paused | StreamState::Streaming) {
                 // Controls only stick once the stream is negotiated: apply the volume then.
                 set_volume(s, state_volume.get());
+                if new == StreamState::Streaming {
+                    crate::trace::mark("stream running");
+                }
             }
         })
         .register()
