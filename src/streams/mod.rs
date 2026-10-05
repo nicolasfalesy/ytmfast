@@ -438,14 +438,19 @@ impl Resolver for Streams {
     }
 }
 
-/// A video id is 11 characters of `A-Z a-z 0-9 _ -`. Checked first: the id goes into a
-/// yt-dlp argument and a URL, where `&` or `/` would change what is asked for.
-fn check_video_id(id: &str) -> Result<(), Error> {
-    let ok = id.len() == 11
+/// A video id is 11 characters of `A-Z a-z 0-9 _ -`. The control socket checks it too, to
+/// answer a bad one with `bad_request`.
+pub fn is_video_id(id: &str) -> bool {
+    id.len() == 11
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if ok {
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Checked first: the id goes into a yt-dlp argument and a URL, where `&` or `/` would
+/// change what is asked for.
+fn check_video_id(id: &str) -> Result<(), Error> {
+    if is_video_id(id) {
         Ok(())
     } else {
         Err(Error::Unavailable("not a video id".into()))

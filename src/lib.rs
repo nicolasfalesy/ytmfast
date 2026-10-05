@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod auth;
+pub mod control;
 pub mod engine;
 pub mod error;
 pub mod innertube;
