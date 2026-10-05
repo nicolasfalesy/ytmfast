@@ -2,8 +2,9 @@
 //! quits the engine, removes the socket it bound itself, and exits 0.
 //!
 //! The daemon runs as its own process with every folder in a temp dir and the D-Bus address
-//! pointing at nothing, so it never reaches the real keyring (it starts without a session)
-//! or the real socket; `--null-sink` keeps it off the speakers.
+//! pointing at nothing, so it never reaches the real keyring (it reads none until a song is
+//! asked for, and these tests ask for none) or the real socket; `--null-sink` keeps it off
+//! the speakers.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

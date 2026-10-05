@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use url::Url;
 use ytmfast::audio::decode::loudness_gain;
@@ -23,8 +22,9 @@ use ytmfast::error::Error;
 use ytmfast::innertube::{API_BASE, Innertube};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
+use ytmfast::streams::lazy::{self, LazyResolver};
 use ytmfast::streams::ytdlp::YtDlpCommand;
-use ytmfast::streams::{Resolver, Stream, Streams, TrackMeta};
+use ytmfast::streams::{Resolver, Streams, TrackMeta};
 
 const USAGE: &str = "\
 usage: ytmfast <command>
@@ -190,41 +190,33 @@ fn describe(e: Error) -> String {
     format!("{e} [{}]", e.code())
 }
 
-/// The real resolver over the session in the login keyring: an `Error` when there is no
-/// session, a message when a folder is missing.
-async fn resolver() -> Result<Result<Arc<dyn Resolver>, Error>, String> {
+/// The real resolver over the session in the login keyring. The keyring is read on the first
+/// resolve, not here (`LazyResolver`): the daemon answers its socket and signals at once, a
+/// missing session is reported per play (usually `signed_out`, as an error event the widget
+/// shows) instead of the daemon refusing to start, and a session imported later is picked
+/// up. A message when a folder is missing.
+fn resolver() -> Result<Arc<dyn Resolver>, String> {
     let store: Arc<dyn SessionStore> = Arc::new(KeyringStore::new());
-    let session = match store.load().await {
-        Ok(s) => Arc::new(Mutex::new(s)),
-        Err(e) => return Ok(Err(e)),
-    };
     let base = Url::parse(API_BASE).map_err(|_| "bad API address".to_string())?;
-    let api = Arc::new(Innertube::new(session.clone(), store, base));
     let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
     let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
-    Ok(Ok(Arc::new(Streams::new(
-        api,
-        session,
-        Arc::new(Solver::new(cache.clone())),
-        Arc::new(YtDlpCommand::new(runtime_dir)),
-        cache,
-    ))))
-}
-
-/// Stands in for the resolver when the session couldn't be loaded: every play reports why
-/// (usually `signed_out`) as an error event, instead of the daemon refusing to start. A
-/// daemon that exits at once would just be started again by the next connection, and the
-/// widget would never learn the reason.
-struct NoSession(Error);
-
-#[async_trait]
-impl Resolver for NoSession {
-    async fn resolve(&self, _: &str) -> Result<Stream, Error> {
-        Err(self.0.clone())
-    }
-    async fn resolve_fresh(&self, _: &str) -> Result<Stream, Error> {
-        Err(self.0.clone())
-    }
+    let api_store = store.clone();
+    let build: lazy::Build = Box::new(move |session| {
+        let session = Arc::new(Mutex::new(session));
+        let api = Arc::new(Innertube::new(
+            session.clone(),
+            api_store.clone(),
+            base.clone(),
+        ));
+        Arc::new(Streams::new(
+            api,
+            session,
+            Arc::new(Solver::new(cache.clone())),
+            Arc::new(YtDlpCommand::new(runtime_dir.clone())),
+            cache.clone(),
+        ))
+    });
+    Ok(Arc::new(LazyResolver::new(store, build)))
 }
 
 /// Runs the engine behind the control socket until `quit` or idle.
@@ -292,21 +284,12 @@ async fn serve(
     listener: std::os::unix::net::UnixListener,
     null_sink: bool,
 ) -> Result<Exit, String> {
-    // First, so a stop that comes while the session loads still ends cleanly.
+    // First, so a stop that comes while anything below starts still ends cleanly.
     let shutdown =
         control::termination().map_err(|e| format!("could not watch for signals: {e}"))?;
     let listener = tokio::net::UnixListener::from_std(listener)
         .map_err(|e| format!("could not use the socket: {e}"))?;
-    let resolver = match resolver().await? {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "ytmfast: no usable session ({}); plays will fail",
-                describe(e.clone())
-            );
-            Arc::new(NoSession(e))
-        }
-    };
+    let resolver = resolver()?;
     let sink: Box<dyn Sink> = if null_sink {
         Box::new(NullSink::realtime())
     } else {
@@ -324,7 +307,7 @@ async fn serve(
 }
 
 async fn play_track(args: PlayArgs) -> Result<(), String> {
-    let resolver = resolver().await?.map_err(describe)?;
+    let resolver = resolver()?;
 
     let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
     println!("{}", song_line(&stream.meta, &args.video_id));

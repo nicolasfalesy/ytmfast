@@ -11,6 +11,7 @@
 //!
 //! Links are cached per video until 30 minutes before their `expire` time.
 
+pub mod lazy;
 pub mod ytdlp;
 
 use std::collections::HashMap;
