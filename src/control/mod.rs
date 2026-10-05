@@ -14,6 +14,7 @@
 
 pub mod idle;
 pub mod protocol;
+pub mod stop;
 
 use std::ffi::OsString;
 use std::io;

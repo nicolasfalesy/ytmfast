@@ -15,11 +15,11 @@ use ytmfast::audio::fetch::{Relink, TrackBuffer};
 use ytmfast::audio::player::{AudioEvent, AudioPlayer};
 use ytmfast::audio::pw::PipeWireSink;
 use ytmfast::audio::sink::{NullSink, Sink};
-use ytmfast::auth::{KeyringStore, SessionStore, chromium};
-use ytmfast::control::{self, Exit};
+use ytmfast::auth::{KeyringStore, Session, SessionStore, chromium, sidhash};
+use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
-use ytmfast::innertube::{API_BASE, Innertube};
+use ytmfast::innertube::{API_BASE, Innertube, clients};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
 use ytmfast::streams::lazy::{self, LazyResolver};
@@ -122,7 +122,8 @@ fn default_profile_in(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf>
     Some(config.join("YouTube Music"))
 }
 
-/// Imports the session from the profile and saves it in the login keyring. Prints only the
+/// Imports the session from the profile and saves it in the login keyring, then stops a
+/// running engine so it can't write its old session back over the new one. Prints only the
 /// cookie count: never a value.
 fn import_session(profile: Option<PathBuf>) -> ExitCode {
     let Some(profile) = profile.or_else(|| default_profile_in(&|k| std::env::var_os(k))) else {
@@ -132,7 +133,7 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
     let session = match chromium::import(&profile) {
         Ok(s) => s,
         Err(Error::SignedOut) => {
-            eprintln!("ytmfast: no YouTube sign-in in that profile; sign in to the app first");
+            eprintln!("ytmfast: {NOT_SIGNED_IN}");
             return ExitCode::from(1);
         }
         Err(e) => {
@@ -140,7 +141,13 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // One small runtime for the one keyring call; the daemon builds its own.
+    // Checked before saving: a profile with YouTube cookies but no sign-in (a visitor's
+    // cookies only) would replace a working session with one that can't sign a request.
+    if !has_sign_in(&session) {
+        eprintln!("ytmfast: {NOT_SIGNED_IN}");
+        return ExitCode::from(1);
+    }
+    // One small runtime for the keyring calls; the daemon builds its own.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -151,15 +158,78 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match runtime.block_on(KeyringStore::new().save(&session)) {
-        Ok(()) => {
-            println!("Imported {} cookies", session.cookies.len());
+    let store = KeyringStore::new();
+    if let Err(e) = runtime.block_on(store.save(&session)) {
+        eprintln!("ytmfast: {e}");
+        return ExitCode::from(1);
+    }
+    println!("Imported {} cookies", session.cookies.len());
+    // Stopped after the save, so a failed save never stops the music for nothing.
+    match stop_running_engine() {
+        EngineStop::NoneRunning => {
+            println!("No engine was running");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("ytmfast: {e}");
+        EngineStop::Stopped => {
+            // Saved again: a cookie rotation the old engine saved while it stopped could
+            // otherwise be the last word in the keyring.
+            if let Err(e) = runtime.block_on(store.save(&session)) {
+                eprintln!("ytmfast: {e}");
+                return ExitCode::from(1);
+            }
+            println!("Restarted the running engine: the next play starts it with the new session");
+            ExitCode::SUCCESS
+        }
+        EngineStop::Unreachable => {
+            eprintln!(
+                "ytmfast: an engine is running but did not stop; stop it (systemctl --user stop ytmfast.service) and import again"
+            );
             ExitCode::from(1)
         }
+    }
+}
+
+const NOT_SIGNED_IN: &str = "no YouTube sign-in in that profile; sign in to the app first";
+
+/// True when the session can sign API requests: it holds a SAPISID cookie for the origin the
+/// `player` request is signed for. Without one every request would be `signed_out`.
+fn has_sign_in(session: &Session) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    sidhash::authorization(session, clients::TV.origin, now).is_some()
+}
+
+/// What `import-session` did about a running engine.
+#[derive(Debug, PartialEq)]
+enum EngineStop {
+    NoneRunning,
+    Stopped,
+    /// One is running but didn't answer `quit` or didn't exit in time.
+    Unreachable,
+}
+
+/// Asks the user's running engine, if any, to quit, and waits for it to exit (`STOP_WAIT`
+/// each for the reply and the exit). Never starts
+/// one: the socket is only tried when an engine process exists (see `control::stop`).
+fn stop_running_engine() -> EngineStop {
+    let proc_root = std::path::Path::new("/proc");
+    // SAFETY: getuid has no preconditions and can't fail.
+    let uid = unsafe { libc::getuid() };
+    let pids = stop::daemon_pids(proc_root, uid, std::process::id());
+    if pids.is_empty() {
+        return EngineStop::NoneRunning;
+    }
+    let Ok(dir) = paths::runtime_dir() else {
+        return EngineStop::Unreachable;
+    };
+    let socket = dir.join(control::SOCKET_NAME);
+    if stop::ask_to_quit(&socket, stop::STOP_WAIT)
+        && stop::wait_gone(proc_root, &pids, stop::STOP_WAIT)
+    {
+        EngineStop::Stopped
+    } else {
+        EngineStop::Unreachable
     }
 }
 
@@ -521,6 +591,36 @@ mod tests {
         assert_eq!(p(&["daemon", "--null-sink", "--null-sink"]), Command::Usage);
         assert_eq!(p(&["import-session", "--profile"]), Command::Usage);
         assert_eq!(p(&["import-session", "/x"]), Command::Usage);
+    }
+
+    #[test]
+    fn import_needs_a_sign_in_cookie() {
+        use ytmfast::auth::Cookie;
+        let cookie = |domain: &str, name: &str| Cookie {
+            domain: domain.into(),
+            name: name.into(),
+            value: "fake-value".into(),
+            path: "/".into(),
+            secure: true,
+            expires_utc: None,
+        };
+        // A visitor's cookies only: YouTube cookies, but nothing to sign a request with.
+        let visitor = Session {
+            cookies: vec![
+                cookie(".youtube.com", "VISITOR_INFO1_LIVE"),
+                cookie(".youtube.com", "YSC"),
+            ],
+        };
+        assert!(!has_sign_in(&visitor));
+        // A SAPISID for another domain doesn't sign youtube.com requests.
+        let google_only = Session {
+            cookies: vec![cookie(".google.com", "SAPISID")],
+        };
+        assert!(!has_sign_in(&google_only));
+        let signed_in = Session {
+            cookies: vec![cookie(".youtube.com", "SAPISID")],
+        };
+        assert!(has_sign_in(&signed_in));
     }
 
     #[test]

@@ -30,7 +30,9 @@ ytmfast reuses the sign-in of the YouTube Music desktop app. Close that app, the
 ytmfast import-session
 ```
 
-It copies the session into the login keyring (never into a plain file) and prints how many cookies it took.
+It copies the session into the login keyring (never into a plain file) and prints how many cookies it took. It
+refuses a profile that isn't signed in. If the engine is running, it is stopped, so the next play starts it with the
+new session.
 
 ## Build
 
