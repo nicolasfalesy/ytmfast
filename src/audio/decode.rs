@@ -243,6 +243,24 @@ impl Decoder {
         Ok(dec)
     }
 
+    /// The song's length from the resolver (`length_seconds`), for a file whose header states
+    /// none (fragmented MP4, YouTube's DASH audio, may not). It then clamps seeks like a stated
+    /// length, and caps the end at the hint plus 1 s. Only a cap: the resolver's length is in
+    /// whole seconds, so cutting at it could drop up to a second of music, while the padding a
+    /// real trim removes is one codec frame. A stated length always wins.
+    pub fn with_length_hint(mut self, seconds: Option<f64>) -> Decoder {
+        let Some(hint) = seconds.filter(|s| s.is_finite() && *s > 0.0) else {
+            return self;
+        };
+        if self.duration.is_none() {
+            self.duration = Some(hint);
+        }
+        if self.end_frame.is_none() {
+            self.end_frame = Some(((hint + 1.0) * f64::from(self.rate)).round() as i64);
+        }
+        self
+    }
+
     /// The output rate: 48 kHz for Opus, the track's rate for AAC.
     pub fn rate(&self) -> u32 {
         self.rate
@@ -485,7 +503,11 @@ fn mp4_edit_media_time(r: &mut (impl Read + Seek)) -> io::Result<Option<i64>> {
             // Runs to the end of the file: nothing after it.
             (_, None) => return Ok(None),
             (_, Some(len)) => {
-                r.seek(SeekFrom::Current(len as i64))?;
+                // Checked: a 64-bit size near 2^64 must not wrap into a seek backwards (an
+                // endless loop on the audio thread, from a file off the network).
+                let here = r.stream_position()?;
+                let next = here.checked_add(len).ok_or_else(bad_box)?;
+                r.seek(SeekFrom::Start(next))?;
             }
         }
     }
@@ -551,13 +573,16 @@ fn child<'a>(parent: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
             }
             n => (8, n),
         };
-        if len < header || at + len > parent.len() {
+        // Checked: `at + len` must not wrap (a huge 64-bit size) into a loop or a reversed
+        // slice.
+        let end = at.checked_add(len)?;
+        if len < header || end > parent.len() {
             return None;
         }
         if &parent[at + 4..at + 8] == kind {
-            return Some(&parent[at + header..at + len]);
+            return Some(&parent[at + header..end]);
         }
-        at += len;
+        at = end;
     }
     None
 }
@@ -640,6 +665,46 @@ mod tests {
         );
         assert_eq!(
             mp4_edit_media_time(&mut file(bx(b"free", &[]))).unwrap(),
+            None
+        );
+    }
+
+    /// Runs `f` on its own thread and fails if it takes over 2 s: the bug these tests pin
+    /// was an endless loop, which must fail the test, not hang the suite.
+    fn within_2s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the box walker looped (no answer in 2 s)")
+    }
+
+    /// A 64-bit size of 2^64 − 8: `as i64` made it −8, a seek back onto the same box.
+    fn huge_box(kind: &[u8; 4]) -> Vec<u8> {
+        let mut b = 1u32.to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(&(u64::MAX - 7).to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn top_level_huge_largesize_does_not_loop() {
+        let mut f = bx(b"free", &[]);
+        f.extend(huge_box(b"skip"));
+        let r =
+            within_2s(move || mp4_edit_media_time(&mut io::Cursor::new(f)).map_err(|e| e.kind()));
+        assert!(matches!(r, Ok(None) | Err(_)), "{r:?}");
+    }
+
+    #[test]
+    fn child_huge_largesize_does_not_loop_or_panic() {
+        let mut moov = bx(b"free", &[]);
+        moov.extend(huge_box(b"skip"));
+        moov.extend(vec![0; 16]);
+        // `at + len` wrapped to a small number in a release build (an overflow panic in debug).
+        assert_eq!(
+            within_2s(move || child(&moov, b"trak").map(<[u8]>::len)),
             None
         );
     }

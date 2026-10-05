@@ -7,15 +7,15 @@
 //! the CPU asleep most of the time); while paused or idle it blocks on the command channel;
 //! at the end of a track it waits, in steps, for the output to play what it holds.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 
 use crate::audio::decode::Decoder;
-use crate::audio::fetch::TrackReader;
+use crate::audio::fetch::{ReaderCancel, TrackReader};
 use crate::audio::sink::Sink;
 use crate::error::Error;
 
@@ -38,6 +38,7 @@ enum Command {
         mime: String,
         gain: f32,
         start: f64,
+        length_hint: Option<f64>,
     },
     Play,
     Pause,
@@ -63,6 +64,10 @@ pub struct AudioPlayer {
     events: Receiver<AudioEvent>,
     /// Seconds into the track, as f64 bits, kept fresh by the audio thread.
     position: Arc<AtomicU64>,
+    /// Cancels the newest loaded track's reader. The audio thread can be blocked in a read
+    /// waiting for a stalled download; `stop`, a new `load` and drop cancel it first, so they
+    /// never wait behind the network.
+    current: Mutex<Option<ReaderCancel>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -88,6 +93,7 @@ impl AudioPlayer {
             commands,
             events,
             position,
+            current: Mutex::new(None),
             thread: Some(thread),
         }
     }
@@ -99,13 +105,24 @@ impl AudioPlayer {
     }
 
     /// Replaces the current track with `reader`, paused at `start_seconds`, with `gain`
-    /// applied to its samples (loudness normalisation). `play` starts it.
-    pub fn load(&self, reader: TrackReader, mime: &str, gain: f32, start_seconds: f64) {
+    /// applied to its samples (loudness normalisation). `length_hint` is the resolver's length
+    /// in seconds, used when the file states none (see `Decoder::with_length_hint`). `play`
+    /// starts it.
+    pub fn load(
+        &self,
+        reader: TrackReader,
+        mime: &str,
+        gain: f32,
+        start_seconds: f64,
+        length_hint: Option<f64>,
+    ) {
+        self.cancel_current(Some(reader.canceller()));
         self.send(Command::Load {
             reader,
             mime: mime.to_string(),
             gain,
             start: start_seconds,
+            length_hint,
         });
     }
 
@@ -129,7 +146,19 @@ impl AudioPlayer {
 
     /// Unloads the track and empties the output.
     pub fn stop(&self) {
+        self.cancel_current(None);
         self.send(Command::Stop);
+    }
+
+    /// Cancels the current track's reader and makes `next` the current one.
+    fn cancel_current(&self, next: Option<ReaderCancel>) {
+        let old = std::mem::replace(
+            &mut *self.current.lock().unwrap_or_else(|e| e.into_inner()),
+            next,
+        );
+        if let Some(old) = old {
+            old.cancel();
+        }
     }
 
     /// Seconds into the track that the listener is hearing now: (frames written − the
@@ -146,6 +175,7 @@ impl AudioPlayer {
 
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
+        self.cancel_current(None);
         self.send(Command::Quit);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -156,6 +186,9 @@ impl Drop for AudioPlayer {
 /// The loaded track.
 struct Track {
     decoder: Decoder,
+    /// Set when the engine cancelled this track's reader: its read errors are then expected
+    /// and not reported.
+    cancel: ReaderCancel,
     gain: f32,
     rate: f64,
     /// The position (seconds) where `written` counts from: the load or seek point.
@@ -226,7 +259,8 @@ impl Worker {
                 mime,
                 gain,
                 start,
-            } => self.load(reader, &mime, gain, start),
+                length_hint,
+            } => self.load(reader, &mime, gain, start, length_hint),
             Command::Play => {
                 let Some(t) = self.track.as_mut().filter(|t| !t.playing && !t.ended) else {
                     return;
@@ -267,7 +301,10 @@ impl Worker {
                         self.sink.flush();
                         self.publish();
                     }
-                    Err(e) => self.fail(e),
+                    Err(e) => {
+                        let cancel = t.cancel.clone();
+                        self.fail_unless_cancelled(e, &cancel);
+                    }
                 }
             }
             Command::Volume(v) => {
@@ -280,17 +317,25 @@ impl Worker {
         }
     }
 
-    fn load(&mut self, reader: TrackReader, mime: &str, gain: f32, start: f64) {
+    fn load(
+        &mut self,
+        reader: TrackReader,
+        mime: &str,
+        gain: f32,
+        start: f64,
+        length_hint: Option<f64>,
+    ) {
         self.unload();
+        let cancel = reader.canceller();
         // Opening reads the track's headers, so it waits for the first bytes to arrive.
         let mut decoder = match Decoder::open(reader, mime) {
-            Ok(d) => d,
-            Err(e) => return self.fail(e),
+            Ok(d) => d.with_length_hint(length_hint),
+            Err(e) => return self.fail_unless_cancelled(e, &cancel),
         };
         let base = if start > 0.0 {
             match decoder.seek(start) {
                 Ok(at) => at,
-                Err(e) => return self.fail(e),
+                Err(e) => return self.fail_unless_cancelled(e, &cancel),
             }
         } else {
             0.0
@@ -301,6 +346,7 @@ impl Worker {
         self.track = Some(Track {
             rate: f64::from(decoder.rate()),
             decoder,
+            cancel,
             gain: if gain.is_finite() {
                 gain.clamp(0.0, 1.0)
             } else {
@@ -351,7 +397,10 @@ impl Worker {
                 self.publish();
                 return;
             }
-            Err(e) => return self.fail(e),
+            Err(e) => {
+                let cancel = t.cancel.clone();
+                return self.fail_unless_cancelled(e, &cancel);
+            }
         };
         let n = (frames.len() / 2) as u64;
         let out: &[f32] = if t.gain == 1.0 {
@@ -382,6 +431,16 @@ impl Worker {
     fn fail(&mut self, e: Error) {
         self.unload();
         self.emit(AudioEvent::Error(e.to_string()));
+    }
+
+    /// Like `fail`, but quiet when the engine cancelled the track's reader on purpose (stop,
+    /// a new load, drop): that error is the cancel itself, not a fault to report.
+    fn fail_unless_cancelled(&mut self, e: Error, cancel: &ReaderCancel) {
+        if cancel.is_cancelled() {
+            self.unload();
+        } else {
+            self.fail(e);
+        }
     }
 
     fn emit(&self, event: AudioEvent) {
@@ -421,7 +480,7 @@ mod tests {
     #[test]
     fn player_position_counts_delay() {
         let (p, events, stats) = player(NullSink::with_delay(4800));
-        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0);
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
         p.play();
         assert_eq!(next_event(&events), AudioEvent::Started);
         // The sink never drains (its delay is fixed), so the end comes from the drain
@@ -441,7 +500,7 @@ mod tests {
     #[test]
     fn pause_stops_writes() {
         let (p, events, stats) = player(NullSink::realtime());
-        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0);
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
         let t = std::time::Instant::now();
         p.play();
         assert_eq!(next_event(&events), AudioEvent::Started);
@@ -475,7 +534,7 @@ mod tests {
     #[test]
     fn ended_event_at_eof() {
         let (p, events, stats) = player(NullSink::new());
-        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.0);
+        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.0, None);
         p.play();
         assert_eq!(next_event(&events), AudioEvent::Started);
         assert_eq!(next_event(&events), AudioEvent::Ended);
@@ -489,7 +548,7 @@ mod tests {
     #[test]
     fn load_at_a_start_point_and_seek() {
         let (p, events, stats) = player(NullSink::new());
-        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.5);
+        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.5, None);
         p.seek(0.75);
         p.set_volume(0.3);
         p.play();
@@ -525,7 +584,7 @@ mod tests {
             let seen = Arc::new(std::sync::Mutex::new(0.0f32));
             let p = AudioPlayer::spawn(Box::new(Peak(seen.clone())));
             let events = p.events();
-            p.load(fixture("sine440_44k.m4a"), AAC_MIME, gain, 0.0);
+            p.load(fixture("sine440_44k.m4a"), AAC_MIME, gain, 0.0, None);
             p.play();
             assert_eq!(next_event(&events), AudioEvent::Started);
             assert_eq!(next_event(&events), AudioEvent::Ended);
@@ -540,7 +599,7 @@ mod tests {
     fn bad_track_is_an_error_event() {
         let (p, events, _) = player(NullSink::new());
         let garbage = TrackBuffer::from_bytes(vec![0x5a; 4096]).reader();
-        p.load(garbage, OPUS_MIME, 1.0, 0.0);
+        p.load(garbage, OPUS_MIME, 1.0, 0.0, None);
         p.play();
         match next_event(&events) {
             AudioEvent::Error(m) => assert!(m.contains("not a recognised audio file"), "{m}"),
@@ -551,7 +610,7 @@ mod tests {
     #[test]
     fn stop_flushes_and_resets() {
         let (p, events, stats) = player(NullSink::realtime());
-        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0);
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
         p.play();
         assert_eq!(next_event(&events), AudioEvent::Started);
         std::thread::sleep(Duration::from_millis(100));
@@ -563,5 +622,80 @@ mod tests {
         assert!(stats.flushes() >= 1);
         assert!(stats.paused());
         assert!(events.try_recv().is_err(), "no events after stop");
+    }
+
+    /// The first `n` bytes of a fixture, from a download that then stalls for ever.
+    fn stalled(name: &str, n: usize) -> TrackReader {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(path).unwrap();
+        let total = bytes.len() as u64;
+        TrackBuffer::stalled(bytes[..n].to_vec(), total).reader()
+    }
+
+    /// Fails the test, rather than hanging the suite, if `f` takes over 3 s.
+    fn within_3s(what: &str, f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "{what} hung behind the stalled download"
+        );
+    }
+
+    #[test]
+    fn drop_returns_while_opening_a_stalled_download() {
+        let (p, _events, _) = player(NullSink::new());
+        // Too few bytes to open: the audio thread blocks in the decoder's first reads.
+        p.load(stalled("sine440_48k.webm", 100), OPUS_MIME, 1.0, 0.0, None);
+        std::thread::sleep(Duration::from_millis(100));
+        within_3s("dropping the player", move || drop(p));
+    }
+
+    #[test]
+    fn drop_returns_while_a_track_stalls_mid_way() {
+        let (p, events, stats) = player(NullSink::new());
+        // MP4 with its index at the front: it opens and plays, then runs out of bytes.
+        p.load(stalled("sine440_44k.m4a", 20_000), AAC_MIME, 1.0, 0.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(stats.frames() > 0, "played the part that arrived");
+        within_3s("dropping the player", move || drop(p));
+    }
+
+    #[test]
+    fn stop_and_a_new_load_work_while_a_download_stalls() {
+        let (p, events, stats) = player(NullSink::new());
+        p.load(stalled("sine440_48k.webm", 100), OPUS_MIME, 1.0, 0.0, None);
+        std::thread::sleep(Duration::from_millis(100));
+        p.stop();
+        p.load(fixture("sine440_44k.m4a"), AAC_MIME, 1.0, 0.0, None);
+        p.play();
+        // The stopped track fails quietly: no Error event for it.
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        assert_eq!(next_event(&events), AudioEvent::Ended);
+        assert_eq!(stats.frames(), 88_200);
+    }
+
+    #[test]
+    fn length_hint_reaches_the_decoder() {
+        let (p, _events, _) = player(NullSink::new());
+        p.load(
+            fixture("sine440_44k_frag.m4a"),
+            AAC_MIME,
+            1.0,
+            0.0,
+            Some(2.0),
+        );
+        p.seek(99.0);
+        // Commands run in order; the position is published after the seek.
+        let t = std::time::Instant::now();
+        while p.position() == 0.0 && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!((p.position() - 1.0).abs() < 1e-9, "{}", p.position());
     }
 }

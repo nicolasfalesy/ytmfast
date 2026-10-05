@@ -21,7 +21,7 @@ use ytmfast::innertube::{API_BASE, Innertube};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
 use ytmfast::streams::ytdlp::YtDlpCommand;
-use ytmfast::streams::{Resolver, Streams};
+use ytmfast::streams::{Resolver, Streams, TrackMeta};
 
 const USAGE: &str = "\
 usage: ytmfast <command>
@@ -203,9 +203,10 @@ async fn play_track(args: PlayArgs) -> Result<(), String> {
     ));
 
     let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
-    println!("{} - {}", stream.meta.title, stream.meta.artist);
+    println!("{}", song_line(&stream.meta, &args.video_id));
     let gain = loudness_gain(stream.loudness_db);
     let mime = stream.mime.clone();
+    let length_hint = Some(f64::from(stream.meta.length_seconds)).filter(|s| *s > 0.0);
 
     // A link that stops working mid-song is replaced by a fresh one, never a cached one
     // (ruling R2).
@@ -227,16 +228,31 @@ async fn play_track(args: PlayArgs) -> Result<(), String> {
     };
     let player = AudioPlayer::spawn(sink);
     let events = player.events();
-    player.load(buffer.reader(), &mime, gain, 0.0);
+    player.load(buffer.reader(), &mime, gain, 0.0, length_hint);
     player.play();
-    // The wait is blocking; the download runs on this runtime meanwhile.
+    // The wait, and dropping the player (which joins the audio thread), happen off this
+    // runtime's one thread: the download task runs on it, and the audio thread may be blocked
+    // reading bytes that only that task can deliver. (Dropping the player also cancels its
+    // reader, so the join can't wait on the network either way.)
     let seconds = args.seconds;
-    let outcome = tokio::task::spawn_blocking(move || wait_for_end(&events, seconds))
-        .await
-        .map_err(|_| "the wait for the song failed".to_string())?;
-    drop(player);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = wait_for_end(&events, seconds);
+        drop(player);
+        outcome
+    })
+    .await
+    .map_err(|_| "the wait for the song failed".to_string())?;
     drop(buffer);
     outcome
+}
+
+/// "Title - Artist", leaving out what is missing; the video id when there is no title.
+fn song_line(meta: &TrackMeta, video_id: &str) -> String {
+    match (meta.title.is_empty(), meta.artist.is_empty()) {
+        (false, false) => format!("{} - {}", meta.title, meta.artist),
+        (false, true) => meta.title.clone(),
+        (true, _) => video_id.to_string(),
+    }
 }
 
 /// Waits for the song to end: `Ok` at its end or once `seconds` have passed, `Err` with the
@@ -344,6 +360,18 @@ mod tests {
         ] {
             assert_eq!(p(bad), Command::Usage, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn song_line_leaves_out_what_is_missing() {
+        let meta = |t: &str, a: &str| TrackMeta {
+            title: t.into(),
+            artist: a.into(),
+            ..Default::default()
+        };
+        assert_eq!(song_line(&meta("Song", "Artist"), "id"), "Song - Artist");
+        assert_eq!(song_line(&meta("Song", ""), "id"), "Song");
+        assert_eq!(song_line(&meta("", ""), "dQw4w9WgXcQ"), "dQw4w9WgXcQ");
     }
 
     #[test]

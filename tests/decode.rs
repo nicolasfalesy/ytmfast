@@ -187,3 +187,36 @@ fn garbage_is_a_stream_error() {
     let err = Decoder::open(reader, OPUS_MIME).err().expect("garbage");
     assert_eq!(err.code(), "stream_failed");
 }
+
+/// A fragmented MP4 (like YouTube's DASH audio) whose header states no length: the resolver's
+/// length stands in for it, so a seek is still clamped to 1 s before the end.
+#[test]
+fn seek_clamps_with_length_hint() {
+    let dec = Decoder::open(fixture("sine440_44k_frag.m4a"), AAC_MIME).unwrap();
+    assert_eq!(dec.duration(), None, "the fixture states no length");
+    let mut dec = dec.with_length_hint(Some(2.0));
+    assert_eq!(dec.duration(), Some(2.0));
+    let back = dec.seek(99.0).unwrap();
+    assert!((back - 1.0).abs() <= 0.002, "seek(99) gave {back}");
+    let rest = decode_all(&mut dec).len() / 2;
+    let rest = rest as f64 / f64::from(dec.rate());
+    // No edit list in this file, so its 1024 frames of priming stay in: about 23 ms long.
+    assert!((rest - 1.0).abs() <= 0.05, "{rest} s after the seek");
+
+    // A stated length wins over the hint.
+    let dec = Decoder::open(fixture("sine440_44k.m4a"), AAC_MIME)
+        .unwrap()
+        .with_length_hint(Some(5.0));
+    assert_eq!(dec.duration(), Some(2.0));
+}
+
+/// The hint caps a stream with no stated end at the hint plus 1 s (the resolver's length is
+/// whole seconds, so it is never used to cut closer than that).
+#[test]
+fn length_hint_caps_a_runaway_end() {
+    let mut dec = Decoder::open(fixture("sine440_44k_frag.m4a"), AAC_MIME)
+        .unwrap()
+        .with_length_hint(Some(0.5));
+    let frames = decode_all(&mut dec).len() / 2;
+    assert_eq!(frames, 66_150, "0.5 s + 1 s at 44.1 kHz");
+}

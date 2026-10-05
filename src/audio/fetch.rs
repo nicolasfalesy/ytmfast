@@ -17,6 +17,7 @@
 use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -61,10 +62,37 @@ pub struct TrackBuffer {
 /// bytes that haven't arrived yet; reading at or past the track's length is EOF; a read
 /// after the download failed for good (with no bytes left to give) is an io error that
 /// wraps the `Error` (get it with `get_ref()` and `downcast_ref::<Error>()`).
+///
+/// A reader can be cancelled from another thread (`canceller`): a read blocked waiting for
+/// bytes then returns at once with an error, so a thread stuck on a stalled download can be
+/// stopped.
 pub struct TrackReader {
     shared: Arc<Shared>,
     _owner: Arc<Owner>,
     pos: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Cancels one `TrackReader` (see `TrackReader::canceller`).
+#[derive(Clone)]
+pub struct ReaderCancel {
+    shared: Arc<Shared>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ReaderCancel {
+    /// Makes every read and length wait on the reader fail from now on, and wakes one that is
+    /// blocked. Other readers of the same track are not affected.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Under the lock: a reader between its check and its wait can't miss the wake-up.
+        let _st = self.shared.lock();
+        self.shared.wake.notify_all();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 struct Shared {
@@ -294,12 +322,31 @@ impl TrackBuffer {
         }
     }
 
+    /// A download that has `bytes` of a `total`-byte track and never gets more: readers block
+    /// past `bytes` until cancelled. For tests of a stalled server.
+    #[cfg(test)]
+    pub(crate) fn stalled(bytes: Vec<u8>, total: u64) -> TrackBuffer {
+        TrackBuffer {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    data: bytes,
+                    total: Some(total),
+                    end: None,
+                    waiting: 0,
+                }),
+                wake: Condvar::new(),
+            }),
+            owner: Arc::new(Owner { task: None }),
+        }
+    }
+
     /// A new cursor at the start of the track. It keeps the download going while it lives.
     pub fn reader(&self) -> TrackReader {
         TrackReader {
             shared: self.shared.clone(),
             _owner: self.owner.clone(),
             pos: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -310,6 +357,23 @@ impl TrackBuffer {
 }
 
 impl TrackReader {
+    /// A handle that cancels this reader from any thread.
+    pub fn canceller(&self) -> ReaderCancel {
+        ReaderCancel {
+            shared: self.shared.clone(),
+            cancelled: self.cancelled.clone(),
+        }
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::other(Error::Internal(
+                "the track was stopped".into(),
+            )));
+        }
+        Ok(())
+    }
+
     /// The track's length once the first answer has said it (it has by the time the first
     /// byte can be read), else `None`. Never waits.
     pub fn total_len(&self) -> Option<u64> {
@@ -335,6 +399,7 @@ impl Read for TrackReader {
         }
         let mut st = self.shared.lock();
         loop {
+            self.check_cancelled()?;
             let have = st.data.len() as u64;
             if self.pos < have {
                 let n = (have - self.pos).min(buf.len() as u64) as usize;
@@ -367,6 +432,7 @@ impl Seek for TrackReader {
             SeekFrom::End(d) => {
                 let mut st = self.shared.lock();
                 let total = loop {
+                    self.check_cancelled()?;
                     if let Some(t) = st.total {
                         break t;
                     }
@@ -621,6 +687,34 @@ fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancel_wakes_a_blocked_read() {
+        let buf = TrackBuffer::stalled(vec![1, 2, 3], 100);
+        let mut reader = buf.reader();
+        let cancel = reader.canceller();
+        let other = buf.reader();
+        let t = std::thread::spawn(move || {
+            let mut b = [0u8; 8];
+            assert_eq!(
+                reader.read(&mut b).unwrap(),
+                3,
+                "what has arrived is readable"
+            );
+            reader.read(&mut b)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!t.is_finished(), "the second read waits for bytes");
+        cancel.cancel();
+        let err = t.join().unwrap().unwrap_err();
+        let ours = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<Error>())
+            .cloned();
+        assert_eq!(ours, Some(Error::Internal("the track was stopped".into())));
+        assert!(cancel.is_cancelled());
+        assert!(!other.canceller().is_cancelled(), "only that reader");
+    }
+
     use super::*;
 
     #[test]

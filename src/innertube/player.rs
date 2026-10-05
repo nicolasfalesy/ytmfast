@@ -89,7 +89,19 @@ impl Innertube {
         let client = &clients::TV;
         let body = request_body(client, video_id, sts);
         let answer = self.post(client, "player", &body).await?;
-        parse(&answer, video_id)
+        let parsed = parse(&answer, video_id)?;
+        if parsed.title.is_empty() {
+            // Once per run: which shape came back, so a missing title can be traced (keys
+            // only; the resolver then asks oEmbed for the details).
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "ytmfast: the player answer has no title ({})",
+                    answer_shape(&answer)
+                );
+            }
+        }
+        Ok(parsed)
     }
 }
 
@@ -130,6 +142,44 @@ struct Raw {
     streaming_data: Option<RawStreaming>,
     player_config: Option<RawPlayerConfig>,
     playback_tracking: Option<RawTracking>,
+    microformat: Option<RawMicroformat>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMicroformat {
+    player_microformat_renderer: Option<RawMicroformatRenderer>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMicroformatRenderer {
+    title: Option<RawText>,
+    owner_channel_name: Option<String>,
+    length_seconds: Option<String>,
+}
+
+/// YouTube's text object: `{"simpleText": …}` or `{"runs": [{"text": …}, …]}`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawText {
+    simple_text: Option<String>,
+    #[serde(default)]
+    runs: Vec<RawRun>,
+}
+
+#[derive(Deserialize)]
+struct RawRun {
+    text: Option<String>,
+}
+
+impl RawText {
+    fn text(self) -> String {
+        match self.simple_text {
+            Some(t) => t,
+            None => self.runs.into_iter().filter_map(|r| r.text).collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -205,6 +255,27 @@ struct RawBaseUrl {
     base_url: Option<String>,
 }
 
+/// The answer's shape for a log line: its top-level keys and `videoDetails`' keys, sorted.
+/// Keys only, never values (the answer holds signed links).
+pub(crate) fn answer_shape(answer: &[u8]) -> String {
+    let keys = |v: Option<&serde_json::Value>| -> String {
+        match v.and_then(|v| v.as_object()) {
+            Some(o) => {
+                let mut k: Vec<&str> = o.keys().map(String::as_str).collect();
+                k.sort_unstable();
+                k.join(", ")
+            }
+            None => "none".into(),
+        }
+    };
+    let v: Option<serde_json::Value> = serde_json::from_slice(answer).ok();
+    format!(
+        "keys: {}; videoDetails: {}",
+        keys(v.as_ref()),
+        keys(v.as_ref().and_then(|v| v.get("videoDetails")))
+    )
+}
+
 /// Parses a `player` answer for `video_id`.
 fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     // Fixed text: serde_json's message can quote part of the answer, which holds stream links.
@@ -231,15 +302,30 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     }
     let (title, author, length_seconds, thumbnail) = match details {
         Some(d) => (
-            d.title.unwrap_or_default(),
-            d.author.unwrap_or_default(),
-            d.length_seconds
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_default(),
+            d.title,
+            d.author,
+            d.length_seconds.and_then(|s| s.parse().ok()),
             d.thumbnail.and_then(widest_thumbnail),
         ),
-        None => Default::default(),
+        None => (None, None, None, None),
     };
+    // Each detail from `videoDetails` first, else from the microformat (some clients send
+    // only one of the two).
+    let micro = raw.microformat.and_then(|m| m.player_microformat_renderer);
+    let (micro_title, micro_author, micro_length) = match micro {
+        Some(m) => (
+            m.title.map(RawText::text),
+            m.owner_channel_name,
+            m.length_seconds.and_then(|s| s.parse().ok()),
+        ),
+        None => (None, None, None),
+    };
+    let present = |s: Option<String>| s.filter(|s| !s.is_empty());
+    let title = present(title).or(present(micro_title)).unwrap_or_default();
+    let author = present(author)
+        .or(present(micro_author))
+        .unwrap_or_default();
+    let length_seconds = length_seconds.or(micro_length).unwrap_or_default();
 
     let formats = raw
         .streaming_data
@@ -369,6 +455,52 @@ mod tests {
         assert_eq!(parse(&a, "x"), Err(Error::Unavailable("UNPLAYABLE".into())));
         assert_eq!(reason(Some("y".repeat(500)), "ERROR").len(), 200);
         assert_eq!(reason(None, ""), "unknown");
+    }
+
+    #[test]
+    fn details_fall_back_to_the_microformat() {
+        // Some clients answer with the microformat and no `videoDetails`.
+        let a = answer(json!({
+            "playabilityStatus": {"status": "OK"},
+            "microformat": {"playerMicroformatRenderer": {
+                "title": {"runs": [{"text": "Micro "}, {"text": "Song"}]},
+                "ownerChannelName": "Micro Artist",
+                "lengthSeconds": "187"
+            }}
+        }));
+        let p = parse(&a, "x").unwrap();
+        assert_eq!(
+            (p.title.as_str(), p.author.as_str(), p.length_seconds),
+            ("Micro Song", "Micro Artist", 187)
+        );
+        let a = answer(json!({
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"videoId": "x", "title": "Details Song", "lengthSeconds": "10"},
+            "microformat": {"playerMicroformatRenderer": {
+                "title": {"simpleText": "Micro Song"}, "ownerChannelName": "Micro Artist"
+            }}
+        }));
+        let p = parse(&a, "x").unwrap();
+        // Each field from the details first, the microformat only for what they lack.
+        assert_eq!(
+            (p.title.as_str(), p.author.as_str(), p.length_seconds),
+            ("Details Song", "Micro Artist", 10)
+        );
+    }
+
+    #[test]
+    fn shape_names_keys_never_values() {
+        let a = json!({
+            "playabilityStatus": {"status": "OK"},
+            "streamingData": {"adaptiveFormats": [{"url": "https://x/?sig=SECRET"}]},
+            "videoDetails": {"videoId": "x", "isPrivate": false}
+        });
+        let shape = answer_shape(&serde_json::to_vec(&a).unwrap());
+        assert_eq!(
+            shape,
+            "keys: playabilityStatus, streamingData, videoDetails; videoDetails: isPrivate, videoId"
+        );
+        assert!(!shape.contains("SECRET"));
     }
 
     #[test]

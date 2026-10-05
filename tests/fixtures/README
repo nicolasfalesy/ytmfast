@@ -8,3 +8,9 @@ sine440_44k.m4a   2 s, stereo, AAC-LC 128 kb/s in MP4 (like YouTube's itag 141):
   ffmpeg -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 -ac 2 \
     -c:a aac -b:a 128k -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
     -movflags +faststart sine440_44k.m4a
+
+sine440_44k_frag.m4a  the same AAC, as fragmented MP4 with no stated length (mvhd duration 0,
+  no edit list), like YouTube's DASH audio can be:
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 -ac 2 \
+    -c:a aac -b:a 128k -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
+    -movflags +frag_keyframe+empty_moov+default_base_moof -frag_duration 500000 sine440_44k_frag.m4a

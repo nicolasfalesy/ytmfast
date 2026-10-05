@@ -48,6 +48,19 @@ const FAILED_PLAYER_RETRY: Duration = Duration::from_secs(6 * 3600);
 /// version, so a restarted engine doesn't pay for the failure again.
 const FAILED_SUFFIX: &str = "failed";
 
+/// oEmbed answers are a few hundred bytes.
+const OEMBED_CAP: usize = 64 << 10;
+
+/// Details are cosmetic: don't hold a song's start for long waiting on them.
+const OEMBED_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The parts of an oEmbed answer we read.
+#[derive(Deserialize)]
+struct OEmbed {
+    title: Option<String>,
+    author_name: Option<String>,
+}
+
 /// The most links kept. A queue rarely holds more songs than this; expired links go first.
 const MAX_CACHED_LINKS: usize = 64;
 
@@ -238,7 +251,44 @@ impl Streams {
             }
         }
         let url = link.assemble(solved_sig.as_deref(), solved_n.as_deref())?;
-        Ok(stream_from_answer(format, url, &answer))
+        let mut stream = stream_from_answer(format, url, &answer);
+        if stream.meta.title.is_empty() {
+            // The TV answer can come back without the song's details (seen live): ask oEmbed.
+            // Best effort: a song without a title still plays.
+            if let Some((title, artist)) = self.oembed(video_id).await {
+                stream.meta.title = title;
+                if stream.meta.artist.is_empty() {
+                    stream.meta.artist = artist;
+                }
+            }
+        }
+        Ok(stream)
+    }
+
+    /// The song's title and channel from YouTube's oEmbed answer (public: no session goes
+    /// with it), or `None` if that fails.
+    async fn oembed(&self, video_id: &str) -> Option<(String, String)> {
+        let mut url = self.web_base.clone();
+        url.set_path("/oembed");
+        url.query_pairs_mut()
+            .append_pair(
+                "url",
+                &format!("https://www.youtube.com/watch?v={video_id}"),
+            )
+            .append_pair("format", "json");
+        let ask = async {
+            let resp = self.http.get(url).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            net::read_capped(resp, OEMBED_CAP).await.ok()
+        };
+        let body = tokio::time::timeout(OEMBED_TIMEOUT, ask).await.ok()??;
+        let o: OEmbed = serde_json::from_slice(&body).ok()?;
+        Some((
+            o.title.unwrap_or_default(),
+            o.author_name.unwrap_or_default(),
+        ))
     }
 
     /// The current player id and signature timestamp, and the player script when it had to be

@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ytmfast::auth::{Cookie, MemoryStore, Session};
 use ytmfast::error::Error;
@@ -926,4 +926,77 @@ async fn ytdlp_missing_is_an_error() {
 /// `application/x-www-form-urlencoded` value encoding, as YouTube's `signatureCipher` uses.
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+// ---- song details when the TV answer has none --------------------------------------------
+
+/// The TV `player` answer on the real account came back with no title or author (a live
+/// play printed an empty title line). The link still resolves; the details then come from
+/// YouTube's oEmbed answer, which needs no session.
+#[tokio::test]
+async fn details_come_from_oembed_when_the_answer_has_none() {
+    let expire = now() + 6 * 3600;
+    let mut a = answer(url_format(&stream_url(expire, "")));
+    a.as_object_mut().unwrap().remove("videoDetails");
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    Mock::given(method("GET"))
+        .and(path("/oembed"))
+        .and(query_param("format", "json"))
+        .and(query_param(
+            "url",
+            format!("https://www.youtube.com/watch?v={VIDEO}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Oembed Song",
+            "author_name": "Oembed Artist",
+            "type": "video"
+        })))
+        .expect(1)
+        .mount(&r.server)
+        .await;
+    let s = r.streams.resolve(VIDEO).await.unwrap();
+    assert_eq!(s.meta.title, "Oembed Song");
+    assert_eq!(s.meta.artist, "Oembed Artist");
+    // No session goes to oEmbed.
+    let reqs = r.server.received_requests().await.unwrap();
+    let oembed = reqs.iter().find(|q| q.url.path() == "/oembed").unwrap();
+    assert!(oembed.headers.get("cookie").is_none());
+    assert!(oembed.headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn details_missing_everywhere_still_plays() {
+    let expire = now() + 6 * 3600;
+    let mut a = answer(url_format(&stream_url(expire, "")));
+    a.as_object_mut().unwrap().remove("videoDetails");
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    Mock::given(method("GET"))
+        .and(path("/oembed"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&r.server)
+        .await;
+    let s = r.streams.resolve(VIDEO).await.unwrap();
+    assert_eq!(s.meta.title, "");
+    assert_eq!(s.itag, 774);
+}
+
+#[tokio::test]
+async fn details_in_the_answer_skip_oembed() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/oembed"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&r.server)
+        .await;
+    assert_eq!(
+        r.streams.resolve(VIDEO).await.unwrap().meta.title,
+        "Test Song"
+    );
 }
