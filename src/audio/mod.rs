@@ -3,3 +3,6 @@
 
 pub mod decode;
 pub mod fetch;
+pub mod player;
+pub mod pw;
+pub mod sink;
