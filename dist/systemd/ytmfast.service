@@ -1,0 +1,10 @@
+# Started by ytmfast.socket on the first connection; it quits by itself when idle, and the
+# socket starts it again on the next connection. No [Install]: enable the socket instead.
+[Unit]
+Description=ytmfast music engine
+Requires=ytmfast.socket
+After=ytmfast.socket
+
+[Service]
+ExecStart=%h/.local/bin/ytmfast daemon
+Restart=no

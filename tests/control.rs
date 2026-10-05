@@ -153,14 +153,31 @@ async fn connect(path: &Path) -> Client {
     }
 }
 
+/// Keeps a paused test clock still until dropped. Tokio advances a paused clock whenever
+/// the runtime parks, even when that park is what delivers a socket's readiness, so a
+/// request in flight could see the idle timer (or a read timeout) fire first. It never
+/// auto-advances while a blocking task runs, so one waits here for the drop. Harmless with a
+/// real clock.
+struct ClockHold(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+
+fn hold_clock() -> ClockHold {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    ClockHold(tx)
+}
+
 impl Client {
     async fn send(&mut self, line: &str) {
+        let _hold = hold_clock();
         self.write.write_all(line.as_bytes()).await.unwrap();
         self.write.write_all(b"\n").await.unwrap();
     }
 
     /// The next line, or None at the end of the connection.
     async fn next(&mut self) -> Option<Value> {
+        let _hold = hold_clock();
         let line = tokio::time::timeout(WAIT, self.lines.next_line())
             .await
             .expect("no line in time")
@@ -308,11 +325,10 @@ async fn reply_goes_out_after_the_client_half_closes() {
     c.until_closed().await;
 }
 
-/// The paused clock jumps straight to each timer, so these take no real time. It can also
-/// jump while socket IO is in flight (tokio advances it whenever no task is ready, and a
-/// socket's readiness only shows up after that check), so the command's exact moment is
-/// only known to lie between sending it and seeing its reply. The quit must come one idle
-/// limit after a moment in that window.
+/// The paused clock jumps straight to each timer, so these take no real time. The client
+/// holds the clock while it talks (`hold_clock`); the window between sending a command and
+/// seeing its reply is checked anyway, as the command's moment lies somewhere in it. The
+/// quit must come one idle limit after a moment in that window.
 struct Window {
     sent: Instant,
     answered: Instant,
