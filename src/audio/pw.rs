@@ -86,10 +86,15 @@ struct Output {
     thread: Option<JoinHandle<()>>,
 }
 
+/// How an `Output` is made: `Output::connect`, or a stand-in in tests (which must never
+/// reach the user's PipeWire).
+type Connect = fn(rate: u32, volume: f32, paused: bool) -> Result<Output, Error>;
+
 /// PipeWire playback. Connects on the first `open`; a new rate reconnects (the rare switch
-/// between 48 kHz Opus and 44.1 kHz AAC).
+/// between 48 kHz Opus and 44.1 kHz AAC), and so does a stream that failed.
 pub struct PipeWireSink {
     out: Option<Output>,
+    connect: Connect,
     /// The slider value (0..=1), re-applied to each new stream.
     volume: f32,
     paused: bool,
@@ -99,6 +104,7 @@ impl PipeWireSink {
     pub fn new() -> PipeWireSink {
         PipeWireSink {
             out: None,
+            connect: Output::connect,
             volume: 1.0,
             paused: false,
         }
@@ -158,13 +164,19 @@ impl Sink for PipeWireSink {
         if channels != 2 {
             return Err(Error::Internal("the output is stereo only".into()));
         }
-        if self.out.as_ref().is_some_and(|o| o.rate == rate) {
+        // A failed stream stays failed (PipeWire restarted, or the stream was unlinked for
+        // good): reusing it would fail every later song too, so it is replaced.
+        if self
+            .out
+            .as_ref()
+            .is_some_and(|o| o.rate == rate && !o.shared.failed.load(Ordering::Acquire))
+        {
             return Ok(());
         }
         if let Some(old) = self.out.take() {
             old.close();
         }
-        self.out = Some(Output::connect(
+        self.out = Some((self.connect)(
             rate,
             channel_volume(self.volume),
             self.paused,
@@ -627,6 +639,50 @@ mod tests {
         assert_eq!(channel_volume(1.0), 1.0);
         assert_eq!(channel_volume(0.0), 0.0);
         assert!((channel_volume(0.5) - 0.125).abs() < 1e-7);
+    }
+
+    // Connections made by `fake_connect`, per test thread (tests run in parallel).
+    thread_local! {
+        static CONNECTS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// An `Output` with no PipeWire behind it: nothing reads its ring or its control channel.
+    fn fake_connect(rate: u32, _volume: f32, _paused: bool) -> Result<Output, Error> {
+        CONNECTS.with(|c| c.set(c.get() + 1));
+        let (producer, _consumer) = rtrb::RingBuffer::new(16);
+        let (control, _inbox) = pw::channel::channel();
+        Ok(Output {
+            rate,
+            producer,
+            capacity: 16,
+            shared: Arc::new(Shared::default()),
+            control,
+            thread: None,
+        })
+    }
+
+    #[test]
+    fn failed_stream_is_reconnected() {
+        // After a PipeWire restart the old stream is gone for good: the next song must get a
+        // new one, not keep failing with "the audio output stopped" on the dead one.
+        let mut sink = PipeWireSink::new();
+        sink.connect = fake_connect;
+        sink.open(48_000, 2).unwrap();
+        sink.open(48_000, 2).unwrap();
+        assert_eq!(CONNECTS.with(Cell::get), 1, "a healthy stream is kept");
+        let shared = sink.out.as_ref().unwrap().shared.clone();
+        shared.failed.store(true, Ordering::Release);
+        sink.open(48_000, 2).unwrap();
+        assert_eq!(CONNECTS.with(Cell::get), 2, "a failed stream is replaced");
+        assert!(
+            !sink
+                .out
+                .as_ref()
+                .unwrap()
+                .shared
+                .failed
+                .load(Ordering::Acquire)
+        );
     }
 
     #[test]
