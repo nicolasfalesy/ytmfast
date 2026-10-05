@@ -4,8 +4,10 @@
 //! InnerTube's `player` for the song as the TV client with the session, pick the format
 //! (itag 774 Opus, else 141 AAC, else the highest-bitrate other audio), solve the link's
 //! challenges (the `n` parameter, and the signature of a `signatureCipher`) in one solver
-//! call, and assemble the link. If any step fails, yt-dlp is asked instead (`ytdlp`); if that
-//! fails too, the own-code error is reported, since it says why (signed out, unavailable).
+//! call, and assemble the link. If a step fails for a reason yt-dlp might get past (the solver,
+//! the link, the network), yt-dlp is asked instead (`ytdlp`); if that fails too, the own-code
+//! error is reported. A rejected session (`signed_out`) or a song YouTube won't play
+//! (`unavailable`) is reported at once, without yt-dlp: see `falls_back`.
 //!
 //! Links are cached per video until 30 minutes before their `expire` time.
 
@@ -182,6 +184,9 @@ impl Streams {
         // reusing a version that may be why this failed, for up to `PLAYER_ID_TTL`. If it is
         // the same version and the solver failed on it, `current_player` skips it at once.
         *self.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if !falls_back(&own) {
+            return Err(own);
+        }
         // The code only: messages are short and fixed, but the code is all a log needs.
         eprintln!(
             "ytmfast: own stream link failed ({}); trying yt-dlp",
@@ -436,6 +441,15 @@ impl Resolver for Streams {
         self.remember(&stream);
         Ok(stream)
     }
+}
+
+/// Whether an own-code failure is worth asking yt-dlp about. Not `SignedOut`: yt-dlp would
+/// usually get an anonymous link anyway (lower quality, about 4 s later), and the user would
+/// never learn the session needs importing again. Not `Unavailable`: YouTube said the song
+/// can't be played, which yt-dlp can't change. Everything else (the solver, an odd link, the
+/// network, our own faults) may be ours alone, so yt-dlp gets a try.
+fn falls_back(e: &Error) -> bool {
+    !matches!(e, Error::SignedOut | Error::Unavailable(_))
 }
 
 /// A video id is 11 characters of `A-Z a-z 0-9 _ -`. The control socket checks it too, to

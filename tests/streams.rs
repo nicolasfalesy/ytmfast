@@ -502,8 +502,8 @@ async fn no_audio_format_is_unavailable() {
         r.streams.resolve(VIDEO).await,
         Err(Error::Unavailable("no audio format".into()))
     );
-    // The fallback was tried; its failure doesn't hide the real reason.
-    assert_eq!(r.ytdlp.calls(), 1);
+    // The song itself is the problem: yt-dlp isn't asked.
+    assert_eq!(r.ytdlp.calls(), 0);
 }
 
 #[tokio::test]
@@ -629,6 +629,65 @@ async fn ytdlp_answer_is_checked() {
         assert_eq!(e.code(), "stream_failed", "{bad}");
         assert!(!format!("{e:?}").contains("://"));
     }
+}
+
+// ---- what never falls back --------------------------------------------------------------
+
+#[tokio::test]
+async fn signed_out_never_falls_back_to_ytdlp() {
+    // YouTube refused the session. yt-dlp would usually still get an anonymous, lower-quality
+    // link a few seconds later, and the widget would never learn the user must sign in again.
+    let expire = now() + 6 * 3600;
+    let login_required: Value =
+        serde_json::from_str(include_str!("fixtures/player_login_required.json")).unwrap();
+    let r = rig(
+        Some(login_required),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(r.streams.resolve(VIDEO).await, Err(Error::SignedOut));
+    assert_eq!(r.ytdlp.calls(), 0);
+
+    // The same when the session has no sign-in cookie at all.
+    *r.session.lock().unwrap() = Session::default();
+    assert_eq!(r.streams.resolve_fresh(VIDEO).await, Err(Error::SignedOut));
+    assert_eq!(r.ytdlp.calls(), 0);
+}
+
+#[tokio::test]
+async fn unavailable_never_falls_back_to_ytdlp() {
+    let expire = now() + 6 * 3600;
+    let a = json!({"playabilityStatus": {"status": "UNPLAYABLE", "reason": "Not in your country"}});
+    let r = rig(
+        Some(a),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(
+        r.streams.resolve(VIDEO).await,
+        Err(Error::Unavailable("Not in your country".into()))
+    );
+    assert_eq!(r.ytdlp.calls(), 0);
+}
+
+#[tokio::test]
+async fn network_failure_still_falls_back_to_ytdlp() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        None,
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/player"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&r.server)
+        .await;
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.ytdlp.calls(), 1);
 }
 
 // ---- player versions the solver can't handle -------------------------------------------
