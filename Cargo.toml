@@ -57,6 +57,10 @@ zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "process", "time", "net", "io-util", "signal"] }
 url = "2.5"
 
+[build-dependencies]
+# Finds the system libopus (build.rs); already in the tree through aws-lc-sys.
+pkg-config = "0.3"
+
 [dev-dependencies]
 # StreamExt for the MPRIS tests' signal streams (already in the tree through reqwest and zbus).
 futures-util = { version = "0.3", default-features = false }

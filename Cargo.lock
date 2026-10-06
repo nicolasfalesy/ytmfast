@@ -2888,6 +2888,7 @@ dependencies = [
  "oo7",
  "pbkdf2",
  "pipewire",
+ "pkg-config",
  "reqwest",
  "rquickjs",
  "rtrb",

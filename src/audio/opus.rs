@@ -1,4 +1,4 @@
-//! Opus decoding with the system's libopus (`libopus.so`, Arch's `opus` package), through the
+//! Opus decoding with the system's libopus (`libopus.so.0`, Arch's `opus` package), through the
 //! four calls the decoder needs. Linking the system library instead of a crate that builds
 //! its own copy makes the binary smaller, drops the cmake build, and takes libopus fixes with
 //! system updates. `tests/decode.rs` pins the output bit for bit (`opus_output_is_pinned`).
@@ -12,7 +12,7 @@ struct RawDecoder {
     _private: [u8; 0],
 }
 
-#[link(name = "opus")]
+// Linked by build.rs, which finds libopus with pkg-config.
 unsafe extern "C" {
     fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int) -> *mut RawDecoder;
     fn opus_decode_float(

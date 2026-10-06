@@ -42,7 +42,8 @@ cargo build --release
 ```
 
 Building needs Rust, clang, pkg-config, and the PipeWire and libopus development files (Arch:
-`pipewire` and `opus`). `yt-dlp` is used as a fallback for stream links when it is installed.
+`pipewire` and `opus`). Running needs the same two libraries (`libpipewire-0.3.so.0` and
+`libopus.so.0`). `yt-dlp` is used as a fallback for stream links when it is installed.
 
 ## Run with systemd
 
