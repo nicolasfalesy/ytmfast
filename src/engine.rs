@@ -741,8 +741,12 @@ impl Engine {
                 }
             }
             PlayState::Stopped => {
-                // The queue ran out and songs were added since: go on with them.
-                if self.at_end && self.queue.peek_next(false).is_some() {
+                // The queue ran out and songs were added since, or songs were added to a queue
+                // with nothing current yet: go on with them. Liked songs (below) only when the
+                // queue is truly empty, so a play never throws away songs the user queued.
+                if (self.at_end || self.queue.current().is_none())
+                    && self.queue.peek_next(false).is_some()
+                {
                     return self.advance(false, false);
                 }
                 if self.queue.current().is_some() {
@@ -3782,6 +3786,98 @@ mod tests {
                 ..NextRequest::default()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn play_with_songs_queued_but_none_current_plays_them_not_liked_songs() {
+        let mut r = rig(Setup {
+            pages: vec![ok("LM", 0, "XY", None)],
+            ..Setup::default()
+        })
+        .await;
+        // Songs added to an empty queue: none is current yet (ruling S8).
+        let (added, ok_rx) = oneshot::channel();
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('B'), song('C')],
+            at: AddAt::End,
+            added,
+        })
+        .await;
+        assert!(ok_rx.await.unwrap());
+        let before = r.queue().await;
+        assert_eq!(before.current_id, None);
+        r.send(EngineCmd::Play {
+            video_id: None,
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        })
+        .await;
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        no_errors(&seen);
+        let q = r.queue().await;
+        let ids: Vec<_> = q.items.iter().map(|i| i.song.video_id.clone()).collect();
+        assert_eq!(ids, [vid('B'), vid('C')], "the queue is kept");
+        assert_eq!(q.current_id, Some(id_of(&before, 'B')));
+        assert!(
+            !r.source
+                .requests()
+                .iter()
+                .any(|q| q.playlist_id.as_deref() == Some(LIKED_SONGS)),
+            "Liked songs are not asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_with_songs_queued_but_none_current_plays_them() {
+        let mut r = rig(Setup {
+            pages: vec![ok("LM", 0, "XY", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('B'), song('C')],
+            at: AddAt::End,
+            added: oneshot::channel().0,
+        })
+        .await;
+        // MPRIS Play and PlayPause from Stopped come here too.
+        r.send(EngineCmd::Toggle).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        // (The radio of the queue's last song may be asked for now that B plays.)
+        assert!(
+            !r.source
+                .requests()
+                .iter()
+                .any(|q| q.playlist_id.as_deref() == Some(LIKED_SONGS)),
+            "{:?}",
+            r.source.requests()
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_to_a_queue_with_nothing_current_fetches_no_radio() {
+        let r = rig(Setup {
+            pages: vec![ok(&radio_of('B'), 0, "BXY", None)],
+            ..Setup::default()
+        })
+        .await;
+        let (added, ok_rx) = oneshot::channel();
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('B')],
+            at: AddAt::End,
+            added,
+        })
+        .await;
+        assert!(ok_rx.await.unwrap());
+        // Let a request (if one went out) land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            r.source.requests().is_empty(),
+            "nothing plays yet, so no radio: {:?}",
+            r.source.requests()
+        );
+        assert_eq!(r.queue().await.items.len(), 1);
     }
 
     #[tokio::test]

@@ -427,13 +427,14 @@ impl Queue {
     }
 
     /// True when the queue is about to run out: Repeat::Off and 2 or fewer items after the
-    /// current one. The engine then fetches more radio songs.
+    /// current one. The engine then fetches more radio songs. Never with no current item
+    /// (an empty queue, or songs added to one): nothing plays, so nothing is about to run
+    /// out, and a radio fetched then would be for a queue the user may never play.
     pub fn needs_more(&self) -> bool {
-        let left = match self.current {
-            Some(c) => self.items.len() - c - 1,
-            None => self.items.len(),
+        let Some(c) = self.current else {
+            return false;
         };
-        self.repeat == Repeat::Off && left <= 2
+        self.repeat == Repeat::Off && self.items.len() - c - 1 <= 2
     }
 
     /// Appends a radio page (or a list's next page) at the end of the original order; while
@@ -889,7 +890,13 @@ mod tests {
         assert!(!queue(5, 1).needs_more(), "3 left");
         assert!(queue(5, 2).needs_more(), "2 left");
         assert!(queue(5, 4).needs_more(), "none left");
-        assert!(Queue::with_seed(1).needs_more(), "empty");
+        assert!(!Queue::with_seed(1).needs_more(), "empty: nothing plays");
+        // Songs added to an empty queue: none is current until a play, and nothing is
+        // fetched for a queue that isn't playing.
+        let mut q = Queue::with_seed(1);
+        assert!(q.add(vec![song("a")], AddAt::End));
+        assert_eq!(q.current(), None);
+        assert!(!q.needs_more(), "no current song");
 
         let mut q = queue(5, 4);
         q.set_repeat(Repeat::All);
