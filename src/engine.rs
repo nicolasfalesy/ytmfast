@@ -101,9 +101,12 @@ pub enum EngineCmd {
     /// Restarts the song when more than 3 s in, else plays the item before.
     Previous,
     QueueGet(oneshot::Sender<QueueView>),
+    /// `added` answers false, with nothing added, when the songs would take the queue past
+    /// `queue::MAX_ITEMS` (the socket refuses the request).
     QueueAdd {
         songs: Vec<SongItem>,
         at: AddAt,
+        added: oneshot::Sender<bool>,
     },
     /// By queue id.
     QueueRemove(u64),
@@ -618,7 +621,10 @@ impl Engine {
             EngineCmd::QueueGet(reply) => {
                 let _ = reply.send(self.queue_view());
             }
-            EngineCmd::QueueAdd { songs, at } => self.queue_add(songs, at),
+            EngineCmd::QueueAdd { songs, at, added } => {
+                let ok = self.queue_add(songs, at);
+                let _ = added.send(ok);
+            }
             EngineCmd::QueueRemove(id) => self.queue_remove(id),
             EngineCmd::QueueJump(id) => self.queue_jump(id),
             EngineCmd::QueueMove { id, index } => {
@@ -1022,14 +1028,19 @@ impl Engine {
         }
     }
 
-    fn queue_add(&mut self, songs: Vec<SongItem>, at: AddAt) {
-        self.queue.add(songs, at);
+    /// False when the queue is full (nothing changed).
+    fn queue_add(&mut self, songs: Vec<SongItem>, at: AddAt) -> bool {
+        if !self.queue.add(songs, at) {
+            return false;
+        }
         self.emit_queue();
         if self.waiting {
             self.waiting = false;
-            return self.advance(false, true);
+            self.advance(false, true);
+        } else {
+            self.maybe_refill();
         }
-        self.maybe_refill();
+        true
     }
 
     fn queue_remove(&mut self, id: u64) {
@@ -3222,6 +3233,7 @@ mod tests {
         r.send(EngineCmd::Repeat(Repeat::Off)).await;
         r.send(EngineCmd::Shuffle(false)).await;
         r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
             songs: vec![],
             at: AddAt::End,
         })
@@ -3626,6 +3638,7 @@ mod tests {
         r.until_song(&vid('A'), PlayState::Playing).await;
 
         r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
             songs: vec![song('D')],
             at: AddAt::End,
         })
@@ -3814,6 +3827,7 @@ mod tests {
         r.status().await;
         assert_eq!(saves_settle(&saves, base + 4), base + 4, "volume saves");
         r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
             songs: vec![song('B')],
             at: AddAt::End,
         })

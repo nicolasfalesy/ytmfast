@@ -469,7 +469,24 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
         Request::Volume { percent } => EngineCmd::Volume(protocol::percent_to_volume(percent)),
         Request::Next => EngineCmd::Next,
         Request::Previous => EngineCmd::Previous,
-        Request::QueueAdd { songs, at } => EngineCmd::QueueAdd { songs, at },
+        // Answered by the engine, which alone knows whether the songs fit (ruling S15).
+        Request::QueueAdd { songs, at } => {
+            let (added, ok) = oneshot::channel();
+            if shared
+                .cmds
+                .send(EngineCmd::QueueAdd { songs, at, added })
+                .await
+                .is_err()
+            {
+                return (gone(), false);
+            }
+            let reply = match ok.await {
+                Ok(true) => protocol::ok_reply(id, json!({})),
+                Ok(false) => protocol::error_reply(Some(id), BAD_REQUEST, "the queue is full"),
+                Err(_) => gone(),
+            };
+            return (reply, false);
+        }
         Request::QueueRemove { id } => EngineCmd::QueueRemove(id),
         Request::QueueJump { id } => EngineCmd::QueueJump(id),
         Request::QueueMove { id, index } => EngineCmd::QueueMove { id, index },

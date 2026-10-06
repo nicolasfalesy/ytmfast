@@ -127,6 +127,15 @@ fn fake_engine(status: Status) -> FakeEngine {
                 EngineCmd::QueueGet(reply) => {
                     let _ = reply.send(fake_queue());
                 }
+                // Always fits; the test sees the songs (with a sender nobody waits on).
+                EngineCmd::QueueAdd { songs, at, added } => {
+                    let _ = added.send(true);
+                    let _ = seen_tx.send(EngineCmd::QueueAdd {
+                        songs,
+                        at,
+                        added: tokio::sync::oneshot::channel().0,
+                    });
+                }
                 EngineCmd::Quit => return,
                 other => {
                     let _ = seen_tx.send(other);
@@ -635,14 +644,14 @@ async fn queue_commands_reach_the_engine() {
     assert!(matches!(got[0], EngineCmd::Next));
     assert!(matches!(got[1], EngineCmd::Previous));
     match &got[2] {
-        EngineCmd::QueueAdd { songs, at } => {
+        EngineCmd::QueueAdd { songs, at, .. } => {
             assert_eq!(songs, &vec![full_song(SONG)]);
             assert_eq!(*at, AddAt::Next);
         }
         other => panic!("{other:?}"),
     }
     match &got[3] {
-        EngineCmd::QueueAdd { songs, at } => {
+        EngineCmd::QueueAdd { songs, at, .. } => {
             let ids: Vec<&str> = songs.iter().map(|s| s.video_id.as_str()).collect();
             assert_eq!(ids, ["AAAAAAAAAAA", "BBBBBBBBBBB"]);
             assert!(
@@ -882,4 +891,41 @@ async fn queue_round_trips_and_events_reach_both_clients() {
     assert_eq!(a.reply(15).await["ok"], true);
     let e = a.event("error").await;
     assert!(!e["message"].as_str().unwrap().is_empty());
+}
+
+/// The live queue holds at most 1,000 songs (ruling S15): an add that would pass it is
+/// refused whole, with a `bad_request`, and the queue is left as it was.
+#[tokio::test]
+async fn an_add_past_the_queue_cap_is_refused() {
+    let d = daemon(true);
+    let mut c = connect(&d.path).await;
+    let ids = |prefix: char, n: usize| -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i:010}")).collect()
+    };
+    for (id, batch) in [(1, ids('a', 500)), (2, ids('b', 499))] {
+        let line = json!({"id": id, "cmd": "queue.add", "args": {"videoIds": batch}});
+        c.send(&line.to_string()).await;
+        assert_eq!(c.reply(id).await["ok"], true);
+    }
+    // Two more would pass 1,000: refused whole.
+    let line = json!({"id": 3, "cmd": "queue.add", "args": {"videoIds": ids('c', 2)}});
+    c.send(&line.to_string()).await;
+    assert_eq!(
+        c.reply(3).await,
+        json!({"id": 3, "ok": false,
+               "error": {"code": "bad_request", "message": "the queue is full"}})
+    );
+    // One more fits exactly.
+    let line = json!({"id": 4, "cmd": "queue.add", "args": {"videoIds": ids('d', 1)}});
+    c.send(&line.to_string()).await;
+    assert_eq!(c.reply(4).await["ok"], true);
+    c.send(r#"{"id":5,"cmd":"queue.get"}"#).await;
+    let q = c.reply(5).await;
+    let items = q["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1000);
+    assert!(
+        items
+            .iter()
+            .all(|i| !i["videoId"].as_str().unwrap().starts_with('c'))
+    );
 }

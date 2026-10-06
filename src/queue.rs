@@ -20,6 +20,16 @@ const RADIO_OVERLAP_WINDOW: usize = 50;
 /// Previous restarts the song once the position is more than this far in (global constraint).
 const RESTART_AFTER_SECONDS: f64 = 3.0;
 
+/// The most songs the live queue holds (ruling S15). The whole queue goes to every widget on
+/// every change as one line, and the socket's lines stop at 1 MiB: 1,000 songs at about
+/// 375 bytes each is about 375 KB. An add that would pass it is refused; a refill drops
+/// played songs first and stops at it.
+pub const MAX_ITEMS: usize = 1_000;
+
+/// Played songs a refill keeps behind the current one when it makes room, so Previous and
+/// the widget's list still reach back a while.
+pub const KEEP_PLAYED: usize = 50;
+
 /// One song in the queue, with the id the widgets use to jump to it, remove it or move it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueItem {
@@ -136,8 +146,24 @@ impl Queue {
 
     /// Replaces the whole queue with new items (new ids) and makes `songs[start_index]` current.
     /// A start past the end (a stale index) starts at the first song. With shuffle on, the new
-    /// queue is shuffled with the start song first.
-    pub fn replace(&mut self, songs: Vec<SongItem>, start_index: usize) -> Option<&QueueItem> {
+    /// queue is shuffled with the start song first. A list over `MAX_ITEMS` keeps that many
+    /// around the start: `KEEP_PLAYED` before it and the rest after, reaching further back
+    /// when the list ends sooner.
+    pub fn replace(&mut self, mut songs: Vec<SongItem>, start_index: usize) -> Option<&QueueItem> {
+        let mut start_index = start_index;
+        if songs.len() > MAX_ITEMS {
+            let start = if start_index < songs.len() {
+                start_index
+            } else {
+                0
+            };
+            let from = start
+                .saturating_sub(KEEP_PLAYED)
+                .min(songs.len() - MAX_ITEMS);
+            songs.truncate(from + MAX_ITEMS);
+            songs.drain(..from);
+            start_index = start - from;
+        }
         let items = self.new_items(songs);
         self.current = match items.len() {
             0 => None,
@@ -316,8 +342,18 @@ impl Queue {
 
     /// Adds songs as new items, in the given order. `Next` puts them right after the current
     /// item, in the play order and (while shuffled) in the original order too, so they still
-    /// come next after shuffle is turned off.
-    pub fn add(&mut self, songs: Vec<SongItem>, at: AddAt) {
+    /// come next after shuffle is turned off. False, with nothing added, when they would take
+    /// the queue past `MAX_ITEMS`: the user asked for these songs, so none are dropped
+    /// quietly, and played songs are not dropped to make room either.
+    pub fn add(&mut self, songs: Vec<SongItem>, at: AddAt) -> bool {
+        if self.items.len() + songs.len() > MAX_ITEMS {
+            return false;
+        }
+        self.insert(songs, at);
+        true
+    }
+
+    fn insert(&mut self, songs: Vec<SongItem>, at: AddAt) {
         let items = self.new_items(songs);
         let ids = items.iter().map(|i| i.id);
         match at {
@@ -398,6 +434,10 @@ impl Queue {
     /// Appends a radio page at the end of both orders (radio songs stay in radio order even
     /// while shuffled), skipping songs already among the queue's last 50 items, because
     /// consecutive radio pages overlap. Returns how many were added.
+    ///
+    /// At `MAX_ITEMS`: first the played songs (before the current one in play order) are
+    /// dropped from the front, keeping `KEEP_PLAYED`; then only what fits is appended. A refill
+    /// comes only when 2 or fewer songs are left, so in practice there is always room.
     pub fn append_radio(&mut self, songs: Vec<SongItem>) -> usize {
         // The last items in the order songs were appended in: the original order while shuffled.
         let mut seen: HashSet<String> = match &self.original {
@@ -419,13 +459,34 @@ impl Queue {
                 .collect(),
         };
         // `seen` also takes each new song, so a page that repeats a song adds it once.
-        let fresh: Vec<SongItem> = songs
+        let mut fresh: Vec<SongItem> = songs
             .into_iter()
             .filter(|s| seen.insert(s.video_id.clone()))
             .collect();
+        if self.items.len() + fresh.len() > MAX_ITEMS {
+            self.drop_played();
+        }
+        fresh.truncate(MAX_ITEMS.saturating_sub(self.items.len()));
         let added = fresh.len();
-        self.add(fresh, AddAt::End);
+        self.insert(fresh, AddAt::End);
         added
+    }
+
+    /// Drops the played songs (those before the current one in play order) but the last
+    /// `KEEP_PLAYED`, from both orders.
+    fn drop_played(&mut self) {
+        let Some(c) = self.current else {
+            return;
+        };
+        let drop = c.saturating_sub(KEEP_PLAYED);
+        if drop == 0 {
+            return;
+        }
+        let gone: HashSet<u64> = self.items.drain(..drop).map(|i| i.id).collect();
+        if let Some(original) = &mut self.original {
+            original.retain(|id| !gone.contains(id));
+        }
+        self.current = Some(c - drop);
     }
 
     fn index_of(&self, id: u64) -> Option<usize> {
@@ -923,5 +984,157 @@ mod tests {
             }
         }
         assert!(Queue::with_seed(1).peek_next(true).is_none());
+    }
+
+    /// The ids in play order, and (while shuffled) the original order as ids: what a test
+    /// compares to see both orders stay in step.
+    fn orders(q: &Queue) -> (Vec<u64>, Option<Vec<u64>>) {
+        let ids: Vec<u64> = q.items().iter().map(|i| i.id).collect();
+        let original = q
+            .original_positions()
+            .map(|o| o.iter().map(|&p| ids[p]).collect());
+        (ids, original)
+    }
+
+    /// Both orders hold exactly the same ids, each once.
+    fn assert_orders_agree(q: &Queue) {
+        let (ids, original) = orders(q);
+        let mut a = ids.clone();
+        a.sort_unstable();
+        a.dedup();
+        assert_eq!(a.len(), ids.len(), "an id twice in the play order");
+        if let Some(o) = original {
+            let mut b = o.clone();
+            b.sort_unstable();
+            assert_eq!(a, b, "the original order lost or gained items");
+        }
+    }
+
+    #[test]
+    fn add_past_the_cap_is_refused_whole() {
+        let mut q = queue(500, 0);
+        assert!(q.add(songs(499), AddAt::End));
+        assert_eq!(q.len(), MAX_ITEMS - 1);
+        // Exactly to the cap is fine.
+        assert!(q.add(vec![song("last")], AddAt::Next));
+        assert_eq!(q.len(), MAX_ITEMS);
+        let before = orders(&q);
+        let current = q.current().map(|i| i.id);
+        // One more: refused, and nothing changed (no item, no id spent).
+        assert!(!q.add(vec![song("over")], AddAt::End));
+        assert!(!q.add(vec![song("over")], AddAt::Next));
+        assert_eq!(orders(&q), before);
+        assert_eq!(q.current().map(|i| i.id), current);
+        // A refused add that would have fitted partly is still refused whole.
+        q.remove(id_of(&q, "last"));
+        assert!(!q.add(songs(2), AddAt::End));
+        assert_eq!(q.len(), MAX_ITEMS - 1);
+        // The next id is the one after the last song added: refused adds spent none.
+        assert!(q.add(vec![song("fits")], AddAt::End));
+        assert_eq!(id_of(&q, "fits"), 1001);
+    }
+
+    #[test]
+    fn refill_at_the_cap_drops_played_songs_keeping_50() {
+        let mut q = queue(MAX_ITEMS, 997);
+        let current = q.current().unwrap().clone();
+        let kept_first = q.items()[997 - KEEP_PLAYED].id;
+        let radio: Vec<SongItem> = (0..100).map(|i| song(&format!("r{i}"))).collect();
+        assert_eq!(q.append_radio(radio), 100);
+        // 50 played, the current one, the 2 to come, then the new 100.
+        assert_eq!(q.len(), KEEP_PLAYED + 1 + 2 + 100);
+        assert_eq!(q.current(), Some(&current));
+        assert_eq!(q.current_index(), Some(KEEP_PLAYED));
+        assert_eq!(q.items()[0].id, kept_first);
+        assert_eq!(cur(&q), Some("s997".into()));
+        assert_eq!(q.items().last().unwrap().song.video_id, "r99");
+        // Playing on still works through the trimmed queue.
+        assert_eq!(
+            q.next(false).map(|i| i.song.video_id.clone()),
+            Some("s998".into())
+        );
+        assert_orders_agree(&q);
+    }
+
+    #[test]
+    fn refill_below_the_cap_trims_nothing() {
+        let mut q = queue(500, 498);
+        assert_eq!(q.append_radio(songs_named("r", 100)), 100);
+        assert_eq!(q.len(), 600);
+        assert_eq!(q.current_index(), Some(498));
+    }
+
+    fn songs_named(prefix: &str, n: usize) -> Vec<SongItem> {
+        (0..n).map(|i| song(&format!("{prefix}{i}"))).collect()
+    }
+
+    #[test]
+    fn refill_stops_appending_at_the_cap() {
+        // Few songs played (under 50 to drop): only what fits is appended.
+        let mut q = queue(960, 5);
+        assert_eq!(q.append_radio(songs_named("r", 100)), 40);
+        assert_eq!(q.len(), MAX_ITEMS);
+        assert_eq!(q.current_index(), Some(5));
+        assert_eq!(q.items().last().unwrap().song.video_id, "r39");
+        // Full with nothing to drop: nothing is added.
+        assert_eq!(q.append_radio(songs_named("x", 10)), 0);
+        assert_eq!(q.len(), MAX_ITEMS);
+    }
+
+    #[test]
+    fn refill_trim_keeps_both_orders_in_step_while_shuffled() {
+        let mut q = queue(MAX_ITEMS, 0);
+        q.set_shuffle(true);
+        // Play to near the end of the shuffled order.
+        for _ in 0..997 {
+            q.next(false);
+        }
+        assert!(q.needs_more());
+        let current = q.current().unwrap().clone();
+        let played: Vec<u64> = q.items()[..997].iter().map(|i| i.id).collect();
+        assert_eq!(q.append_radio(songs_named("r", 100)), 100);
+        assert_eq!(q.current(), Some(&current));
+        assert_eq!(q.len(), KEEP_PLAYED + 1 + 2 + 100);
+        // The songs dropped are the earliest played in play order.
+        let dropped = &played[..997 - KEEP_PLAYED];
+        assert!(q.items().iter().all(|i| !dropped.contains(&i.id)));
+        assert_orders_agree(&q);
+        // Shuffle off: the survivors in their original order, at the same current song, with
+        // the radio songs last.
+        q.set_shuffle(false);
+        assert_eq!(q.current(), Some(&current));
+        let originals: Vec<usize> = q
+            .items()
+            .iter()
+            .filter_map(|i| i.song.video_id.strip_prefix('s'))
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert!(originals.windows(2).all(|w| w[0] < w[1]), "{originals:?}");
+        assert_eq!(q.items().last().unwrap().song.video_id, "r99");
+    }
+
+    #[test]
+    fn replace_keeps_at_most_the_cap_around_the_start() {
+        let mut q = Queue::with_seed(3);
+        q.replace(songs(3000), 700);
+        assert_eq!(q.len(), MAX_ITEMS);
+        assert_eq!(cur(&q), Some("s700".into()));
+        assert_eq!(q.current_index(), Some(KEEP_PLAYED));
+        assert_eq!(q.items()[0].song.video_id, "s650");
+        // Fewer than MAX_ITEMS - KEEP_PLAYED after the start: the window reaches further back.
+        q.replace(songs(1500), 700);
+        assert_eq!(q.len(), MAX_ITEMS);
+        assert_eq!(cur(&q), Some("s700".into()));
+        assert_eq!(q.items()[0].song.video_id, "s500");
+        // Near the end: the last MAX_ITEMS songs, the start among them.
+        q.replace(songs(1500), 1490);
+        assert_eq!(q.len(), MAX_ITEMS);
+        assert_eq!(cur(&q), Some("s1490".into()));
+        assert_eq!(q.items().last().unwrap().song.video_id, "s1499");
+        // From the first song, or a start past the end: the first MAX_ITEMS.
+        q.replace(songs(1500), 5000);
+        assert_eq!(q.len(), MAX_ITEMS);
+        assert_eq!(cur(&q), Some("s0".into()));
+        assert_eq!(q.items().last().unwrap().song.video_id, "s999");
     }
 }
