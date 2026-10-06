@@ -66,3 +66,18 @@ tempfile = "3"
 tokio = { version = "1.53.2", features = ["net", "io-util", "rt", "macros", "time", "test-util"] }
 # A local HTTP server standing in for the InnerTube API.
 wiremock = "0.6.5"
+
+# Measured on this tree (release, cores 12-15, see the polish report): 22.56 MB -> 14.57 MB
+# on disk, idle PSS 5.99 -> 4.79 MB, start-to-socket unchanged (about 1.5-1.9 ms).
+[profile.release]
+# Symbols only: a panic still prints its message, but a backtrace shows no function names.
+strip = true
+# Fat over thin: 1.06 MB smaller and 0.6 MB less idle PSS, for about a minute more per
+# release build (clean 206 s against 147 s, a one-file rebuild 129 s against 69 s, on battery).
+lto = "fat"
+codegen-units = 1
+# panic stays "unwind" (abort would save another 1.16 MB): the engine relies on catching
+# panics. A panicking engine task is caught by tokio and ends the daemon cleanly as
+# EngineGone (removing a self-bound socket); a panicking client task drops only that client;
+# the audio and solver threads failing leave the rest running; and every Mutex recovers from
+# poisoning. With abort, each of those would kill the whole process.
