@@ -134,11 +134,13 @@ song) or `"one"` (the current song again when it ends; `next` and `previous` sti
 
 `like` sets a song's like status on the account: `"like"`, `"dislike"`, or `"none"` to take
 either back. With `videoId` it is that song (a row in a list, whatever is playing); without,
-it is the song the state shows. With no `videoId` and no song shown, it is `bad_request`
-(`bad request: nothing is playing: say which song (videoId)`).
+or with `"videoId": null`, it is the song the state shows. With no `videoId` and no song
+shown, it is `bad_request` (`bad request: nothing is playing: say which song (videoId)`).
 
 Unlike the playback commands, the reply waits for YouTube: `{}` means YouTube took it, and
-by then the state's `liked` already shows it when it is the song shown. A like runs
+by then the state's `liked` already shows it when it is the song shown. With two likes for
+one song on their way at once, the last one sent wins: the state shows only its answer, and
+an older one's `{}` (whenever it comes) changes nothing there. A like runs
 alongside the client's other requests, like a browse, and counts toward the same limit of 4
 waiting at once (see Browsing). A refused like is answered with the error, to that client
 only, never as an `error` event, with the codes of browsing's errors (see Browsing);
@@ -269,7 +271,9 @@ the play went to the engine. A page with nothing to play is `bad_request` with t
 A newer choice wins: when a command that picks what plays (`play`, `playPage`'s own play,
 `queue.jump`, `next`, `previous`, from any client or MPRIS) reaches the engine after this
 `playPage` and before its page has loaded, the page's play is dropped, and the reply is
-`{"id": ..., "ok": true, "data": {"superseded": true}}`.
+`{"id": ..., "ok": true, "data": {"superseded": true}}`. A `play` with no id and a `toggle`
+(and MPRIS Play and PlayPause) count only when the state is `stopped`: then they start
+something. Otherwise they only resume or pause the song, and the page still plays.
 
 ### lyrics
 
