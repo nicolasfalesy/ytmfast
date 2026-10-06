@@ -15,7 +15,7 @@ use sha1::{Digest, Sha1};
 use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use ytmfast::auth::{Cookie, MemoryStore, Session};
+use ytmfast::auth::{Cookie, MemoryStore, Session, SessionStore};
 use ytmfast::browse::{LikeStatus, parse_browse, parse_lyrics, parse_more, parse_search};
 use ytmfast::error::Error;
 use ytmfast::innertube::{Innertube, MoreKind, NextRequest, clients};
@@ -59,15 +59,23 @@ fn session() -> Session {
 
 struct Rig {
     server: MockServer,
+    store: Arc<MemoryStore>,
+    session: Arc<Mutex<Session>>,
     api: Innertube,
 }
 
 async fn rig() -> Rig {
     let server = MockServer::start().await;
     let store = Arc::new(MemoryStore::new());
+    let session = Arc::new(Mutex::new(session()));
     let base = Url::parse(&server.uri()).unwrap();
-    let api = Innertube::new(Arc::new(Mutex::new(session())), store, base);
-    Rig { server, api }
+    let api = Innertube::new(session.clone(), store.clone(), base);
+    Rig {
+        server,
+        store,
+        session,
+        api,
+    }
 }
 
 fn endpoint(name: &str, body: ResponseTemplate) -> Mock {
@@ -614,4 +622,52 @@ async fn usable_concurrently() {
     n.unwrap();
     // The lyrics browse gets the home fixture here: no lyrics shelf, so none.
     assert_eq!(lyrics.await.unwrap(), Ok(None));
+}
+
+/// The rotated `ROTATE` cookie reached the live session, and the store saved it.
+async fn rotation_kept(rig: &Rig, value: &str) {
+    let live = rig.session.lock().unwrap().clone();
+    assert!(
+        live.cookies
+            .iter()
+            .any(|c| c.name == "ROTATE" && c.value == value),
+        "the live session lacks the rotation"
+    );
+    for _ in 0..500 {
+        if let Ok(saved) = rig.store.load().await
+            && saved
+                .cookies
+                .iter()
+                .any(|c| c.name == "ROTATE" && c.value == value)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the rotation was never saved");
+}
+
+#[tokio::test]
+async fn set_cookie_from_browse_and_like_is_kept() {
+    // Browsing and liking share the session handling of `next` and `player`: Google rotates
+    // cookies on any answer, and a rotation lost here would sign the user out later.
+    let rig = rig().await;
+    endpoint(
+        "browse",
+        json_answer(HOME).append_header("set-cookie", "ROTATE=browse; Path=/"),
+    )
+    .mount(&rig.server)
+    .await;
+    rig.api.browse("FEmusic_home", None).await.unwrap();
+    rotation_kept(&rig, "browse").await;
+
+    let rig = self::rig().await;
+    endpoint(
+        "like/like",
+        json_answer("{}").append_header("set-cookie", "ROTATE=like; Path=/"),
+    )
+    .mount(&rig.server)
+    .await;
+    rig.api.like("fakeV000001", LikeStatus::Like).await.unwrap();
+    rotation_kept(&rig, "like").await;
 }

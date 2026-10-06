@@ -236,7 +236,8 @@ const PARAMS_RULE: &str =
     "params must be up to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
 const TOKEN_RULE: &str = "token must be 1 to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
 const LIKE_STATUS_RULE: &str = "status must be \"like\", \"dislike\" or \"none\"";
-const QUERY_RULE: &str = "query must be text of 1 to 200 characters with no control characters";
+const QUERY_RULE: &str =
+    "query must be text of 1 to 200 characters with no control or invisible characters";
 const ENDPOINT_RULE: &str = "endpoint must be a row's play: {\"watchEndpoint\": {videoId, playlistId, index, params}} or {\"watchPlaylistEndpoint\": {playlistId, params}}";
 /// An endpoint's ids follow the browse rule (`browse::id_ok`, as rows are cleaned with), not
 /// the plain `play`'s 1 to 256: an endpoint only ever comes from a row.

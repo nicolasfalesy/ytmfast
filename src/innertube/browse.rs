@@ -70,8 +70,8 @@ impl Innertube {
     /// A search. With a filter chip's `params` (Songs, Albums, ...) it is a filtered search,
     /// which pages and keeps more rows a section (see `browse::parse_search`).
     ///
-    /// The query is trimmed, and must then be 1 to `MAX_QUERY` characters with no control
-    /// characters. Errors as for `browse`.
+    /// The query is trimmed, and must then be 1 to `MAX_QUERY` characters with no control or
+    /// invisible characters (`check_query`). Errors as for `browse`.
     pub async fn search(&self, query: &str, params: Option<&str>) -> Result<SearchPage, Error> {
         let query = check_query(query)?;
         let params = check_params(params)?;
@@ -239,8 +239,9 @@ pub fn check_params(params: Option<&str>) -> Result<Option<&str>, Error> {
 }
 
 /// The search text as sent: trimmed, 1 to `MAX_QUERY` characters (not bytes: a search in
-/// another script is as long as it looks), no control characters (a newline or an escape
-/// sequence is never something the user typed into a search box).
+/// another script is as long as it looks), no control characters and no `invisible`
+/// characters (a newline, an escape sequence or a bidi override is never something the user
+/// typed into a search box).
 pub fn check_query(query: &str) -> Result<&str, Error> {
     let q = query.trim();
     if q.is_empty() {
@@ -256,7 +257,36 @@ pub fn check_query(query: &str) -> Result<&str, Error> {
             "the search holds a control character".into(),
         ));
     }
+    if q.chars().any(invisible) {
+        return Err(Error::BadRequest(
+            "the search holds an invisible character".into(),
+        ));
+    }
     Ok(q)
+}
+
+/// The line and paragraph separators (Unicode Zl, Zp), the bidi controls, and the
+/// zero-width or invisible format characters (Cf) nobody types: pasted in, they make a query
+/// look like something else (a bidi override reverses the text) or miss what it looks like.
+/// Not every Cf: ZWNJ and ZWJ (U+200C, U+200D) are part of how Persian, Indic scripts and
+/// emoji sequences are written, the tag characters (U+E0020 to U+E007F) spell subdivision
+/// flags, and the Arabic number signs (U+0600 to U+0605 and kin) are visible marks.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}' // Zl, Zp
+            | '\u{061C}' | '\u{200E}' | '\u{200F}' // bidi marks
+            | '\u{202A}'..='\u{202E}' // bidi embeddings and overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{00AD}' // soft hyphen
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}' // zero-width space
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{206A}'..='\u{206F}' // deprecated shaping controls
+            | '\u{FEFF}' // zero-width no-break space (byte order mark)
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{E0001}' // language tag
+    )
 }
 
 fn check_video_id(id: &str) -> Result<(), Error> {
@@ -289,6 +319,47 @@ mod tests {
             );
         }
         assert!(check_query(&"x".repeat(MAX_QUERY + 1)).is_err());
+    }
+
+    #[test]
+    fn query_refuses_separators_and_invisible_format_characters() {
+        // Line and paragraph separators (Zl, Zp), bidi controls (which can make the text read
+        // in another order than it was sent) and invisible zero-width characters are never
+        // typed into a search box.
+        for bad in [
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202E}b",
+            "a\u{202A}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{200E}b",
+            "a\u{200F}b",
+            "a\u{061C}b",
+            "a\u{200B}b",
+            "a\u{2060}b",
+            "a\u{FEFF}b",
+            "a\u{00AD}b",
+            "a\u{180E}b",
+            "a\u{206A}b",
+            "a\u{FFF9}b",
+            "a\u{E0001}b",
+        ] {
+            assert_eq!(
+                check_query(bad).unwrap_err().code(),
+                "bad_request",
+                "{bad:?}"
+            );
+        }
+        // Joiners stay: Persian and Indic text (ZWNJ, ZWJ) and emoji sequences need them, as
+        // do the tag characters of subdivision flags.
+        for good in [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0645}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+        ] {
+            assert_eq!(check_query(good), Ok(good), "{good:?}");
+        }
     }
 
     #[test]
