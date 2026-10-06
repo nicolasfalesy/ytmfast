@@ -88,8 +88,9 @@ impl Innertube {
     /// The `player` answer for `video_id`. `sts` is the signature timestamp of the current
     /// player script; YouTube only hands out ciphers that script can solve.
     ///
-    /// Errors: `SignedOut` for no session or LOGIN_REQUIRED, `Unavailable(reason)` when
-    /// YouTube won't play it, `Network` for transport trouble or an answer over 32 MiB.
+    /// Errors: `SignedOut` for no session or LOGIN_REQUIRED (not the bot check),
+    /// `StreamFailed(reason)` when the TV client won't play it or answers for another video
+    /// (yt-dlp may still get it), `Network` for transport trouble or an answer over 32 MiB.
     pub async fn player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error> {
         let client = &clients::TV;
         let body = request_body(client, video_id, sts);
@@ -382,17 +383,27 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
         .playability_status
         .ok_or_else(|| Error::Internal("the player answer has no playability status".into()))?;
     let status = playability.status.as_deref().unwrap_or("");
+    // Only a plain sign-in refusal means the session is bad. Every other refusal is
+    // `StreamFailed`, so the resolver asks yt-dlp (ruling S4, revising step 1's R26): this is
+    // the TV client's answer alone, and yt-dlp asks other clients, which may play what the TV
+    // client won't. The bot check comes as LOGIN_REQUIRED too, but it is about this client and
+    // address, not the session, and calling it `signed_out` would send the user to re-import a
+    // session that is fine.
     match status {
         "OK" => {}
-        "LOGIN_REQUIRED" => return Err(Error::SignedOut),
-        _ => return Err(Error::Unavailable(reason(playability.reason, status))),
+        "LOGIN_REQUIRED" if !is_bot_check(playability.reason.as_deref()) => {
+            return Err(Error::SignedOut);
+        }
+        _ => return Err(Error::StreamFailed(reason(playability.reason, status))),
     }
 
     let details = raw.video_details;
     let answered_for = details.as_ref().and_then(|d| d.video_id.as_deref());
-    // YouTube sometimes answers with another video's data; yt-dlp skips such answers too.
+    // YouTube sometimes answers with another video's data; yt-dlp skips such answers too. A
+    // rare transient, so `StreamFailed`: yt-dlp's own request will most likely be answered
+    // right.
     if answered_for.is_some_and(|id| id != video_id) {
-        return Err(Error::Unavailable(
+        return Err(Error::StreamFailed(
             "YouTube answered for a different video".into(),
         ));
     }
@@ -455,6 +466,12 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
         formats,
         tracking,
     })
+}
+
+/// Whether a LOGIN_REQUIRED reason is the "Sign in to confirm you're not a bot" check. Matched
+/// on "not a bot" in any case, so either apostrophe YouTube uses (and any text after) fits.
+fn is_bot_check(reason: Option<&str>) -> bool {
+    reason.is_some_and(|r| r.to_lowercase().contains("not a bot"))
 }
 
 /// YouTube's reason text for a refusal, else the status itself. It is shown to the user, so
@@ -529,18 +546,40 @@ mod tests {
     }
 
     #[test]
-    fn other_statuses_are_unavailable() {
+    fn other_statuses_are_tv_refusals() {
+        // The TV client is the one client asked: its refusal may not be another client's, so
+        // these are stream_failed and yt-dlp gets a try.
         for status in ["ERROR", "AGE_CHECK_REQUIRED", "LIVE_STREAM_OFFLINE"] {
             let a = answer(json!({"playabilityStatus": {"status": status}}));
-            assert_eq!(parse(&a, "x"), Err(Error::Unavailable(status.into())));
+            assert_eq!(parse(&a, "x"), Err(Error::StreamFailed(status.into())));
         }
         let a = answer(
             json!({"playabilityStatus": {"status": "ERROR", "reason": "Video unavailable"}}),
         );
         assert_eq!(
             parse(&a, "x"),
-            Err(Error::Unavailable("Video unavailable".into()))
+            Err(Error::StreamFailed("Video unavailable".into()))
         );
+    }
+
+    #[test]
+    fn login_required_is_signed_out_unless_a_bot_check() {
+        let a = answer(json!({"playabilityStatus": {"status": "LOGIN_REQUIRED"}}));
+        assert_eq!(parse(&a, "x"), Err(Error::SignedOut));
+        // Both apostrophes YouTube uses, any case.
+        for reason in [
+            "Sign in to confirm you're not a bot",
+            "Sign in to confirm you\u{2019}re not a bot",
+            "SIGN IN TO CONFIRM YOU'RE NOT A BOT. This helps protect our community.",
+        ] {
+            let a = answer(json!({"playabilityStatus": {
+                "status": "LOGIN_REQUIRED", "reason": reason}}));
+            assert_eq!(
+                parse(&a, "x").unwrap_err().code(),
+                "stream_failed",
+                "{reason}"
+            );
+        }
     }
 
     #[test]
@@ -549,7 +588,10 @@ mod tests {
             "status": "UNPLAYABLE",
             "reason": "see https://rr1---sn-test.googlevideo.com/videoplayback?sig=FAKE"
         }}));
-        assert_eq!(parse(&a, "x"), Err(Error::Unavailable("UNPLAYABLE".into())));
+        assert_eq!(
+            parse(&a, "x"),
+            Err(Error::StreamFailed("UNPLAYABLE".into()))
+        );
         assert_eq!(reason(Some("y".repeat(500)), "ERROR").len(), 200);
         assert_eq!(reason(None, ""), "unknown");
     }

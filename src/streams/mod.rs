@@ -5,9 +5,10 @@
 //! (itag 774 Opus, else 141 AAC, else the highest-bitrate other audio), solve the link's
 //! challenges (the `n` parameter, and the signature of a `signatureCipher`) in one solver
 //! call, and assemble the link. If a step fails for a reason yt-dlp might get past (the solver,
-//! the link, the network), yt-dlp is asked instead (`ytdlp`); if that fails too, the own-code
-//! error is reported. A rejected session (`signed_out`) or a song YouTube won't play
-//! (`unavailable`) is reported at once, without yt-dlp: see `falls_back`.
+//! the link, the network, or the TV client refusing the song), yt-dlp is asked instead
+//! (`ytdlp`); if that fails too, the own-code error is reported. A rejected session
+//! (`signed_out`) or a bad video id (`unavailable`) is reported at once, without yt-dlp: see
+//! `falls_back`.
 //!
 //! Links are cached per video until 30 minutes before their `expire` time.
 
@@ -221,8 +222,10 @@ impl Streams {
         let (player_id, sts, mut code) = self.current_player(fresh).await?;
         let answer = self.api.player(video_id, sts).await?;
         trace::mark("player request answered");
+        // `StreamFailed`, not `Unavailable`: the TV answer can lack formats that yt-dlp's
+        // clients get (ruling S4).
         let format = pick_format(&answer.formats)
-            .ok_or_else(|| Error::Unavailable("no audio format".into()))?;
+            .ok_or_else(|| Error::StreamFailed("no audio format".into()))?;
         let link = Link::of(format)?;
 
         // Both kinds in one solver call: one `jsc` run, one pass over the player.
@@ -507,9 +510,11 @@ impl ReportApi for Streams {
 
 /// Whether an own-code failure is worth asking yt-dlp about. Not `SignedOut`: yt-dlp would
 /// usually get an anonymous link anyway (lower quality, about 4 s later), and the user would
-/// never learn the session needs importing again. Not `Unavailable`: YouTube said the song
-/// can't be played, which yt-dlp can't change. Everything else (the solver, an odd link, the
-/// network, our own faults) may be ours alone, so yt-dlp gets a try.
+/// never learn the session needs importing again. Not `Unavailable`: on this path that is
+/// only a bad video id, which yt-dlp can't change. Everything else may be ours or the TV
+/// client's alone (the solver, an odd link, the network, our own faults, and since ruling S4
+/// a TV refusal, the bot check, an answer with no audio or for another video), so yt-dlp
+/// gets a try.
 fn falls_back(e: &Error) -> bool {
     !matches!(e, Error::SignedOut | Error::Unavailable(_))
 }

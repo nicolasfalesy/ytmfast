@@ -215,9 +215,11 @@ async fn debug_output_hides_signed_urls() {
 #[tokio::test]
 async fn login_required_is_signed_out() {
     let rig = rig().await;
-    player_mock(json_answer(LOGIN_REQUIRED))
-        .mount(&rig.server)
-        .await;
+    player_mock(json_answer(
+        r#"{"playabilityStatus": {"status": "LOGIN_REQUIRED", "reason": "Please sign in"}}"#,
+    ))
+    .mount(&rig.server)
+    .await;
     assert_eq!(
         rig.api.player("FAKEVID0001", STS).await,
         Err(Error::SignedOut)
@@ -225,14 +227,27 @@ async fn login_required_is_signed_out() {
 }
 
 #[tokio::test]
-async fn unplayable_is_unavailable() {
+async fn bot_check_is_not_signed_out() {
+    // The fixture's LOGIN_REQUIRED says "Sign in to confirm you're not a bot": a check on the
+    // client, not a rejected session, so it is stream_failed (yt-dlp gets a try).
+    let rig = rig().await;
+    player_mock(json_answer(LOGIN_REQUIRED))
+        .mount(&rig.server)
+        .await;
+    let err = rig.api.player("FAKEVID0001", STS).await.unwrap_err();
+    assert_eq!(err.code(), "stream_failed", "{err}");
+}
+
+#[tokio::test]
+async fn unplayable_is_a_tv_refusal() {
+    // The TV client's refusal: stream_failed with YouTube's reason, so yt-dlp gets a try.
     let rig = rig().await;
     player_mock(json_answer(UNPLAYABLE))
         .mount(&rig.server)
         .await;
     assert_eq!(
         rig.api.player("FAKEVID0002", STS).await,
-        Err(Error::Unavailable(
+        Err(Error::StreamFailed(
             "This video is not available in your country".into()
         ))
     );
@@ -240,11 +255,12 @@ async fn unplayable_is_unavailable() {
 
 #[tokio::test]
 async fn answer_for_another_video_is_refused() {
-    // yt-dlp checks this too: YouTube sometimes answers with a different video.
+    // yt-dlp checks this too: YouTube sometimes answers with a different video. A transient,
+    // so stream_failed (yt-dlp asks again).
     let rig = rig().await;
     player_mock(json_answer(PREMIUM)).mount(&rig.server).await;
     let err = rig.api.player("OTHERVID001", STS).await.unwrap_err();
-    assert_eq!(err.code(), "unavailable");
+    assert_eq!(err.code(), "stream_failed");
 }
 
 #[tokio::test]

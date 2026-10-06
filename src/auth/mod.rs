@@ -407,8 +407,9 @@ const KEYRING_ATTRIBUTES: [(&str, &str); 1] = [("application", "ytmfast")];
 ///
 /// It talks to the Secret Service over D-Bus only (`oo7::dbus`), never `oo7::Keyring`: that
 /// one silently switches to a file-backed keyring inside a sandbox, and the session must
-/// never be a file. A fresh D-Bus connection is opened per call; loads happen once at start
-/// and saves only when Google rotates a cookie, so a kept-open connection would buy nothing.
+/// never be a file. A fresh D-Bus connection is opened per call: the engine loads when a song
+/// is first asked for (and again only until a session is found, `streams::lazy`) and saves
+/// only when Google rotates a cookie, so a kept-open connection would buy nothing.
 pub struct KeyringStore;
 
 impl KeyringStore {
