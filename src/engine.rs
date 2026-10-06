@@ -584,7 +584,11 @@ impl Engine {
         // the player still knows the position. Bounded, so a hung disk can't hold up a stop.
         // The song playing now gets its last report (best-effort: the runtime may stop
         // before it is sent).
-        let at = self.snapshot().position;
+        let at = if self.loaded && self.started {
+            self.played_to()
+        } else {
+            self.snapshot().position
+        };
         self.end_report(at);
         if let Some(writer) = self.writer.take() {
             let last = self.saved();
@@ -1089,10 +1093,12 @@ impl Engine {
 
     /// Stops what plays (keeping its position in the status) and drops its resolve.
     fn halt(&mut self) {
+        let mut ended_at = self.status.position;
         if self.loaded && self.started {
             self.status.position = self.player.position();
+            ended_at = self.played_to();
         }
-        self.end_report(self.status.position);
+        self.end_report(ended_at);
         self.generation += 1;
         if let Some(task) = self.resolving.take() {
             task.abort();
@@ -1227,6 +1233,12 @@ impl Engine {
         self.status.album = item.song.album.clone();
         // The queue item's details show at once; the link's only fill its gaps.
         self.status.meta = song_meta(&item.song, None);
+        // The old song's report ends now, while the preload still tells whether the audio
+        // thread already moved on to it (`played_to`); `begin` would see it taken.
+        if self.loaded && self.started {
+            let at = self.played_to();
+            self.end_report(at);
+        }
         // Skipped (or jumped) to the preloaded item: its link and download are here already.
         let ready = match self.preload.take() {
             Some(Preload {
@@ -1248,7 +1260,7 @@ impl Engine {
     fn begin(&mut self, video_id: &str, start: f64) {
         // The old song's report ends where it stopped playing.
         let was_at = if self.loaded && self.started {
-            self.player.position()
+            self.played_to()
         } else {
             self.status.position
         };
@@ -1674,13 +1686,7 @@ impl Engine {
     fn on_advanced(&mut self, ticket: u64) {
         // The old song played to its end, whichever item comes next: its report ends there
         // (the player's position is already the new track's, so its length stands in).
-        let old_end = self
-            .status
-            .meta
-            .as_ref()
-            .map(|m| f64::from(m.length_seconds))
-            .filter(|l| *l > 0.0)
-            .unwrap_or(self.status.position);
+        let old_end = self.song_end();
         self.end_report(old_end);
         let next = self.queue.peek_next(true).map(|i| i.id);
         let source = match self.preload.take() {
@@ -1733,6 +1739,32 @@ impl Engine {
         self.maybe_refill();
         // A short song: the one after it is due at once.
         self.maybe_preload(at);
+    }
+
+    /// The current song's end: its length, else the last position seen.
+    fn song_end(&self) -> f64 {
+        self.status
+            .meta
+            .as_ref()
+            .map(|m| f64::from(m.length_seconds))
+            .filter(|l| *l > 0.0)
+            .unwrap_or(self.status.position)
+    }
+
+    /// Where the current song has got to, for its report. Between the audio thread moving on
+    /// to the preload and the engine taking its `Advanced`, the player's position is already
+    /// the next song's: the current one then played to its end. The position is read before
+    /// the id (`AudioPlayer::advanced_to`), so a position that is the next song's always comes
+    /// with that id.
+    fn played_to(&self) -> f64 {
+        let at = self.player.position();
+        match &self.preload {
+            Some(Preload {
+                state: PreloadState::Ready { ticket, .. },
+                ..
+            }) if self.player.advanced_to() == *ticket => self.song_end(),
+            _ => at,
+        }
     }
 
     /// Starts the report of the song now heard, at `at`.
@@ -3744,6 +3776,60 @@ mod tests {
             start_seconds: 0.0,
         });
         assert!(engine.preload.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_next_in_the_handover_window_ends_the_old_report_at_its_end() {
+        // The audio thread has moved on to the preload (B), but the engine hasn't taken the
+        // `Advanced` yet when a Next comes: the player's position is already B's. A's report
+        // must end where A really stopped (its end), not at B's few tenths of a second.
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        // In real time, so B's position grows at a known pace.
+        let built = engine_for(&server, fake.clone(), Arc::default(), false, false);
+        let mut engine = built.engine;
+        let reports = Arc::new(FakeReports::default());
+        engine.report_with(Reporter::new(reports.clone()));
+        let audio = engine.player.events();
+        engine
+            .queue
+            .replace(vec![song('A'), song('B'), song('C')], 0);
+        engine.start_current(0.0);
+        engine.on_resolved(Resolved {
+            generation: engine.generation,
+            result: Ok(fake.stream(&vid('A'))),
+        });
+        engine.on_audio(AudioEvent::Loading);
+        engine.on_audio(AudioEvent::Started);
+        // A 2 s song: under 10 s left, so B is preloaded at once.
+        engine.maybe_preload(0.0);
+        take_preloads(&mut engine).await;
+        let ticket = engine.preload.as_ref().and_then(Preload::ticket).unwrap();
+        // Wait (off the engine) for the audio thread's handover to B.
+        let waited = tokio::task::spawn_blocking(move || {
+            loop {
+                match audio.recv_timeout(Duration::from_secs(5)) {
+                    Ok(AudioEvent::Advanced(t)) if t == ticket => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(waited, "the audio thread moved on to B");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(engine.player.position() < 1.5, "the position is B's now");
+        engine.handle(EngineCmd::Next);
+        eventually("A's last ping", || reports.finals() == 1).await;
+        let ranges = reports.watch_ranges();
+        let end = ranges.iter().map(|r| r.1).fold(0.0, f64::max);
+        assert!(end > 1.9, "A's report ended at {end}: {ranges:?}");
     }
 
     #[tokio::test]

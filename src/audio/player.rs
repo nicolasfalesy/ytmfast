@@ -150,6 +150,8 @@ pub struct AudioPlayer {
     readers: Arc<Mutex<Readers>>,
     /// The last handover's gap in µs (`NO_GAP` before the first).
     gap_us: Arc<AtomicU64>,
+    /// The id of the last preload the audio thread moved on to (0 before the first).
+    advanced: Arc<AtomicU64>,
     /// Ids handed out by `preload`.
     preloads: AtomicU64,
     thread: Option<JoinHandle<()>>,
@@ -178,6 +180,7 @@ impl AudioPlayer {
         let position = Arc::new(AtomicU64::new(0f64.to_bits()));
         let readers = Arc::new(Mutex::new(Readers::default()));
         let gap_us = Arc::new(AtomicU64::new(NO_GAP));
+        let advanced = Arc::new(AtomicU64::new(0));
         let worker = Worker {
             sink,
             inbox,
@@ -185,6 +188,7 @@ impl AudioPlayer {
             position: position.clone(),
             readers: readers.clone(),
             gap_us: gap_us.clone(),
+            advanced: advanced.clone(),
             track: None,
             next: None,
             outgoing: None,
@@ -200,6 +204,7 @@ impl AudioPlayer {
             position,
             readers,
             gap_us,
+            advanced,
             preloads: AtomicU64::new(0),
             thread: Some(thread),
         }
@@ -309,6 +314,14 @@ impl AudioPlayer {
         f64::from_bits(self.position.load(Ordering::Acquire))
     }
 
+    /// The id of the last preload the audio thread moved on to (0 before the first): set
+    /// before the new track's position is, so a `position()` that is already the preload's
+    /// is always read with its id here (read the position first). It tells the engine, in
+    /// the moment before it takes `Advanced`, that the position it reads is the next song's.
+    pub fn advanced_to(&self) -> u64 {
+        self.advanced.load(Ordering::Acquire)
+    }
+
     /// The silence the last handover put between two tracks. Same rate: how much longer
     /// than the audio still queued at the old track's end the switch took (0 when the output
     /// never ran dry). A new rate: from the old track's last frame heard to the new one's
@@ -413,6 +426,7 @@ struct Worker {
     position: Arc<AtomicU64>,
     readers: Arc<Mutex<Readers>>,
     gap_us: Arc<AtomicU64>,
+    advanced: Arc<AtomicU64>,
     track: Option<Track>,
     next: Option<Next>,
     outgoing: Option<Outgoing>,
@@ -940,6 +954,8 @@ impl Worker {
         let Some(o) = self.outgoing.take() else {
             return;
         };
+        // Before the position: whoever reads the new track's position sees this id too.
+        self.advanced.store(o.id, Ordering::Release);
         self.publish();
         let gap = match o.gap {
             Gap::Reopen { drained } => {
@@ -1387,11 +1403,14 @@ mod tests {
         // ahead, has reached the end, and the handover is made there and then.)
         std::thread::sleep(Duration::from_millis(850));
         assert!(events.try_recv().is_err(), "not heard yet");
+        // Not moved on yet: the position is still the old track's.
+        assert_eq!(p.advanced_to(), 0);
         let before = p.position();
         assert!(before > 1.8, "the old track's clock: {before}");
         let t = std::time::Instant::now();
         p.seek(0.5);
         assert_eq!(next_event(&events), AudioEvent::Advanced(id));
+        assert_eq!(p.advanced_to(), id, "the position is the preload's now");
         let after = t.elapsed().as_secs_f64();
         // 1.5 s more of the old track first, not the 0.1 s that was left before the seek.
         assert!(
