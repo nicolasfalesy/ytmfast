@@ -431,11 +431,14 @@ pub fn id_ok(s: &str) -> bool {
     (2..=128).contains(&s.len()) && s.bytes().all(id_char)
 }
 
-/// A `params` value or a continuation token: base64url, possibly %-escaped padding, at most 4 KiB.
-/// These go back to YouTube as JSON strings; the charset keeps anything else (spaces, quotes, markup,
-/// a smuggled URL) from ever passing through.
+/// A `params` value or a continuation token: base64, either alphabet (YouTube's tokens and params can
+/// hold `+` and `/` as well as `-` and `_`; blanking those would silently stop paging and filters,
+/// ruling P3), with `=` padding or its `%3D` escape, at most 4 KiB. These go back to YouTube as JSON
+/// strings; the charset keeps anything else (spaces, quotes, colons, markup, a smuggled URL) out.
 pub fn token_ok(s: &str) -> bool {
-    (1..=4096).contains(&s.len()) && s.bytes().all(|c| id_char(c) || c == b'%' || c == b'=')
+    (1..=4096).contains(&s.len())
+        && s.bytes()
+            .all(|c| id_char(c) || matches!(c, b'%' | b'=' | b'+' | b'/'))
 }
 
 fn clean(v: Option<&Value>, ok: fn(&str) -> bool) -> String {

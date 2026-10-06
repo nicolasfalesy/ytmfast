@@ -124,7 +124,9 @@ pub(crate) fn collect(root: &Value, limit: usize) -> Vec<Section> {
         loose: None,
         pending_title: String::new(),
     };
-    // Depth needs no guard of its own: serde_json refuses input nested deeper than 128 levels.
+    // Depth needs no guard of its own only as long as answers are parsed with serde_json's default
+    // recursion limit (it refuses input nested deeper than 128 levels). Parsing with
+    // `disable_recursion_limit` would need a depth cap here.
     c.walk(root, None);
     c.sections.retain(|s| !s.items.is_empty());
     c.sections

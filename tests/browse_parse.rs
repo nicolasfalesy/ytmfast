@@ -318,6 +318,17 @@ fn thumbnail_rules() {
     // Search's cropped stills (sqp=) are already bar-free and stay.
     let crop = "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg?sqp=abc&rs=def";
     assert_eq!(first_thumb(json!([{"url": crop, "width": 120}])), crop);
+    // The link sent is the link checked: a backslash (a path separator to the url crate, but not to
+    // the widget's QUrl, which would read the host as evil.example) comes out as a slash, and a
+    // newline (dropped before the host check) is gone from what is sent too.
+    let t = first_thumb(json!([{"url": "https://i.ytimg.com\\@evil.example/a.jpg", "width": 120}]));
+    assert_eq!(t, "https://i.ytimg.com/@evil.example/a.jpg");
+    let t =
+        first_thumb(json!([{"url": "https://lh3.googleusercontent.com/a\n=w120", "width": 120}]));
+    assert_eq!(t, "https://lh3.googleusercontent.com/a=w120");
+    let t =
+        first_thumb(json!([{"url": "//lh3.googleusercontent.com\\@evil.example/a", "width": 120}]));
+    assert_eq!(t, "https://lh3.googleusercontent.com/@evil.example/a");
     // Other hosts, plain http and junk are dropped.
     for bad in [
         "https://example.com/a.jpg",
@@ -538,6 +549,25 @@ fn ids_and_tokens_are_shape_checked() {
         json!({"watchEndpoint": {"videoId": "bcdefghijkl", "playlistId": "PLabc", "index": 3, "params": "wAEB%3D"}})
     );
     assert_eq!(page.sections[0].cont, "");
+
+    // Standard base64 (`+`, `/`) in params and tokens survives (ruling P3); a colon or a quote does not.
+    let answer = single_column(vec![json!({"musicShelfRenderer": {
+        "contents": [two_row("Std", json!({"browseEndpoint": {"browseId": "MPREb_ok", "params": "ab+c/d=="}}))],
+        "continuations": [{"nextContinuationData": {"continuation": "4qmF+sgK/AQ%3D%3D"}}],
+    }})]);
+    let page = parse_browse(&answer);
+    assert_eq!(page.sections[0].items[0].params, "ab+c/d==");
+    assert_eq!(page.sections[0].cont, "4qmF+sgK/AQ%3D%3D");
+    for bad in ["https://evil.example", "a\"b", "a b", ""] {
+        let answer = single_column(vec![json!({"musicShelfRenderer": {
+            "contents": [two_row("Std", json!({"browseEndpoint": {"browseId": "MPREb_ok", "params": bad}}))],
+        }})]);
+        assert_eq!(
+            parse_browse(&answer).sections[0].items[0].params,
+            "",
+            "{bad}"
+        );
+    }
 
     // A "More" link with a bad browse id is no link; a good one with bad params keeps the link.
     let carousel = |browse_id: &str, params: &str| {

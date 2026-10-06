@@ -526,7 +526,8 @@ fn audio_format(f: RawFormat) -> Option<AudioFormat> {
     })
 }
 
-/// The widest thumbnail with an allowed URL. Some answers give protocol-relative links
+/// The widest thumbnail with an allowed URL, in its parsed form (`net::allowed_link`: the link
+/// sent to the widgets is the one checked). Some answers give protocol-relative links
 /// (`//i.ytimg.com/…`); those are made https.
 pub(super) fn widest_thumbnail(t: RawThumbnails) -> Option<String> {
     t.thumbnails
@@ -537,7 +538,7 @@ pub(super) fn widest_thumbnail(t: RawThumbnails) -> Option<String> {
                 Some(rest) => format!("https://{rest}"),
                 None => url,
             };
-            url_allowed(&url).then_some((t.width.unwrap_or(0), url))
+            Some((t.width.unwrap_or(0), net::allowed_link(&url)?))
         })
         // `max_by_key` keeps the last of equal widths; the order of equals doesn't matter.
         .max_by_key(|(width, _)| *width)
@@ -737,6 +738,24 @@ mod tests {
         assert_eq!(
             parse(&a, "x").unwrap().thumbnail.as_deref(),
             Some("https://i.ytimg.com/vi/x/hq.jpg")
+        );
+    }
+
+    #[test]
+    fn thumbnail_is_sent_in_its_checked_form() {
+        // The song's thumbnail (here and in every `next` queue item, which use the same
+        // function) goes to the widgets: it must be the parsed link that passed the check, not
+        // the raw text, which QUrl would read with the host evil.example.
+        let a = answer(json!({
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"videoId": "x", "thumbnail": {"thumbnails": [
+                {"url": "https://i.ytimg.com\\@evil.example/a.jpg", "width": 480},
+                {"url": "https://i.ytimg.com/vi/x/\nmax.jpg", "width": 120}
+            ]}}
+        }));
+        assert_eq!(
+            parse(&a, "x").unwrap().thumbnail.as_deref(),
+            Some("https://i.ytimg.com/@evil.example/a.jpg")
         );
     }
 

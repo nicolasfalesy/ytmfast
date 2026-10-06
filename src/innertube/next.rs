@@ -489,6 +489,21 @@ mod tests {
     }
 
     #[test]
+    fn queue_item_thumbnail_is_sent_in_its_checked_form() {
+        let v: RawVideo = serde_json::from_value(json!({
+            "videoId": "abcdefghijk",
+            "thumbnail": {"thumbnails": [
+                {"url": "//lh3.googleusercontent.com\\@evil.example/a\t=w120", "width": 120}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            song(v).unwrap().thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/@evil.example/a=w120")
+        );
+    }
+
+    #[test]
     fn repeated_artist_listed_once() {
         let b: RawByline = serde_json::from_value(json!({"runs": [
             {"text": "Same"}, {"text": " & "}, {"text": "Same - Topic"}, {"text": " • "},

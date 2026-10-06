@@ -2,7 +2,6 @@
 //! `kindOf`.
 
 use serde_json::Value;
-use url::Url;
 
 use super::{
     Endpoint, Kind, Row, SEP, WatchEndpoint, clean_id, clean_token, clean_video_id, get, text,
@@ -68,11 +67,9 @@ pub(crate) fn thumb_of(r: &Value) -> String {
         u.truncate(cut);
         u.push_str("/mqdefault.jpg");
     }
-    // A picture link goes to the widget, which loads it: only https on YouTube's own hosts.
-    match Url::parse(&u) {
-        Ok(parsed) if crate::net::allowed_host(&parsed) => u,
-        _ => String::new(),
-    }
+    // A picture link goes to the widget, which loads it: only https on YouTube's own hosts, and sent
+    // in the parsed form that was checked (see `allowed_link`).
+    crate::net::allowed_link(&u).unwrap_or_default()
 }
 
 /// Where Page.js's `/\/(hq|sd)?default\.jpg.*$/` first matches: the leftmost `/` followed by

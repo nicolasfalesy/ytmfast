@@ -10,7 +10,6 @@
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use url::Url;
 
 use crate::engine::{EngineEvent, PlayState, QueueView, Status};
 use crate::innertube::SongItem;
@@ -364,10 +363,12 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
     };
     let thumbnail = match field(song, "thumbnail") {
         None => None,
+        // Kept in its parsed form, the link that was checked (see `net::allowed_link`); the cap is
+        // checked on both, as parsing can lengthen a link (percent-escapes).
         Some(Value::String(s)) => Some(s)
             .filter(|s| s.len() <= MAX_TEXT)
-            .filter(|s| Url::parse(s).is_ok_and(|u| crate::net::allowed_host(&u)))
-            .cloned(),
+            .and_then(|s| crate::net::allowed_link(s))
+            .filter(|s| s.len() <= MAX_TEXT),
         Some(_) => return Err("thumbnail must be a link"),
     };
     let length_seconds = match field(song, "lengthSeconds") {
@@ -788,6 +789,28 @@ mod tests {
             match parse(&line) {
                 Ok((4, Request::QueueAdd { songs, .. })) => {
                     assert_eq!(songs[0].thumbnail, None, "{thumb}")
+                }
+                other => panic!("{thumb}: {other:?}"),
+            }
+        }
+        // A kept thumbnail is stored in its parsed form, the link that was checked: QUrl would
+        // read the backslash one's host as evil.example, and the newline is dropped.
+        for (thumb, want) in [
+            (
+                "https://i.ytimg.com\\@evil.example/x.jpg",
+                "https://i.ytimg.com/@evil.example/x.jpg",
+            ),
+            (
+                "https://i.ytimg.com/vi/\nx.jpg",
+                "https://i.ytimg.com/vi/x.jpg",
+            ),
+        ] {
+            let line = json!({"id": 4, "cmd": "queue.add",
+                "args": {"songs": [{"videoId": "dQw4w9WgXcQ", "thumbnail": thumb}]}})
+            .to_string();
+            match parse(&line) {
+                Ok((4, Request::QueueAdd { songs, .. })) => {
+                    assert_eq!(songs[0].thumbnail.as_deref(), Some(want), "{thumb}")
                 }
                 other => panic!("{thumb}: {other:?}"),
             }

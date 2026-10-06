@@ -329,11 +329,14 @@ fn set_aside(dir: &Path, why: &str) {
 /// Makes a loaded file safe to use: songs checked like fresh ones from YouTube (dropped
 /// otherwise, with the indexes moved to match), tokens checked, numbers clamped.
 fn sanitize(mut s: Saved) -> Saved {
-    // A bad thumbnail costs the song its picture only: the song itself is still fine.
+    // A bad thumbnail costs the song its picture only: the song itself is still fine. A kept one
+    // is replaced by its parsed form, the link that was checked (see `net::allowed_link`).
     for song in &mut s.queue {
-        if song.thumbnail.as_deref().is_some_and(|t| !thumbnail_ok(t)) {
-            song.thumbnail = None;
-        }
+        song.thumbnail = song
+            .thumbnail
+            .take()
+            .and_then(|t| net::allowed_link(&t))
+            .filter(|t| text_ok(t));
     }
     let keep: Vec<bool> = s.queue.iter().map(song_ok).collect();
     // Old index -> new index, for the songs kept.
@@ -736,6 +739,25 @@ mod tests {
         s.queue[0].playlist_id = Some("p".repeat(MAX_TEXT + 1));
         save(dir.path(), &s).unwrap();
         assert!(load(dir.path()).unwrap().queue.is_empty());
+        // A kept thumbnail is loaded in its parsed form, the link that was checked: a backslash
+        // (which QUrl would read as part of the host) becomes a slash, a newline goes.
+        let mut s = saved_of("AB", 0);
+        s.queue[0].thumbnail = Some("https://i.ytimg.com\\@evil.example/a.jpg".into());
+        s.queue[1].thumbnail = Some("https://i.ytimg.com/vi/\nb.jpg".into());
+        save(dir.path(), &s).unwrap();
+        let thumbs: Vec<Option<String>> = load(dir.path())
+            .unwrap()
+            .queue
+            .into_iter()
+            .map(|i| i.thumbnail)
+            .collect();
+        assert_eq!(
+            thumbs,
+            [
+                Some("https://i.ytimg.com/@evil.example/a.jpg".to_string()),
+                Some("https://i.ytimg.com/vi/b.jpg".to_string())
+            ]
+        );
         // A song with no thumbnail at all is fine.
         let mut s = saved_of("A", 0);
         s.queue[0].thumbnail = None;
