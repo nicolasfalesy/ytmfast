@@ -3393,6 +3393,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_private_or_age_checked_song_is_skipped_not_signed_out() {
+        // What the TV client's LOGIN_REQUIRED for a private video or an age check becomes
+        // (`innertube::player`): that song's failure, so the queue goes on.
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![
+                (
+                    "AAAAAAAAAAA",
+                    Error::StreamFailed("This is a private video.".into()),
+                ),
+                (
+                    "BBBBBBBBBBB",
+                    Error::StreamFailed("Sign in to confirm your age".into()),
+                ),
+            ],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let seen = r.until_song(&vid('C'), PlayState::Playing).await;
+        assert_eq!(errors(&seen), ["stream_failed", "stream_failed"]);
+        assert_eq!(r.started(), [vid('C')]);
+    }
+
+    #[tokio::test]
     async fn all_unplayable_stops_after_one_pass() {
         // Review Focus 3: with repeat on, a queue of nothing but unplayable songs must not
         // skip round for ever.

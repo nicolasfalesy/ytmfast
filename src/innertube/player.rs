@@ -88,7 +88,8 @@ impl Innertube {
     /// The `player` answer for `video_id`. `sts` is the signature timestamp of the current
     /// player script; YouTube only hands out ciphers that script can solve.
     ///
-    /// Errors: `SignedOut` for no session or LOGIN_REQUIRED (not the bot check),
+    /// Errors: `SignedOut` for no session or a plain LOGIN_REQUIRED (not the bot check, a
+    /// private video or an age check, which are `StreamFailed`),
     /// `StreamFailed(reason)` when the TV client won't play it or answers for another video
     /// (yt-dlp may still get it), `Network` for transport trouble or an answer over 32 MiB.
     pub async fn player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error> {
@@ -386,12 +387,12 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     // Only a plain sign-in refusal means the session is bad. Every other refusal is
     // `StreamFailed`, so the resolver asks yt-dlp (ruling S4, revising step 1's R26): this is
     // the TV client's answer alone, and yt-dlp asks other clients, which may play what the TV
-    // client won't. The bot check comes as LOGIN_REQUIRED too, but it is about this client and
-    // address, not the session, and calling it `signed_out` would send the user to re-import a
-    // session that is fine.
+    // client won't. The bot check, a private video and an age check come as LOGIN_REQUIRED
+    // too, but they are about this client or this song, not the session: calling them
+    // `signed_out` would stop the queue and send the user to re-import a session that is fine.
     match status {
         "OK" => {}
-        "LOGIN_REQUIRED" if !is_bot_check(playability.reason.as_deref()) => {
+        "LOGIN_REQUIRED" if !not_about_the_session(playability.reason.as_deref()) => {
             return Err(Error::SignedOut);
         }
         _ => return Err(Error::StreamFailed(reason(playability.reason, status))),
@@ -468,10 +469,24 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     })
 }
 
-/// Whether a LOGIN_REQUIRED reason is the "Sign in to confirm you're not a bot" check. Matched
-/// on "not a bot" in any case, so either apostrophe YouTube uses (and any text after) fits.
-fn is_bot_check(reason: Option<&str>) -> bool {
-    reason.is_some_and(|r| r.to_lowercase().contains("not a bot"))
+/// Whether a LOGIN_REQUIRED reason is about something other than the session: the "Sign in to
+/// confirm you're not a bot" check, a private video ("This is a private video…"), or an age
+/// check ("Sign in to confirm your age", "age-restricted", "inappropriate for some users").
+/// Matched on fragments in any case, so either apostrophe YouTube uses (and any text around
+/// them) fits. A bare LOGIN_REQUIRED, or a plain "sign in" reason, is the session.
+fn not_about_the_session(reason: Option<&str>) -> bool {
+    const FRAGMENTS: [&str; 6] = [
+        "not a bot",
+        "private video",
+        "confirm your age",
+        "age-restricted",
+        "age restricted",
+        "inappropriate for some users",
+    ];
+    reason.is_some_and(|r| {
+        let r = r.to_lowercase();
+        FRAGMENTS.iter().any(|f| r.contains(f))
+    })
 }
 
 /// YouTube's reason text for a refusal, else the status itself. It is shown to the user, so
@@ -579,6 +594,35 @@ mod tests {
                 "stream_failed",
                 "{reason}"
             );
+        }
+    }
+
+    #[test]
+    fn login_required_for_a_private_or_age_checked_song_is_that_songs_failure() {
+        // These refusals are about the song, not the session: the song is skipped, and the
+        // user is not sent to import a session that works.
+        for reason in [
+            "This is a private video. Please sign in to verify that you may see it.",
+            "PRIVATE VIDEO",
+            "Sign in to confirm your age",
+            "Sign in to confirm your age. This video may be inappropriate for some users.",
+            "This video may be inappropriate for some users.",
+            "Age-restricted video (based on Community Guidelines)",
+            "This video is age restricted",
+        ] {
+            let a = answer(json!({"playabilityStatus": {
+                "status": "LOGIN_REQUIRED", "reason": reason}}));
+            assert_eq!(
+                parse(&a, "x").unwrap_err().code(),
+                "stream_failed",
+                "{reason}"
+            );
+        }
+        // A plain sign-in refusal (or none at all) is still the session.
+        for reason in ["", "Sign in to continue", "Please sign in"] {
+            let a = answer(json!({"playabilityStatus": {
+                "status": "LOGIN_REQUIRED", "reason": reason}}));
+            assert_eq!(parse(&a, "x"), Err(Error::SignedOut), "{reason:?}");
         }
     }
 
