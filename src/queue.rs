@@ -353,12 +353,12 @@ impl Queue {
         true
     }
 
-    /// Adds songs as new items, in the given order. `Next` puts them right after the current
-    /// item, in the play order and (while shuffled) in the original order too, so they still
-    /// come next after shuffle is turned off. `End` appends them; while shuffled, only to the
-    /// original order, and the play order gets them shuffled into the songs still to come. False, with nothing added, when they would take
-    /// the queue past `MAX_ITEMS`: the user asked for these songs, so none are dropped
-    /// quietly, and played songs are not dropped to make room either.
+    /// Adds songs as new items, in the given order. `Next` puts them right after the current item,
+    /// in the play order and (while shuffled) in the original order too, so they still come next
+    /// after shuffle is turned off. `End` appends them; while shuffled, only to the original order,
+    /// and the play order gets them shuffled into the songs still to come. False, with nothing
+    /// added, when they would take the queue past `MAX_ITEMS`: the user asked for these songs, so
+    /// none are dropped quietly, and played songs are not dropped to make room either.
     pub fn add(&mut self, songs: Vec<SongItem>, at: AddAt) -> bool {
         if self.items.len() + songs.len() > MAX_ITEMS {
             return false;

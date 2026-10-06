@@ -242,12 +242,13 @@ impl AudioPlayer {
         });
     }
 
-    /// Queues `reader` to play right after the current track, with no gap: `Advanced` with
-    /// the returned id says when it did. It replaces an earlier preload. The audio thread
-    /// opens it once both its download and the current track's are finished (so opening it
-    /// never waits on the network, and only one download runs at a time), or at the latest
-    /// when the current track runs out. A preload that can't be opened is dropped (logged by
-    /// code), and the current track then ends with `Ended`.
+    /// Queues `reader` to play right after the current track, with no gap: `Advanced` with the
+    /// returned id says when it did. It replaces an earlier preload. Its download is already
+    /// running (the engine starts it 10 s before the current song's end, or at once for a shorter
+    /// song), so it can overlap the current track's if that one is still downloading. The audio
+    /// thread opens it once both downloads are finished (so opening it never waits on the network),
+    /// or at the latest when the current track runs out. A preload that can't be opened is dropped
+    /// (logged by code), and the current track then ends with `Ended`.
     pub fn preload(
         &self,
         reader: TrackReader,
@@ -651,9 +652,10 @@ impl Worker {
     }
 
     /// Opens the preload once both downloads are finished: its headers are then in memory, so
-    /// opening never blocks a write (and the current song's connection is closed, so the radio
-    /// carries one download at a time). If that hasn't happened by the current track's end,
-    /// `ready_next` opens it there.
+    /// opening never blocks a write. (Waiting for the current song's download too keeps the
+    /// open off a busy connection; it doesn't stop the preload's download, which the engine
+    /// started 10 s before the end, from running alongside it.) If that hasn't happened by
+    /// the current track's end, `ready_next` opens it there.
     fn open_next_when_ready(&mut self) {
         let waiting = self
             .next
