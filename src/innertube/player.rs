@@ -430,8 +430,11 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     };
     let present = |s: Option<String>| s.filter(|s| !s.is_empty());
     let title = present(title).or(present(micro_title)).unwrap_or_default();
+    // Both name the uploading channel, which for most songs is YouTube's auto-made
+    // "<artist> - Topic" one: the artist alone is what the bar shows.
     let author = present(author)
         .or(present(micro_author))
+        .map(|a| super::clean_artist(&a))
         .unwrap_or_default();
     let length_seconds = length_seconds.or(micro_length).unwrap_or_default();
 
@@ -700,6 +703,37 @@ mod tests {
             (p.title.as_str(), p.author.as_str(), p.length_seconds),
             ("Details Song", "Micro Artist", 10)
         );
+    }
+
+    #[test]
+    fn channel_names_lose_the_topic_suffix() {
+        // The TV answer names the uploading channel, and a song's channel is often YouTube's
+        // auto-made "<artist> - Topic" one: the bar must show the artist alone.
+        for (details, micro) in [
+            (
+                json!({"videoId": "x", "title": "Song", "author": "Artist - Topic"}),
+                json!({}),
+            ),
+            (
+                json!({"videoId": "x", "title": "Song"}),
+                json!({"ownerChannelName": "Artist - Topic"}),
+            ),
+        ] {
+            let a = answer(json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": details,
+                "microformat": {"playerMicroformatRenderer": micro}
+            }));
+            assert_eq!(parse(&a, "x").unwrap().author, "Artist");
+        }
+        // Only the exact trailing suffix: "Topic" as part of a name stays.
+        for name in ["Topic", "The Topic", "Artist -Topic", "Topic - Artist"] {
+            let a = answer(json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {"videoId": "x", "title": "Song", "author": name}
+            }));
+            assert_eq!(parse(&a, "x").unwrap().author, name);
+        }
     }
 
     #[test]

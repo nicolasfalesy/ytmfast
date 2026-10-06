@@ -577,7 +577,9 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         Some(Value::Array(list)) if list.len() <= MAX_ARTISTS => list
             .iter()
             .map(|a| match a {
-                Value::String(s) if s.len() <= MAX_TEXT => Ok(s.clone()),
+                // A widget may pass an artist straight from a channel name (a browse row's
+                // byline): cleaned like `next`'s, so the queue never holds " - Topic".
+                Value::String(s) if s.len() <= MAX_TEXT => Ok(crate::innertube::clean_artist(s)),
                 _ => Err(TEXT),
             })
             .collect::<Result<_, _>>()?,
@@ -1315,6 +1317,16 @@ mod tests {
         assert!(parse(&line).is_ok());
         let line = json!({"id": 1, "cmd": "play", "args": {"playlistId": "x".repeat(256)}});
         assert!(parse(&line.to_string()).is_ok());
+    }
+
+    #[test]
+    fn added_songs_lose_the_topic_suffix() {
+        // A widget's song can carry an artist straight from a channel name (a browse row's
+        // byline); the queue, its status and state.json keep the artist alone.
+        let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ",
+            "artists": ["One - Topic", "Topic", "Two"]}))
+        .unwrap();
+        assert_eq!(song.artists, ["One", "Topic", "Two"]);
     }
 
     fn item(id: u64, song: SongItem) -> QueueItem {

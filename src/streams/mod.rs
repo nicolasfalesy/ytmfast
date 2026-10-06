@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::auth::Session;
 use crate::error::Error;
-use crate::innertube::{AudioFormat, Innertube, PlayerResponse, Tracking, clients};
+use crate::innertube::{AudioFormat, Innertube, PlayerResponse, Tracking, clean_artist, clients};
 use crate::net;
 use crate::report::ReportApi;
 use crate::solver::{ChallengeKind, ChallengeSolver, player_js};
@@ -311,7 +311,9 @@ impl Streams {
         let o: OEmbed = serde_json::from_slice(&body).ok()?;
         Some((
             o.title.unwrap_or_default(),
-            o.author_name.unwrap_or_default(),
+            // The channel's name: "<artist> - Topic" for most songs (seen live on the first
+            // second of a list play); the bar shows the artist alone.
+            o.author_name.map(|a| clean_artist(&a)).unwrap_or_default(),
         ))
     }
 
@@ -754,7 +756,13 @@ fn from_ytdlp(json: &[u8], video_id: &str) -> Result<Stream, Error> {
         loudness_db: None,
         meta: TrackMeta {
             title: info.title.unwrap_or_default(),
-            artist: info.artist.or(info.uploader).unwrap_or_default(),
+            // `uploader` is the channel's name ("<artist> - Topic" for an auto-made artist
+            // channel); cleaned like every other channel name.
+            artist: info
+                .artist
+                .or(info.uploader)
+                .map(|a| clean_artist(&a))
+                .unwrap_or_default(),
             length_seconds: info.duration.map_or(0, |d| d.round() as u32),
             thumbnail,
         },
@@ -836,6 +844,33 @@ mod tests {
         );
         assert_eq!(thumb("https://evil.example/a.jpg"), None);
         assert_eq!(thumb("http://i.ytimg.com/a.jpg"), None);
+    }
+
+    #[test]
+    fn ytdlp_channel_names_lose_the_topic_suffix() {
+        // yt-dlp's `uploader` is the channel's name ("<artist> - Topic" for an auto-made
+        // artist channel); it is the artist when yt-dlp gives no `artist`.
+        let artist = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "id": "abcdefghijk",
+                "url": "https://rr2---sn-test.googlevideo.com/videoplayback?expire=1",
+                "format_id": "251",
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let json = serde_json::to_vec(&v).unwrap();
+            from_ytdlp(&json, "abcdefghijk").unwrap().meta.artist
+        };
+        assert_eq!(
+            artist(serde_json::json!({"uploader": "Artist - Topic"})),
+            "Artist"
+        );
+        assert_eq!(
+            artist(serde_json::json!({"artist": "Real - Topic", "uploader": "x"})),
+            "Real"
+        );
+        assert_eq!(artist(serde_json::json!({"uploader": "Topic"})), "Topic");
     }
 
     #[test]

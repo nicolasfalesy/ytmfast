@@ -347,6 +347,14 @@ fn sanitize(mut s: Saved) -> Saved {
         if !song.album_id.is_empty() && !crate::browse::id_ok(&song.album_id) {
             song.album_id.clear();
         }
+        // A file written before every source cleaned channel names (a `queue.add` from a
+        // widget, say) can hold "<artist> - Topic"; cleaned here so a restart never brings
+        // the suffix back.
+        for artist in &mut song.artists {
+            if artist.ends_with(" - Topic") {
+                *artist = crate::innertube::clean_artist(artist);
+            }
+        }
     }
     let keep: Vec<bool> = s.queue.iter().map(song_ok).collect();
     // Old index -> new index, for the songs kept.
@@ -702,6 +710,20 @@ mod tests {
         // A save after that works as usual.
         save(dir.path(), &saved_of("A", 0)).unwrap();
         assert!(load(dir.path()).is_some());
+    }
+
+    #[test]
+    fn loaded_artists_lose_the_topic_suffix() {
+        // A file saved before every source cleaned channel names can hold "<artist> - Topic":
+        // it is cleaned on load, so a restart never brings the suffix back to the bar.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = saved_of("AB", 0);
+        s.queue[0].artists = vec!["One - Topic".into(), "Two".into()];
+        s.queue[1].artists = vec!["Topic".into()];
+        save(dir.path(), &s).unwrap();
+        let got = load(dir.path()).unwrap();
+        assert_eq!(got.queue[0].artists, ["One", "Two"]);
+        assert_eq!(got.queue[1].artists, ["Topic"]);
     }
 
     #[test]
