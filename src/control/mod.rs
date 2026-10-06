@@ -439,14 +439,22 @@ struct Outbox {
 /// `OUT_BYTES` bytes) or the writer is gone, and the client should be dropped.
 fn push(out: &Outbox, line: String) -> bool {
     let n = line.len();
-    let fits = out
-        .bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
-            (b + n <= OUT_BYTES).then_some(b + n)
-        })
-        .is_ok();
-    if !fits {
-        return false;
+    // Reserve the bytes, or refuse. A plain compare-exchange loop rather than `fetch_update`,
+    // which newer Rust deprecates (renamed `try_update`, missing from older ones): this builds
+    // warning-free on both. An empty outbox always takes the line, so one line over the cap
+    // (none should be) can't drop every client; the next line then waits for it.
+    let mut b = out.bytes.load(Ordering::Acquire);
+    loop {
+        if b != 0 && b + n > OUT_BYTES {
+            return false;
+        }
+        match out
+            .bytes
+            .compare_exchange_weak(b, b + n, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(now) => b = now,
+        }
     }
     if out.tx.try_send(line).is_err() {
         out.bytes.fetch_sub(n, Ordering::AcqRel);
@@ -867,6 +875,30 @@ mod tests {
         std::fs::write(&path, "keep me").unwrap();
         assert!(bind_socket(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn an_empty_outbox_takes_one_oversized_line() {
+        // One line over the byte cap (none should be, but a cap must not make a line that
+        // big drop every client) goes out when nothing else waits; the next one waits for it.
+        let (tx, _rx) = mpsc::channel::<String>(OUT_QUEUE);
+        let out = Outbox {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(push(&out, "x".repeat(OUT_BYTES + 1)));
+        assert!(!push(&out, "y".into()));
+        assert_eq!(out.bytes.load(Ordering::Acquire), OUT_BYTES + 1);
+        // Under the cap, lines go in until the next would pass it.
+        let (tx, _rx) = mpsc::channel::<String>(OUT_QUEUE);
+        let out = Outbox {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(push(&out, "a".repeat(OUT_BYTES - 1)));
+        assert!(push(&out, "b".into()));
+        assert!(!push(&out, "c".into()));
+        assert_eq!(out.bytes.load(Ordering::Acquire), OUT_BYTES);
     }
 
     #[tokio::test]
