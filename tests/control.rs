@@ -494,7 +494,7 @@ async fn commands_reach_the_engine_with_volume_as_a_fraction() {
     f.serve.abort();
 }
 
-/// Task 8 carry: a client that fell behind the engine's events gets a fresh `state`
+/// A client that fell behind the engine's events gets a fresh `state`
 /// instead of being dropped.
 #[tokio::test]
 async fn lagged_client_gets_a_fresh_state() {
