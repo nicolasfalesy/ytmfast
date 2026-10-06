@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use url::Url;
 
 use crate::innertube::SongItem;
 use crate::net;
@@ -428,7 +427,9 @@ fn text_ok(t: &str) -> bool {
 /// than any other text. It goes to the bar widgets, which load it. One that fails is cleared
 /// on load (`sanitize`), not a reason to drop its song.
 fn thumbnail_ok(t: &str) -> bool {
-    text_ok(t) && Url::parse(t).is_ok_and(|u| net::allowed_host(&u))
+    // Only a link already in its parsed form counts (`sanitize` puts kept ones in it), so the
+    // text sent can never differ from the link checked.
+    text_ok(t) && net::allowed_link(t).as_deref() == Some(t)
 }
 
 /// A song as `next` would have let it through: a real video id, and its text within the caps
