@@ -165,6 +165,23 @@ impl Innertube {
     }
 }
 
+/// The socket's browsing commands (`browse::Browser`), straight to the methods above.
+#[async_trait::async_trait]
+impl browse::Browser for Innertube {
+    async fn browse(&self, browse_id: &str, params: Option<&str>) -> Result<Page, Error> {
+        // The inherent methods, not these.
+        Innertube::browse(self, browse_id, params).await
+    }
+
+    async fn search(&self, query: &str, params: Option<&str>) -> Result<SearchPage, Error> {
+        Innertube::search(self, query, params).await
+    }
+
+    async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error> {
+        Innertube::more(self, kind, token).await
+    }
+}
+
 /// The request body: the music web client's context, then `fields`.
 fn body(fields: Map<String, Value>) -> Value {
     let mut body = Map::new();
@@ -175,7 +192,7 @@ fn body(fields: Map<String, Value>) -> Value {
 
 /// `params` as sent, or `None`. An empty one counts as none: rows and links carry `""` for "no
 /// params" (the `Page.js` shapes never use null), and that is how a client sends one back.
-fn check_params(params: Option<&str>) -> Result<Option<&str>, Error> {
+pub fn check_params(params: Option<&str>) -> Result<Option<&str>, Error> {
     match params {
         None | Some("") => Ok(None),
         Some(p) if token_ok(p) => Ok(Some(p)),
@@ -186,7 +203,7 @@ fn check_params(params: Option<&str>) -> Result<Option<&str>, Error> {
 /// The search text as sent: trimmed, 1 to `MAX_QUERY` characters (not bytes: a search in
 /// another script is as long as it looks), no control characters (a newline or an escape
 /// sequence is never something the user typed into a search box).
-fn check_query(query: &str) -> Result<&str, Error> {
+pub fn check_query(query: &str) -> Result<&str, Error> {
     let q = query.trim();
     if q.is_empty() {
         return Err(Error::BadRequest("the search is empty".into()));

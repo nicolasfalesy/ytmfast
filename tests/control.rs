@@ -718,6 +718,7 @@ async fn queue_commands_reach_the_engine() {
             video_id: None,
             playlist_id: Some(p),
             index: Some(2),
+            params: None,
             start_seconds,
         } => {
             assert_eq!(p, "OLAK5uy_x-Y");

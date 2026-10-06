@@ -49,6 +49,7 @@ use async_trait::async_trait;
 use crate::audio::decode::loudness_gain;
 use crate::audio::fetch::{Relink, TrackBuffer};
 use crate::audio::player::{AudioEvent, AudioPlayer};
+use crate::browse::Endpoint;
 use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
@@ -88,10 +89,15 @@ pub enum EngineCmd {
     /// A list with no `video_id` or `index` starts at a random song while shuffle is on.
     ///
     /// `start_seconds` is where the first song starts.
+    ///
+    /// `params` is a play endpoint's opaque `params` (`EngineCmd::play_endpoint`), sent with
+    /// the queue's first `next` request: YouTube picks the queue's flavour by it (an artist's
+    /// shuffle, say). The step 2 form never has one.
     Play {
         video_id: Option<String>,
         playlist_id: Option<String>,
         index: Option<usize>,
+        params: Option<String>,
         start_seconds: f64,
     },
     Pause,
@@ -124,6 +130,38 @@ pub enum EngineCmd {
     Shuffle(bool),
     Repeat(Repeat),
     Quit,
+}
+
+impl EngineCmd {
+    /// The play for a row's (or a page header's) play endpoint, already cleaned
+    /// (`browse::Endpoint`):
+    /// - a `watchEndpoint` with a `playlistId` plays that list, at its `videoId` when it has
+    ///   one (else at its `index`), with its `params`;
+    /// - a `watchEndpoint` with only a `videoId` plays the song and its radio, exactly as a
+    ///   play by id does (step 2). Its `params` are dropped: on a lone song they are YouTube's
+    ///   player flavour for that song, not a list's, and the radio is asked for as always;
+    /// - a `watchPlaylistEndpoint` plays the list from its start, with its `params`.
+    ///
+    /// `None` for a watch endpoint with neither id, which `Endpoint` never holds after cleaning
+    /// but its public fields allow: playing it would resume whatever was loaded instead.
+    pub fn play_endpoint(endpoint: Endpoint) -> Option<EngineCmd> {
+        let (video_id, playlist_id, index, params) = match endpoint {
+            Endpoint::Watch(w) => match (w.video_id, w.playlist_id) {
+                (None, None) => return None,
+                (Some(v), None) => (Some(v), None, None, None),
+                (v, Some(p)) => (v, Some(p), w.index, w.params),
+            },
+            Endpoint::WatchPlaylist(w) => (None, Some(w.playlist_id), None, w.params),
+        };
+        Some(EngineCmd::Play {
+            video_id,
+            playlist_id,
+            // u32 always fits a usize on the targets ytmfast builds for (64-bit Linux).
+            index: index.and_then(|i| usize::try_from(i).ok()),
+            params,
+            start_seconds: 0.0,
+        })
+    }
 }
 
 /// The queue as the widgets see it: the `queue` event's fields, and `QueueGet`'s reply.
@@ -628,13 +666,14 @@ impl Engine {
                 video_id,
                 playlist_id,
                 index,
+                params,
                 start_seconds,
-            } => self.play(video_id, playlist_id, index, start_seconds),
+            } => self.play(video_id, playlist_id, index, params, start_seconds),
             EngineCmd::Pause => self.pause(),
             EngineCmd::Toggle => match self.status.state {
                 PlayState::Playing | PlayState::Buffering => self.pause(),
                 PlayState::Paused => self.resume(),
-                PlayState::Stopped => self.play(None, None, None, 0.0),
+                PlayState::Stopped => self.play(None, None, None, None, 0.0),
             },
             EngineCmd::Seek(seconds) => self.seek(seconds),
             EngineCmd::Volume(v) => self.volume(v),
@@ -684,6 +723,7 @@ impl Engine {
         video_id: Option<String>,
         playlist_id: Option<String>,
         index: Option<usize>,
+        params: Option<String>,
         start_seconds: f64,
     ) {
         let start = if start_seconds.is_finite() {
@@ -697,12 +737,14 @@ impl Engine {
             (Some(v), Some(p)) if p.starts_with(RADIO_PREFIX) => NextRequest {
                 video_id: Some(v.clone()),
                 playlist_id: Some(p.clone()),
+                params,
                 ..NextRequest::default()
             },
             // An album or playlist by its id alone: with a video id too, YouTube answers
             // with just that song (tests/fixtures/NEXT_FIXTURES.md).
             (_, Some(p)) => NextRequest {
                 playlist_id: Some(p.clone()),
+                params,
                 ..NextRequest::default()
             },
             // A lone song: its radio fills the queue behind it, so "radio when the queue
@@ -710,6 +752,7 @@ impl Engine {
             (Some(v), None) => NextRequest {
                 video_id: Some(v.clone()),
                 playlist_id: Some(format!("{RADIO_PREFIX}{v}")),
+                params,
                 ..NextRequest::default()
             },
         };
@@ -773,7 +816,7 @@ impl Engine {
                     };
                     self.start_current(from);
                 } else {
-                    self.play(None, Some(LIKED_SONGS.into()), None, start);
+                    self.play(None, Some(LIKED_SONGS.into()), None, None, start);
                 }
             }
         }
@@ -2525,6 +2568,7 @@ mod tests {
                 video_id: Some(id.into()),
                 playlist_id: None,
                 index: None,
+                params: None,
                 start_seconds: 0.0,
             })
             .await;
@@ -2570,6 +2614,7 @@ mod tests {
                 video_id: None,
                 playlist_id: Some(playlist.into()),
                 index,
+                params: None,
                 start_seconds: 0.0,
             })
             .await;
@@ -2808,6 +2853,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         })
         .await;
@@ -3057,6 +3103,7 @@ mod tests {
             video_id: Some("AAAAAAAAAAA".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         // A 318 s song, loaded (not yet started, so the status shows the engine's own
@@ -3208,6 +3255,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         })
         .await;
@@ -3285,12 +3333,14 @@ mod tests {
             video_id: Some("AAAAAAAAAAA".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         engine.handle(EngineCmd::Play {
             video_id: Some("BBBBBBBBBBB".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         while rx.try_recv().is_ok() {}
@@ -3321,6 +3371,7 @@ mod tests {
             video_id: Some("AAAAAAAAAAA".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         engine.on_resolved(Resolved {
@@ -3334,6 +3385,7 @@ mod tests {
             video_id: Some("BBBBBBBBBBB".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         // A's end, sent before the audio thread took B's load: B is still resolving.
@@ -3388,6 +3440,141 @@ mod tests {
         // B plays first; C (the 2 s song's next) may be preloaded already.
         assert_eq!(r.started()[0], vid('B'));
         assert!(!r.started().contains(&vid('A')));
+    }
+
+    /// A row's endpoint as a play (step 3): the cases of `EngineCmd::play_endpoint`.
+    #[test]
+    fn play_endpoint_maps_each_kind() {
+        use crate::browse::{WatchEndpoint, WatchPlaylistEndpoint};
+        let play = |e| match EngineCmd::play_endpoint(e) {
+            Some(EngineCmd::Play {
+                video_id,
+                playlist_id,
+                index,
+                params,
+                start_seconds,
+            }) => (video_id, playlist_id, index, params, start_seconds),
+            other => panic!("{other:?}"),
+        };
+        let s = |v: &str| Some(v.to_string());
+        // A list's row: the list at that song, with its params and index.
+        assert_eq!(
+            play(Endpoint::Watch(WatchEndpoint {
+                video_id: s("AAAAAAAAAAA"),
+                playlist_id: s("PLlist"),
+                index: Some(4),
+                params: s("pp"),
+            })),
+            (s("AAAAAAAAAAA"), s("PLlist"), Some(4), s("pp"), 0.0)
+        );
+        // A lone song: its radio, as a play by id; its params are not a list's.
+        assert_eq!(
+            play(Endpoint::Watch(WatchEndpoint {
+                video_id: s("AAAAAAAAAAA"),
+                index: Some(4),
+                params: s("wAEB"),
+                ..WatchEndpoint::default()
+            })),
+            (s("AAAAAAAAAAA"), None, None, None, 0.0)
+        );
+        assert_eq!(
+            play(Endpoint::WatchPlaylist(WatchPlaylistEndpoint {
+                playlist_id: "RDAOartist".into(),
+                params: s("shuffle"),
+            })),
+            (None, s("RDAOartist"), None, s("shuffle"), 0.0)
+        );
+        // Neither id: not a play (it would resume whatever is loaded).
+        assert!(EngineCmd::play_endpoint(Endpoint::Watch(WatchEndpoint::default())).is_none());
+    }
+
+    /// A list's row plays the list at its song, and the endpoint's params go with the list's
+    /// `next` request.
+    #[tokio::test]
+    async fn play_watch_endpoint_with_playlist_plays_at_song() {
+        use crate::browse::WatchEndpoint;
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        let cmd = EngineCmd::play_endpoint(Endpoint::Watch(WatchEndpoint {
+            video_id: Some(vid('B')),
+            playlist_id: Some("PLlist".into()),
+            params: Some("8gECGAE%3D".into()),
+            ..WatchEndpoint::default()
+        }))
+        .unwrap();
+        r.send(cmd).await;
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        no_errors(&seen);
+        assert_eq!(
+            r.source.requests()[0],
+            NextRequest {
+                playlist_id: Some("PLlist".into()),
+                params: Some("8gECGAE%3D".into()),
+                ..NextRequest::default()
+            }
+        );
+        // The list lands around the song already playing: B stays current.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let q = loop {
+            let q = r.queue().await;
+            if q.items.len() == 3 || Instant::now() > deadline {
+                break q;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let ids: Vec<_> = q.items.iter().map(|i| i.song.video_id.clone()).collect();
+        assert_eq!(ids, [vid('A'), vid('B'), vid('C')]);
+        assert_eq!(q.current_id, Some(id_of(&q, 'B')));
+        assert_eq!(r.started()[0], vid('B'));
+    }
+
+    /// An artist's shuffle button: the list with its params, which reach `next`.
+    #[tokio::test]
+    async fn play_with_params_reaches_next_request() {
+        let mut r = rig(Setup {
+            pages: vec![ok("RDAOartist", 0, "AB", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("RDAOartist".into()),
+            index: None,
+            params: Some("wAEB8gECKAE%3D".into()),
+            start_seconds: 0.0,
+        })
+        .await;
+        let seen = r.until(PlayState::Playing).await;
+        no_errors(&seen);
+        assert_eq!(
+            r.source.requests()[0],
+            NextRequest {
+                playlist_id: Some("RDAOartist".into()),
+                params: Some("wAEB8gECKAE%3D".into()),
+                ..NextRequest::default()
+            }
+        );
+        // A lone song's radio and a radio by its seed carry them too.
+        for (video, list) in [
+            (Some(vid('A')), None),
+            (Some(vid('A')), Some(format!("RDAMVM{}", vid('A')))),
+        ] {
+            r.send(EngineCmd::Play {
+                video_id: video.clone(),
+                playlist_id: list.clone(),
+                index: None,
+                params: Some("pp".into()),
+                start_seconds: 0.0,
+            })
+            .await;
+            r.until_song(&vid('A'), PlayState::Playing).await;
+            let last = r.source.requests().last().cloned().unwrap();
+            assert_eq!(last.params.as_deref(), Some("pp"));
+            assert_eq!(last.video_id, video);
+        }
     }
 
     #[tokio::test]
@@ -3773,6 +3960,7 @@ mod tests {
             video_id: Some(vid('D')),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         assert!(engine.preload.is_none());
@@ -3949,6 +4137,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         })
         .await;
@@ -3985,6 +4174,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         })
         .await;
@@ -4106,6 +4296,7 @@ mod tests {
             video_id: Some(vid('A')),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         // A ends while its radio is still on the way: the engine waits.
@@ -4139,6 +4330,7 @@ mod tests {
             video_id: Some(vid('A')),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         add(engine, "B", AddAt::End);
@@ -4177,6 +4369,7 @@ mod tests {
             video_id: None,
             playlist_id: Some("PLlist".into()),
             index: Some(1),
+            params: None,
             start_seconds: 0.0,
         });
         add(engine, "X", AddAt::End);
@@ -4213,6 +4406,7 @@ mod tests {
                 video_id: None,
                 playlist_id: Some("PLlist".into()),
                 index,
+                params: None,
                 start_seconds: 0.0,
             });
             engine.on_load(Ok(page("ABCDEFGH", None)));
@@ -4312,6 +4506,7 @@ mod tests {
             video_id: Some("AAAAAAAAAAA".into()),
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         engine.on_resolved(Resolved {
@@ -4331,6 +4526,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         });
         assert_eq!(engine.status.state, PlayState::Buffering);
@@ -4533,6 +4729,7 @@ mod tests {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0,
         })
         .await;

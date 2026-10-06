@@ -353,6 +353,7 @@ async fn playpause_sends_toggle() {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0
         }
     ));

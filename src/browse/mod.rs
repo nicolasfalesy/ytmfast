@@ -25,6 +25,9 @@ mod row;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::Error;
+use crate::innertube::MoreKind;
+
 use collect::{collect, header_of, next_of};
 
 /// YouTube's own separator, so the columns joined here match the text inside them (a column already
@@ -226,6 +229,30 @@ impl TryFrom<Value> for Endpoint {
     fn try_from(v: Value) -> Result<Self, Self::Error> {
         Endpoint::from_endpoint(&v).ok_or("not a playable endpoint")
     }
+}
+
+/// What `playPage` plays (`Page.js`'s `playPage`): the header's big button, or else the first row
+/// that plays. Like `Page.js`, which collected the page with a cap of 5 rows a section for this,
+/// only each section's first 5 rows are looked at: the button stands for the page, and a playable
+/// row deep in a long first shelf is less the page's own than the top of the next shelf.
+pub fn page_play(page: &Page) -> Option<&Endpoint> {
+    page.header.play.as_ref().or_else(|| {
+        page.sections
+            .iter()
+            .flat_map(|s| s.items.iter().take(5))
+            .find_map(|r| r.play.as_ref())
+    })
+}
+
+/// The browsing requests the socket serves: `Innertube`'s in production (through the lazily
+/// loaded session, `streams::lazy`), a fake in tests. Used as `Arc<dyn Browser>`, hence
+/// async-trait, as for `engine::QueueSource` (ruling R1). Each one checks its input before
+/// sending (`Error::BadRequest`) and logs its own failures by endpoint and code.
+#[async_trait::async_trait]
+pub trait Browser: Send + Sync {
+    async fn browse(&self, browse_id: &str, params: Option<&str>) -> Result<Page, Error>;
+    async fn search(&self, query: &str, params: Option<&str>) -> Result<SearchPage, Error>;
+    async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error>;
 }
 
 /// A browse answer: the page header, its sections in page order, and its own next page.

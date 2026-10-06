@@ -9,7 +9,7 @@ pub mod clients;
 mod next;
 mod player;
 
-pub use browse::{MAX_QUERY, MoreKind};
+pub use browse::{MAX_QUERY, MoreKind, check_params, check_query};
 pub use next::{NextPage, NextRequest, SongItem, clean_artist};
 pub use player::{AudioFormat, PlayerResponse, Tracking};
 

@@ -11,8 +11,9 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::browse::{Endpoint, id_ok, token_ok};
 use crate::engine::{EngineEvent, PlayState, QueueView, Status};
-use crate::innertube::SongItem;
+use crate::innertube::{MoreKind, SongItem, check_query};
 use crate::queue::{AddAt, QueueItem, Repeat};
 use crate::state::{MAX_ARTISTS, MAX_TEXT, is_playlist_id};
 use crate::streams::is_video_id;
@@ -41,6 +42,31 @@ pub enum Request {
         playlist_id: Option<String>,
         index: Option<usize>,
         start_seconds: f64,
+    },
+    /// `play {endpoint}`: a row's (or a page header's) play endpoint, sent back as the row
+    /// gave it. Cleaned on the way in (see `parse_endpoint`); the engine turns it into a play
+    /// (`EngineCmd::play_endpoint`).
+    PlayEndpoint(Endpoint),
+    /// The browsing commands. Answered from a task of their own, to the asking client only
+    /// (`control::answer`); nothing is broadcast and the engine is not involved, except for
+    /// `PlayPage`'s play.
+    Browse {
+        browse_id: String,
+        params: Option<String>,
+    },
+    /// `query` is trimmed and checked (`innertube::check_query`).
+    Search {
+        query: String,
+        params: Option<String>,
+    },
+    More {
+        kind: MoreKind,
+        token: String,
+    },
+    /// Browses the page, then plays its header's button or else its first playable row.
+    PlayPage {
+        browse_id: String,
+        params: Option<String>,
     },
     Pause,
     Toggle,
@@ -109,6 +135,23 @@ impl Request {
                 args.insert("startSeconds".into(), json!(start_seconds));
                 ("play", Some(Value::Object(args)))
             }
+            Request::PlayEndpoint(endpoint) => ("play", Some(json!({ "endpoint": endpoint }))),
+            Request::Browse { browse_id, params } => {
+                ("browse", Some(page_args(browse_id, params.as_deref())))
+            }
+            Request::Search { query, params } => {
+                let mut args = json!({ "query": query });
+                if let Some(p) = params {
+                    args["params"] = json!(p);
+                }
+                ("search", Some(args))
+            }
+            Request::More { kind, token } => {
+                ("more", Some(json!({ "kind": kind, "token": token })))
+            }
+            Request::PlayPage { browse_id, params } => {
+                ("playPage", Some(page_args(browse_id, params.as_deref())))
+            }
             Request::Pause => ("pause", None),
             Request::Toggle => ("toggle", None),
             Request::Seek { seconds } => ("seek", Some(json!({ "seconds": seconds }))),
@@ -152,7 +195,25 @@ impl Request {
     }
 }
 
+/// `browse` and `playPage`'s arguments.
+fn page_args(browse_id: &str, params: Option<&str>) -> Value {
+    let mut args = json!({ "browseId": browse_id });
+    if let Some(p) = params {
+        args["params"] = json!(p);
+    }
+    args
+}
+
 const VIDEO_ID_RULE: &str = "videoId must be 11 characters of A-Z, a-z, 0-9, _ and -";
+const PLAYLIST_ID_RULE: &str = "playlistId must be 1 to 256 characters of A-Z, a-z, 0-9, _ and -";
+const BROWSE_ID_RULE: &str = "browseId must be 2 to 128 characters of A-Z, a-z, 0-9, _ and -";
+const PARAMS_RULE: &str =
+    "params must be up to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
+const TOKEN_RULE: &str = "token must be 1 to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
+const QUERY_RULE: &str = "query must be text of 1 to 200 characters with no control characters";
+const ENDPOINT_RULE: &str = "endpoint must be a row's play: {\"watchEndpoint\": {videoId, playlistId, index, params}} or {\"watchPlaylistEndpoint\": {playlistId, params}}";
+const ENDPOINT_INDEX_RULE: &str =
+    "the endpoint's index must be a whole number from 0 to 4294967295";
 
 /// Reads one request line (without its newline).
 pub fn parse_request(text: &[u8]) -> Result<(u64, Request), BadRequest> {
@@ -201,6 +262,47 @@ fn index_of(v: &Value) -> Option<usize> {
 fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'static str> {
     Ok(match cmd {
         "status" => Request::Status,
+        "play" if field(args, "endpoint").is_some() => {
+            // One way to say what to play, not two: an endpoint already names its song and
+            // list, and its play starts at the first second.
+            if ["videoId", "playlistId", "index", "startSeconds"]
+                .iter()
+                .any(|k| field(args, k).is_some())
+            {
+                return Err(
+                    "endpoint can't be mixed with videoId, playlistId, index or startSeconds",
+                );
+            }
+            Request::PlayEndpoint(parse_endpoint(&args["endpoint"])?)
+        }
+        "browse" => Request::Browse {
+            browse_id: browse_id(args)?,
+            params: params(args)?,
+        },
+        "playPage" => Request::PlayPage {
+            browse_id: browse_id(args)?,
+            params: params(args)?,
+        },
+        // Checked here with the request's own rule, not left to the request: a bad search
+        // must not first load the session, which can mean a keyring prompt.
+        "search" => Request::Search {
+            query: match field(args, "query") {
+                Some(Value::String(q)) => check_query(q).map_err(|_| QUERY_RULE)?.to_owned(),
+                _ => return Err(QUERY_RULE),
+            },
+            params: params(args)?,
+        },
+        "more" => Request::More {
+            kind: match field(args, "kind").and_then(Value::as_str) {
+                Some("browse") => MoreKind::Browse,
+                Some("search") => MoreKind::Search,
+                _ => return Err("kind must be \"browse\" or \"search\""),
+            },
+            token: match field(args, "token") {
+                Some(Value::String(t)) if token_ok(t) => t.clone(),
+                _ => return Err(TOKEN_RULE),
+            },
+        },
         "play" => {
             let video_id = match field(args, "videoId") {
                 None => None,
@@ -210,9 +312,7 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
             let playlist_id = match field(args, "playlistId") {
                 None => None,
                 Some(Value::String(s)) if is_playlist_id(s) => Some(s.clone()),
-                Some(_) => {
-                    return Err("playlistId must be 1 to 256 characters of A-Z, a-z, 0-9, _ and -");
-                }
+                Some(_) => return Err(PLAYLIST_ID_RULE),
             };
             let index = match field(args, "index") {
                 None => None,
@@ -285,6 +385,65 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
+}
+
+/// `browse` and `playPage`'s page.
+fn browse_id(args: &Map<String, Value>) -> Result<String, &'static str> {
+    match field(args, "browseId") {
+        Some(Value::String(s)) if id_ok(s) => Ok(s.clone()),
+        _ => Err(BROWSE_ID_RULE),
+    }
+}
+
+/// An optional `params`. `""` is none: rows and "more" links carry `""` for "no params" (the
+/// `Page.js` shapes never use null), and that is how a client sends one back.
+fn params(args: &Map<String, Value>) -> Result<Option<String>, &'static str> {
+    match field(args, "params") {
+        None => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) if token_ok(s) => Ok(Some(s.clone())),
+        Some(_) => Err(PARAMS_RULE),
+    }
+}
+
+/// A play endpoint a client sends back (Review Focus 3). Cleaning it (`Endpoint`) keeps only
+/// the fields that play something: unknown keys, YouTube's extras (`playerParams`, a start
+/// time, logging blocks) are dropped. But a field that cleaning drops for being malformed (a
+/// bad id, params of the wrong charset, an index past u32) is refused here instead: right for
+/// YouTube's own answers, a silent drop would turn a client's bad `videoId` into "play the
+/// whole list from the top". An empty string counts as absent, as in a row.
+fn parse_endpoint(v: &Value) -> Result<Endpoint, &'static str> {
+    if !v.is_object() {
+        return Err(ENDPOINT_RULE);
+    }
+    let endpoint = Endpoint::from_endpoint(v).ok_or(ENDPOINT_RULE)?;
+    let given = |raw: &Value, key: &str| {
+        raw.get(key)
+            .is_some_and(|x| !x.is_null() && x.as_str() != Some(""))
+    };
+    match &endpoint {
+        Endpoint::Watch(w) => {
+            let raw = &v["watchEndpoint"];
+            if given(raw, "videoId") && w.video_id.is_none() {
+                return Err(VIDEO_ID_RULE);
+            }
+            if given(raw, "playlistId") && w.playlist_id.is_none() {
+                return Err(PLAYLIST_ID_RULE);
+            }
+            if given(raw, "index") && w.index.is_none() {
+                return Err(ENDPOINT_INDEX_RULE);
+            }
+            if given(raw, "params") && w.params.is_none() {
+                return Err(PARAMS_RULE);
+            }
+        }
+        Endpoint::WatchPlaylist(w) => {
+            if given(&v["watchPlaylistEndpoint"], "params") && w.params.is_none() {
+                return Err(PARAMS_RULE);
+            }
+        }
+    }
+    Ok(endpoint)
 }
 
 /// `queue.add`: `songs` (objects with details) or `videoIds` (bare ids, whose details the
@@ -393,6 +552,22 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
 /// `{"id", "ok": true, "data"}`.
 pub fn ok_reply(id: u64, data: Value) -> String {
     line(json!({ "id": id, "ok": true, "data": data }))
+}
+
+/// `{"id", "ok": true, "data"}` with `data` serialized straight to text: a browsing answer (a
+/// page of up to 1,000 rows) never becomes a `Value` tree first, which would copy every string
+/// once more. The same keys, in the same order, as `ok_reply`.
+pub fn data_reply<T: Serialize>(id: u64, data: &T) -> String {
+    #[derive(Serialize)]
+    struct Reply<'a, T> {
+        id: u64,
+        ok: bool,
+        data: &'a T,
+    }
+    // The browse shapes are plain strings, numbers, lists and options: serializing can't fail.
+    let mut s = serde_json::to_string(&Reply { id, ok: true, data }).expect("a reply serializes");
+    s.push('\n');
+    s
 }
 
 /// `{"id", "ok": false, "error": {"code", "message"}}`; the id is null when the request
@@ -641,6 +816,42 @@ mod tests {
                 playlist_id: Some("OLAK5uy_abc-DEF".into()),
                 index: Some(3),
                 start_seconds: 0.0,
+            },
+            Request::PlayEndpoint(Endpoint::Watch(crate::browse::WatchEndpoint {
+                video_id: Some("dQw4w9WgXcQ".into()),
+                playlist_id: Some("PLfake".into()),
+                index: Some(3),
+                params: Some("wAEB+/=".into()),
+            })),
+            Request::PlayEndpoint(Endpoint::WatchPlaylist(
+                crate::browse::WatchPlaylistEndpoint {
+                    playlist_id: "RDAOfake".into(),
+                    params: None,
+                },
+            )),
+            Request::Browse {
+                browse_id: "FEmusic_home".into(),
+                params: None,
+            },
+            Request::Browse {
+                browse_id: "UCfake".into(),
+                params: Some("ggMIegYIARoCAQI%3D".into()),
+            },
+            Request::Search {
+                query: "a song".into(),
+                params: Some("EgWKAQIIAQ%3D%3D".into()),
+            },
+            Request::More {
+                kind: MoreKind::Browse,
+                token: "fake+token/==".into(),
+            },
+            Request::More {
+                kind: MoreKind::Search,
+                token: "faketoken".into(),
+            },
+            Request::PlayPage {
+                browse_id: "UCfake".into(),
+                params: None,
             },
             Request::Pause,
             Request::Toggle,
@@ -1043,6 +1254,12 @@ mod tests {
     fn replies_have_the_spec_shape() {
         let v: Value = serde_json::from_str(&ok_reply(7, json!({}))).unwrap();
         assert_eq!(v, json!({"id": 7, "ok": true, "data": {}}));
+        // A browsing answer: the same keys, in the same order, as one line.
+        let line = data_reply(8, &crate::browse::MorePage::default());
+        assert_eq!(
+            line,
+            "{\"id\":8,\"ok\":true,\"data\":{\"items\":[],\"sections\":[],\"cont\":\"\"}}\n"
+        );
         let line = error_reply(None, BAD_REQUEST, "not valid JSON");
         assert!(line.ends_with('\n'));
         let v: Value = serde_json::from_str(&line).unwrap();

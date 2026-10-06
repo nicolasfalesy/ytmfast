@@ -563,6 +563,7 @@ impl EngineRig {
                 video_id: video_id.map(String::from),
                 playlist_id: playlist_id.map(String::from),
                 index: None,
+                params: None,
                 start_seconds: 0.0,
             })
             .await
