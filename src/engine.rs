@@ -680,6 +680,8 @@ mod tests {
         failures: Vec<(&'static str, Error)>,
         /// A sink that plays as fast as it can, instead of in real time.
         fast: bool,
+        /// An output that can't be opened (no sound server to reach).
+        no_output: bool,
     }
 
     struct Rig {
@@ -713,8 +715,29 @@ mod tests {
     }
 
     /// The engine with its download starter pointed at the test server.
-    fn engine_for(server: &Server, resolver: Arc<Fake>, fast: bool) -> Built {
-        let (sink, stats) = sink(fast);
+    /// An output with no sound server behind it: every open fails, like `PipeWireSink`'s
+    /// when PipeWire can't be reached.
+    struct NoOutput;
+
+    impl crate::audio::sink::Sink for NoOutput {
+        fn open(&mut self, _: u32, _: u16) -> Result<(), Error> {
+            Err(Error::Internal("could not connect to PipeWire".into()))
+        }
+        fn write(&mut self, _: &[f32]) -> Result<(), Error> {
+            Err(Error::Internal("the output is not open".into()))
+        }
+        fn pause(&mut self, _: bool) {}
+        fn flush(&mut self) {}
+        fn set_volume(&mut self, _: f32) {}
+        fn delay_frames(&self) -> u64 {
+            0
+        }
+    }
+
+    fn engine_for(server: &Server, resolver: Arc<Fake>, fast: bool, no_output: bool) -> Built {
+        let (null, stats) = sink(fast);
+        let sink: Box<dyn crate::audio::sink::Sink> =
+            if no_output { Box::new(NoOutput) } else { null };
         let started = Arc::new(Mutex::new(Vec::new()));
         let base = server.base.clone();
         let log = started.clone();
@@ -756,7 +779,7 @@ mod tests {
             events,
             started,
             stats,
-        } = engine_for(&server, resolver.clone(), setup.fast);
+        } = engine_for(&server, resolver.clone(), setup.fast, setup.no_output);
         let events = events.subscribe();
         let task = tokio::spawn(engine.run());
         Rig {
@@ -896,6 +919,31 @@ mod tests {
         r.until(PlayState::Stopped).await;
         r.until(PlayState::Playing).await;
         assert_eq!(r.started().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_output_that_cannot_open_is_an_error_on_the_first_play() {
+        // Found live with PipeWire unreachable: the first play stayed `buffering` for ever,
+        // and only the second reported the error.
+        let mut r = rig(Setup {
+            no_output: true,
+            ..Setup::default()
+        })
+        .await;
+        for _ in 0..2 {
+            r.play("AAAAAAAAAAA").await;
+            let seen = r.until(PlayState::Stopped).await;
+            assert!(
+                seen.iter().any(|e| matches!(
+                    e,
+                    EngineEvent::Error {
+                        code: "internal",
+                        ..
+                    }
+                )),
+                "{seen:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1040,7 +1088,7 @@ mod tests {
         });
         let Built {
             mut engine, events, ..
-        } = engine_for(&server, fake.clone(), true);
+        } = engine_for(&server, fake.clone(), true, false);
         let mut rx = events.subscribe();
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),
@@ -1258,7 +1306,7 @@ mod tests {
             events,
             started,
             ..
-        } = engine_for(&server, fake.clone(), true);
+        } = engine_for(&server, fake.clone(), true, false);
         let mut rx = events.subscribe();
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),
@@ -1289,7 +1337,7 @@ mod tests {
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
         });
-        let Built { mut engine, .. } = engine_for(&server, fake.clone(), true);
+        let Built { mut engine, .. } = engine_for(&server, fake.clone(), true, false);
         // A was loaded and started; B is picked and loaded.
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),

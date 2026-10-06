@@ -36,6 +36,9 @@ const STALL: Duration = Duration::from_secs(5);
 /// How long `open` waits for the PipeWire thread to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `close` waits for the PipeWire thread to end before leaving it behind.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// The stream's identity, as mixers and per-app rules see it (Global Constraints).
 const APP_NAME: &str = "YouTube Music";
 const NODE_NAME: &str = "ytmfast";
@@ -85,6 +88,9 @@ struct Output {
     shared: Arc<Shared>,
     control: pw::channel::Sender<Control>,
     thread: Option<JoinHandle<()>>,
+    /// Disconnected once the PipeWire thread has ended (its sender drops with the thread),
+    /// so `close` can wait for that with a timeout, which a join can't.
+    done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 /// How an `Output` is made: `Output::connect`, or a stand-in in tests (which must never
@@ -334,10 +340,13 @@ impl Output {
         let shared = Arc::new(Shared::default());
         let (control, inbox) = pw::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("ytmfast-pipewire".into())
             .spawn(move || {
+                // Dropped when this thread ends, however it ends.
+                let _done = done_tx;
                 let setup = Setup {
                     rate,
                     volume,
@@ -358,6 +367,7 @@ impl Output {
             shared,
             control,
             thread: Some(thread),
+            done: Some(done_rx),
         };
         match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
             Ok(Ok(())) => Ok(out),
@@ -391,9 +401,25 @@ impl Output {
         )
     }
 
+    /// Stops the PipeWire thread. It is joined only once it has ended, and left behind after
+    /// `CLOSE_WAIT` if it hasn't: a thread stuck inside libpipewire (it never reaches its main
+    /// loop, so never sees `Quit`) must not hold the audio thread, and every song after, for
+    /// ever. That is also the one wait in `open` (after a failed or late connect) that had no
+    /// bound.
     fn close(mut self) {
         let _ = self.control.send(Control::Quit);
-        if let Some(t) = self.thread.take() {
+        let Some(t) = self.thread.take() else {
+            return;
+        };
+        let stuck = self.done.take().is_some_and(|done| {
+            matches!(
+                done.recv_timeout(CLOSE_WAIT),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        });
+        if stuck {
+            eprintln!("ytmfast: the PipeWire thread did not stop; leaving it behind");
+        } else {
             let _ = t.join();
         }
     }
@@ -708,6 +734,7 @@ mod tests {
             shared: Arc::new(Shared::default()),
             control,
             thread: None,
+            done: None,
         })
     }
 
@@ -768,6 +795,37 @@ mod tests {
         assert_eq!(sink.write(&[0.0; 4]), Err(Error::OutputRestarted));
         sink.open(48_000, 2).unwrap();
         assert!(!sink.lost(), "open made a new stream");
+    }
+
+    #[test]
+    fn close_never_waits_for_ever_on_a_stuck_thread() {
+        // A PipeWire thread stuck inside libpipewire (a connect that never returns) must not
+        // hold the audio thread in `close`, and so every song after it, for ever.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _done = done_tx;
+            let _ = release_rx.recv();
+        });
+        let (producer, _consumer) = rtrb::RingBuffer::new(16);
+        let (control, _inbox) = pw::channel::channel();
+        let out = Output {
+            rate: 48_000,
+            producer,
+            capacity: 16,
+            shared: Arc::new(Shared::default()),
+            control,
+            thread: Some(stuck),
+            done: Some(done_rx),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            out.close();
+            let _ = tx.send(());
+        });
+        let returned = rx.recv_timeout(CLOSE_WAIT + Duration::from_secs(2));
+        drop(release_tx);
+        assert!(returned.is_ok(), "close waited for ever on a stuck thread");
     }
 
     #[test]
