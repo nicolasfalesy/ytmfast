@@ -26,8 +26,9 @@ pub const MAX_LINE: usize = 1024 * 1024;
 /// add can't push a whole saved queue out.
 pub const MAX_ADD: usize = 500;
 
-/// The error code for a request the engine can't take as written. Protocol only: it is
-/// never an `Error` (see the ledger's pre-flight scan).
+/// The error code for a request the engine can't take as written. The socket's own checks
+/// answer with it directly; since step 3 a request the browsing calls refuse before sending
+/// (`Error::BadRequest`, a bad id, token or search) carries the same code.
 pub const BAD_REQUEST: &str = "bad_request";
 
 #[derive(Debug, Clone, PartialEq)]

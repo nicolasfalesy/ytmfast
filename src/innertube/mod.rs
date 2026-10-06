@@ -4,10 +4,12 @@
 //! answer's `Set-Cookie` rotations are written back to the session and saved, so the session
 //! stays valid on its own. Answers are capped at `net::MAX_ANSWER` while they are read.
 
+mod browse;
 pub mod clients;
 mod next;
 mod player;
 
+pub use browse::{MAX_QUERY, MoreKind};
 pub use next::{NextPage, NextRequest, SongItem, clean_artist};
 pub use player::{AudioFormat, PlayerResponse, Tracking};
 
@@ -183,6 +185,20 @@ impl Innertube {
         endpoint: &str,
         body: &serde_json::Value,
     ) -> Result<Vec<u8>, Error> {
+        self.post_with(client, endpoint, body, false).await
+    }
+
+    /// `post`, where `forbidden_is_signed_out` makes a 403 `SignedOut` too. For account
+    /// actions (a like): YouTube refuses those with a 403 when the session no longer counts
+    /// as signed in, and the fix is the same as for a 401, signing in again. A 403 on a read
+    /// stays a network error, as before.
+    async fn post_with(
+        &self,
+        client: &ClientInfo,
+        endpoint: &str,
+        body: &serde_json::Value,
+        forbidden_is_signed_out: bool,
+    ) -> Result<Vec<u8>, Error> {
         let url = self.endpoint_url(client, endpoint);
         // Ruling R7: production checks every URL it builds. The test base is the one bypass.
         if matches!(self.target, Target::ApiHost) && !net::allowed_host(&url) {
@@ -254,7 +270,9 @@ impl Innertube {
         self.absorb_set_cookies(&resp);
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || (forbidden_is_signed_out && status == reqwest::StatusCode::FORBIDDEN)
+        {
             return Err(Error::SignedOut);
         }
         if !status.is_success() {

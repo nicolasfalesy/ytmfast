@@ -80,15 +80,9 @@ impl Innertube {
 
 /// The request body: the music web client's context, the audio-only flag, and the fields
 /// of `req` that are set.
-fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::Value {
+pub(super) fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::Value {
     let mut body = json!({
-        "context": {
-            "client": {
-                "clientName": client.name,
-                "clientVersion": client.version,
-                "hl": "en",
-            }
-        },
+        "context": context(client),
         // As the music app's audio mode asks: the queue then prefers the song over its
         // music video.
         "isAudioOnly": true,
@@ -108,6 +102,19 @@ fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::
         }
     }
     body
+}
+
+/// The `context` every music web request carries (`next`, and the browsing requests in
+/// `browse.rs`): the client, its version and the language. One builder, so a browse can
+/// never go out as a different client version than the queue.
+pub(super) fn context(client: &clients::ClientInfo) -> serde_json::Value {
+    json!({
+        "client": {
+            "clientName": client.name,
+            "clientVersion": client.version,
+            "hl": "en",
+        }
+    })
 }
 
 // The answer, only the parts we read. Everything is optional, as in `player.rs`.
