@@ -36,7 +36,7 @@ failing) arrives as events.
 | Command        | Args                                                    | Reply data                  |
 |----------------|---------------------------------------------------------|-----------------------------|
 | `status`       | none                                                    | the state (below)           |
-| `play`         | `videoId`, `playlistId`, `index`, `startSeconds` (all optional) | `{}`                |
+| `play`         | `videoId`, `playlistId`, `index`, `startSeconds` (all optional); or `endpoint` alone | `{}` |
 | `pause`        | none                                                    | `{}`                        |
 | `toggle`       | none                                                    | `{}`                        |
 | `seek`         | `seconds` (a negative value seeks to the start)         | `{}`                        |
@@ -51,6 +51,10 @@ failing) arrives as events.
 | `shuffle`      | `on`: `true` or `false`                                 | `{}`                        |
 | `repeat`       | `mode`: `"off"`, `"all"` or `"one"`                     | `{}`                        |
 | `quit`         | none                                                    | `{}`, then the engine stops |
+| `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
+| `search`       | `query`, `params` (optional)                            | a search page (below)       |
+| `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
+| `playPage`     | `browseId`, `params` (optional)                         | `{}`                        |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -69,6 +73,10 @@ A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId`
   none playing yet (songs added to an empty queue), it plays the first of them. With an
   empty queue and nothing saved, it plays Liked songs.
 - `startSeconds` (from 0) is where the first song starts.
+
+With `endpoint`, it plays a row's `play` (or a page header's), sent back exactly as a
+`browse`, `search` or `more` answer gave it; nothing else may come with it. See "Playing a
+row" below.
 
 When the queue runs out, the engine carries on with radio songs. When that would take the
 queue past 1,000 songs, the engine first drops played songs from the front, keeping the
@@ -118,6 +126,130 @@ it goes back to the original order, at the same song. Songs that join later whil
 (a list's next page, radio songs) are shuffled into the songs still to come, never before
 the current one. `repeat` is `"off"`, `"all"` (the whole queue again after the last
 song) or `"one"` (the current song again when it ends; `next` and `previous` still move).
+
+## Browsing
+
+`browse`, `search`, `more` and `playPage` ask YouTube Music for pages, the ones the bar
+widget lists. They answer only the client that asked (nothing is broadcast), and they never
+start playback or change the queue, except `playPage`, whose job is to play.
+
+Each one runs on its own: a client keeps getting replies and events while a page loads, and
+replies may come in a different order from the requests (match them by `id`). A client may
+have at most 4 browsing requests waiting at once; another one is answered at once with
+`bad_request` and the message `busy`. A browsing request counts as activity for the idle
+clock, like any command.
+
+Ids and tokens are checked before anything is sent:
+
+- `browseId` is 2 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`.
+- `params` and `token` are up to 4096 characters of those, plus `+`, `/`, `=` and `%`.
+  An empty `params` (`""`, as rows carry it) is the same as none.
+- `query` is trimmed, then must be 1 to 200 characters with no control characters.
+
+A bad one is `bad_request`, and nothing is asked of YouTube (or of the keyring).
+
+Every text field is a string, `""` when there is nothing (never `null`); links are https
+links on YouTube's or Google's image hosts, or `""`.
+
+### browse
+
+`{"browseId": "FEmusic_home"}` gives a page: Home (`FEmusic_home`), the library
+(`FEmusic_library_landing`, `FEmusic_liked_playlists`, ...), a playlist (`VL...`), an album,
+an artist or a podcast. A section's `more` link is opened the same way, with its `params`.
+
+```json
+{"id": 4, "ok": true, "data": {
+  "header": {"title": "An Album", "subtitle": "Album • An Artist • 2024",
+             "thumb": "https://lh3.googleusercontent.com/...=w226-h226",
+             "play": {"watchPlaylistEndpoint": {"playlistId": "OLAK5uy_..."}}},
+  "sections": [
+    {"title": "", "cont": "", "more": null, "items": [
+      {"title": "A Song", "subtitle": "An Artist", "thumb": "https://...",
+       "videoId": "dQw4w9WgXcQ", "setId": "", "playlistId": "", "browseId": "",
+       "params": "", "play": {"watchEndpoint": {"videoId": "dQw4w9WgXcQ",
+       "playlistId": "OLAK5uy_..."}}, "duration": "3:33", "kind": "song"}]}],
+  "cont": ""}}
+```
+
+- `header.play` is the page's big play button (`null` when it has none).
+- A section's `cont` is the token for its next rows (`""` at the end), for `more` with
+  `kind: "browse"`. Its `more` is `null` or `{"browseId", "params"}`: a "Show all" page.
+- The page's own `cont` is the token for more sections (Home, as it scrolls).
+- A row's `kind` is `song`, `album`, `artist`, `playlist`, `podcast`, `page` or `""`.
+  `videoId`, `browseId` and `playlistId` say what it opens; `setId` is its place in a
+  playlist (a song can be there twice). `play` is `null` or one endpoint:
+  `{"watchEndpoint": {"videoId"?, "playlistId"?, "index"?, "params"?}}` or
+  `{"watchPlaylistEndpoint": {"playlistId", "params"?}}`, holding only those fields.
+- A section holds at most 300 rows.
+
+### search
+
+`{"query": "some song"}` gives the mixed results; with a chip's `params` it gives that
+filter (Songs, Albums, ...):
+
+```json
+{"id": 5, "ok": true, "data": {
+  "sections": [{"title": "Top result", "cont": "", "more": null, "items": [...]}],
+  "chips": [{"label": "Songs", "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"}]}}
+```
+
+Rows are as in `browse`. Mixed results keep 30 rows a section and have no next page; a
+filtered search keeps up to 300 and pages with its section's `cont` (`more` with
+`kind: "search"`).
+
+### more
+
+`{"kind": "browse", "token": "..."}` gives the next page of a list, with a `cont` from a
+`browse` answer (`kind: "browse"`) or a filtered `search` (`kind: "search"`):
+
+```json
+{"id": 6, "ok": true, "data": {"items": [...], "sections": [], "cont": "..."}}
+```
+
+A list's next rows come in `items` (at most 1,000); Home's next shelves come in `sections`.
+`cont` is the token for the page after, `""` at the end.
+
+### Playing a row
+
+`play` with `endpoint` plays a row's `play` as it came:
+
+```json
+{"id": 7, "cmd": "play", "args": {"endpoint":
+  {"watchEndpoint": {"videoId": "dQw4w9WgXcQ", "playlistId": "PL..."}}}}
+```
+
+- A `watchEndpoint` with a `playlistId` plays that list, starting at its `videoId` (that
+  song plays at once), else at its `index`, with its `params`.
+- A `watchEndpoint` with only a `videoId` plays the song and its radio, as `play` with a
+  `videoId` does.
+- A `watchPlaylistEndpoint` plays the list from the start, using its `params` (an artist's
+  shuffle, for example).
+
+Other fields in the endpoint are ignored. A malformed `videoId`, `playlistId`, `index` (a
+whole number from 0 to 4294967295) or `params` is `bad_request`, as is an endpoint that
+plays nothing. The reply is `{}`; what comes of the play arrives as events, as with any
+`play`.
+
+### playPage
+
+`{"browseId": "UC..."}` loads the page and plays its header's button (an artist's
+shuffle, an album's play), or else its first playable row (of the first 5 rows of each
+section). For a tile that has no play of its own, such as an artist. The reply is `{}` once
+the play went to the engine. A page with nothing to play is `bad_request` with the message
+`Nothing here can be played.`
+
+### Errors
+
+A failed browsing request is answered with the error, to that client only, never as an
+`error` event:
+
+```json
+{"id": 4, "ok": false, "error": {"code": "network", "message": "network error: timed out"}}
+```
+
+The code is `bad_request` (a malformed request, or `busy`), `signed_out` (no session, or
+YouTube refused it), `network`, `unavailable` or `internal`. Messages are fixed text: they
+never hold what was sent, a link or a token.
 
 ## Events
 
