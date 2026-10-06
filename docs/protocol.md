@@ -68,7 +68,9 @@ A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId`
   loaded or saved, it plays Liked songs.
 - `startSeconds` (from 0) is where the first song starts.
 
-When the queue runs out, the engine carries on with radio songs.
+When the queue runs out, the engine carries on with radio songs. When that would take the
+queue past 1,000 songs, the engine first drops played songs from the front, keeping the
+last 50 before the current one.
 
 ### next and previous
 
@@ -97,11 +99,15 @@ song even after the queue changes around it.
   is dropped (the song is still added). `lengthSeconds` is a whole number from 0 up.
 - With `videoIds`, the songs join without details; the engine fills them in when they play.
 - `at` is `"next"` (right after the current song) or `"end"` (the default).
+- The queue holds at most 1,000 songs. An add that would take it past that is refused whole
+  with `bad_request` and the message `the queue is full`; nothing is added. Remove songs
+  first, or start a new queue with `play`.
 
 `queue.remove` takes a song out (if it was playing, the next one takes its place).
 `queue.jump` plays a song. `queue.move` moves a song to `index` in the play order (the
-shuffled order while shuffle is on). For a `queueId` that isn't in the queue, the reply is
-still `"ok": true`, and an `unavailable` error event says nothing was done.
+shuffled order while shuffle is on); an `index` past the end moves it to the end. For a
+`queueId` that isn't in the queue, the reply is still `"ok": true`, and an `unavailable`
+error event says nothing was done.
 
 `shuffle` with `on: true` mixes the queue, with the current song moved first; with `false`
 it goes back to the original order, at the same song. `repeat` is `"off"`, `"all"` (the whole queue again after the last
@@ -153,7 +159,8 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
   and `artists` empty, until it plays.
 - `currentId` is the current song's `queueId`; `null` when there is none (songs added to
   an empty queue wait for `queue.jump`, `next` or `play`).
-- The whole queue comes every time. A 500-song queue is about 190 KB on one line.
+- The whole queue comes every time. The queue holds at most 1,000 songs, so with
+  real-sized details the line is at most about 375 KB.
 
 An error:
 
@@ -186,7 +193,8 @@ the same engine as the socket, so a change from either side shows on both.
 
 - `Next` and `Previous` are the socket's `next` and `previous`. `CanGoNext` and
   `CanGoPrevious` follow the queue: true when there is a song after (or before) the current
-  one, or with repeat `all`.
+  one, or with repeat `all`. With songs queued but none current, `CanGoNext` is true (Next
+  starts the first one) and `CanGoPrevious` is false.
 - `Shuffle` (true or false) is the socket's `shuffle`. `LoopStatus` is the socket's
   `repeat`: `"None"` is `off`, `"Track"` is `one` and `"Playlist"` is `all`.
 - `Metadata` holds the title, the artist, the length, `xesam:album` and `mpris:artUrl`

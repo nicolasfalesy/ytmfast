@@ -973,13 +973,13 @@ mod tests {
         );
     }
 
-    /// The biggest queue the engine keeps around (500 songs, the state file's cap), with
+    /// The biggest queue the engine holds (`queue::MAX_ITEMS`, 1,000 songs; ruling S15), with
     /// real-sized fields: one event line. Prints its size and how long it takes to build, for
-    /// the task report; asserts it stays far under the socket's 1 MiB line cap, which widgets
+    /// the task report; asserts it stays well under the socket's 1 MiB line cap, which widgets
     /// reading with the same cap rely on.
     #[test]
-    fn a_500_song_queue_event_is_well_under_a_line() {
-        let items: Arc<[QueueItem]> = (0..500u64)
+    fn a_full_queue_event_is_well_under_a_line() {
+        let items: Arc<[QueueItem]> = (0..crate::queue::MAX_ITEMS as u64)
             .map(|i| {
                 item(
                     i + 1,
@@ -1011,8 +1011,8 @@ mod tests {
             bytes = event_line(&event).len();
         }
         let each = start.elapsed() / rounds;
-        println!("500-song queue event: {bytes} bytes, {each:?} to build");
-        assert!(bytes < MAX_LINE / 4, "{bytes}");
+        println!("1,000-song queue event: {bytes} bytes, {each:?} to build");
+        assert!(bytes < MAX_LINE / 2, "{bytes}");
     }
 
     #[test]
