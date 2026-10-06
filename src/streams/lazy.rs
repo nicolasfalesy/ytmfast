@@ -1,12 +1,13 @@
-//! The resolver and the queue source, over a session loaded on first use.
+//! The resolver, the queue source and the browsing requests, over a session loaded on first use.
 //!
 //! The daemon serves its socket and watches for signals at once, and only reads the keyring
-//! when a song is first asked for. Reading it at start would hold every reply (and a stop)
+//! when a song (or a page) is first asked for. Reading it at start would hold every reply (and a stop)
 //! behind the keyring's unlock prompt, which has no timeout of its own. Until a session is
 //! found, every resolve tries the store again, so `ytmfast import-session` takes effect
 //! without restarting the engine.
 //!
-//! The resolver and the queue source come from one load and share one session: two loads
+//! The resolver, the queue source and the browsing requests come from one load and share one
+//! session (a browse before any play loads it, and a play after finds it loaded): two loads
 //! could each open an unlock prompt, and two copies of the session would drift apart as
 //! YouTube rotates its cookies.
 
@@ -17,9 +18,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::auth::{Session, SessionStore};
+use crate::browse::{Browser, LikeStatus, Lyrics, MorePage, Page, SearchPage};
 use crate::engine::QueueSource;
 use crate::error::Error;
-use crate::innertube::{NextPage, NextRequest, Tracking};
+use crate::innertube::{MoreKind, NextPage, NextRequest, SongNext, Tracking};
 use crate::report::ReportApi;
 use crate::streams::{Resolver, Stream};
 use url::Url;
@@ -28,12 +30,14 @@ use url::Url;
 /// unlock prompt, short enough that a play doesn't hang on a prompt nobody sees.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What one session load builds: the real resolver, queue source and play-report requests.
+/// What one session load builds: the real resolver, queue source, play-report requests and
+/// the socket's browsing requests.
 #[derive(Clone)]
 pub struct Loaded {
     pub resolver: Arc<dyn Resolver>,
     pub queue: Arc<dyn QueueSource>,
     pub reports: Arc<dyn ReportApi>,
+    pub browser: Arc<dyn Browser>,
 }
 
 /// Builds the real resolver and queue source once the session is loaded.
@@ -136,6 +140,37 @@ impl QueueSource for LazySession {
     async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
         self.get().await?.queue.next(req).await
     }
+
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        self.get().await?.queue.song_next(video_id).await
+    }
+
+    async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
+        self.get().await?.queue.like(video_id, status).await
+    }
+}
+
+#[async_trait]
+impl Browser for LazySession {
+    async fn browse(&self, browse_id: &str, params: Option<&str>) -> Result<Page, Error> {
+        self.get().await?.browser.browse(browse_id, params).await
+    }
+
+    async fn search(&self, query: &str, params: Option<&str>) -> Result<SearchPage, Error> {
+        self.get().await?.browser.search(query, params).await
+    }
+
+    async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error> {
+        self.get().await?.browser.more(kind, token).await
+    }
+
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        self.get().await?.browser.song_next(video_id).await
+    }
+
+    async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error> {
+        self.get().await?.browser.lyrics_page(page_id).await
+    }
 }
 
 /// A song is only reported after it was heard, so after a resolve loaded the session: this
@@ -215,6 +250,17 @@ mod tests {
                 ..NextPage::default()
             })
         }
+        async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+            Ok(SongNext {
+                like: Some(LikeStatus::Dislike),
+                lyrics_tab: None,
+            })
+        }
+        /// Refused with the session's first cookie value as the text, so a test can tell
+        /// which session the like went through.
+        async fn like(&self, _: &str, _: LikeStatus) -> Result<(), Error> {
+            Err(Error::Unavailable(self.0.clone()))
+        }
     }
 
     /// Answers every tracking request with the session's first cookie value as the visitor
@@ -234,6 +280,37 @@ mod tests {
         }
     }
 
+    /// Answers every browse with a page titled with the session's first cookie value, like
+    /// `Echo`.
+    struct EchoBrowser(String);
+
+    #[async_trait]
+    impl Browser for EchoBrowser {
+        async fn browse(&self, _: &str, _: Option<&str>) -> Result<Page, Error> {
+            let mut page = Page::default();
+            page.header.title = self.0.clone();
+            Ok(page)
+        }
+        async fn search(&self, _: &str, _: Option<&str>) -> Result<SearchPage, Error> {
+            Ok(SearchPage::default())
+        }
+        async fn more(&self, _: MoreKind, _: &str) -> Result<MorePage, Error> {
+            Ok(MorePage::default())
+        }
+        async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+            Ok(SongNext {
+                like: None,
+                lyrics_tab: Some(self.0.clone()),
+            })
+        }
+        async fn lyrics_page(&self, _: &str) -> Result<Option<Lyrics>, Error> {
+            Ok(Some(Lyrics {
+                text: self.0.clone(),
+                source: String::new(),
+            }))
+        }
+    }
+
     fn counting_build(builds: Arc<AtomicUsize>) -> Build {
         Box::new(move |s: Session| {
             builds.fetch_add(1, Ordering::SeqCst);
@@ -241,7 +318,8 @@ mod tests {
             Loaded {
                 resolver: Arc::new(Echo(value.clone())),
                 queue: Arc::new(EchoQueue(value.clone())),
-                reports: Arc::new(EchoReports(value)),
+                reports: Arc::new(EchoReports(value.clone())),
+                browser: Arc::new(EchoBrowser(value)),
             }
         })
     }
@@ -258,6 +336,23 @@ mod tests {
             lazy.next(NextRequest::default()).await,
             Err(Error::SignedOut)
         );
+        assert_eq!(
+            lazy.browse("FEmusic_home", None).await,
+            Err(Error::SignedOut)
+        );
+        assert_eq!(
+            QueueSource::song_next(&lazy, "testvideo01").await,
+            Err(Error::SignedOut)
+        );
+        assert_eq!(
+            Browser::song_next(&lazy, "testvideo01").await,
+            Err(Error::SignedOut)
+        );
+        assert_eq!(lazy.lyrics_page("MPLYtfake").await, Err(Error::SignedOut));
+        assert_eq!(
+            lazy.like("testvideo01", LikeStatus::Like).await,
+            Err(Error::SignedOut)
+        );
         assert_eq!(builds.load(Ordering::SeqCst), 0);
 
         // The user imports one: the next resolve uses it, without a restart.
@@ -272,6 +367,33 @@ mod tests {
         // So do the play reports.
         let t = lazy.tracking("testvideo01").await.unwrap();
         assert_eq!(t.visitor_data.as_deref(), Some("first"));
+        // And the socket's browsing.
+        let page = lazy.browse("FEmusic_home", None).await.unwrap();
+        assert_eq!(page.header.title, "first");
+        // And the lyrics.
+        assert_eq!(
+            Browser::song_next(&lazy, "testvideo01")
+                .await
+                .unwrap()
+                .lyrics_tab,
+            Some("first".into())
+        );
+        assert_eq!(
+            lazy.lyrics_page("MPLYtfake").await.unwrap().unwrap().text,
+            "first"
+        );
+        // And the likes, through the queue source.
+        assert_eq!(
+            QueueSource::song_next(&lazy, "testvideo01")
+                .await
+                .unwrap()
+                .like,
+            Some(LikeStatus::Dislike)
+        );
+        assert_eq!(
+            lazy.like("testvideo01", LikeStatus::Like).await,
+            Err(Error::Unavailable("first".into()))
+        );
         // Built once, then kept: the store isn't read on every song.
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }

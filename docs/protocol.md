@@ -36,7 +36,7 @@ failing) arrives as events.
 | Command        | Args                                                    | Reply data                  |
 |----------------|---------------------------------------------------------|-----------------------------|
 | `status`       | none                                                    | the state (below)           |
-| `play`         | `videoId`, `playlistId`, `index`, `startSeconds` (all optional) | `{}`                |
+| `play`         | `videoId`, `playlistId`, `index`, `startSeconds` (all optional); or `endpoint` alone | `{}` |
 | `pause`        | none                                                    | `{}`                        |
 | `toggle`       | none                                                    | `{}`                        |
 | `seek`         | `seconds` (a negative value seeks to the start)         | `{}`                        |
@@ -50,7 +50,14 @@ failing) arrives as events.
 | `queue.move`   | `queueId`, `index`                                      | `{}`                        |
 | `shuffle`      | `on`: `true` or `false`                                 | `{}`                        |
 | `repeat`       | `mode`: `"off"`, `"all"` or `"one"`                     | `{}`                        |
+| `like`         | `status`: `"like"`, `"dislike"` or `"none"`; `videoId` (optional) | `{}`, once YouTube took it |
+| `mute`         | `on`: `true` or `false`                                 | `{}`                        |
 | `quit`         | none                                                    | `{}`, then the engine stops |
+| `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
+| `search`       | `query`, `params` (optional)                            | a search page (below)       |
+| `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
+| `playPage`     | `browseId`, `params` (optional)                         | `{}`, or `{"superseded": true}` |
+| `lyrics`       | `videoId`                                               | `{text, source}` or `{"none": true}` (below) |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -69,6 +76,10 @@ A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId`
   none playing yet (songs added to an empty queue), it plays the first of them. With an
   empty queue and nothing saved, it plays Liked songs.
 - `startSeconds` (from 0) is where the first song starts.
+
+With `endpoint`, it plays a row's `play` (or a page header's), sent back exactly as a
+`browse`, `search` or `more` answer gave it; nothing else may come with it. See "Playing a
+row" below.
 
 When the queue runs out, the engine carries on with radio songs. When that would take the
 queue past 1,000 songs, the engine first drops played songs from the front, keeping the
@@ -119,6 +130,195 @@ it goes back to the original order, at the same song. Songs that join later whil
 the current one. `repeat` is `"off"`, `"all"` (the whole queue again after the last
 song) or `"one"` (the current song again when it ends; `next` and `previous` still move).
 
+### like and mute
+
+`like` sets a song's like status on the account: `"like"`, `"dislike"`, or `"none"` to take
+either back. With `videoId` it is that song (a row in a list, whatever is playing); without,
+or with `"videoId": null`, it is the song the state shows. With no `videoId` and no song
+shown, it is `bad_request` (`bad request: nothing is playing: say which song (videoId)`).
+
+Unlike the playback commands, the reply waits for YouTube: `{}` means YouTube took it, and
+by then the state's `liked` already shows it when it is the song shown. With two likes for
+one song on their way at once, the last one sent wins: the state shows only its answer, and
+an older one's `{}` (whenever it comes) changes nothing there. A like runs
+alongside the client's other requests, like a browse, and counts toward the same limit of 4
+waiting at once (see Browsing). A refused like is answered with the error, to that client
+only, never as an `error` event, with the codes of browsing's errors (see Browsing);
+`signed_out` also covers YouTube refusing the account action.
+
+`mute` with `on: true` silences the stream and keeps the volume; `on: false` puts that volume
+back. Muting while muted does nothing. Setting the volume while muted unmutes, at the new
+volume: `volume` from a client, MPRIS's `Volume`, or a mixer or desktop volume popup turning
+the stream up (the user touched the volume, so they want to hear it). Mute is kept across a
+restart, as the volume is.
+
+## Browsing
+
+`browse`, `search`, `more`, `playPage` and `lyrics` ask YouTube Music for pages, the ones
+the bar widget lists. They answer only the client that asked (nothing is broadcast), and they never
+start playback or change the queue, except `playPage`, whose job is to play.
+
+Each one runs on its own: a client keeps getting replies and events while a page loads, and
+replies may come in a different order from the requests (match them by `id`). A client may
+have at most 4 browsing requests waiting at once; another one is answered at once with
+`bad_request` and the message `busy`. A browsing request counts as activity for the idle
+clock, like any command.
+
+Ids and tokens are checked before anything is sent:
+
+- `browseId` is 2 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`.
+- `params` and `token` are up to 4096 characters of those, plus `+`, `/`, `=` and `%`.
+  An empty `params` (`""`, as rows carry it) is the same as none.
+- `query` is trimmed, then must be 1 to 200 characters with no control characters, no line or paragraph
+  separators and no invisible format characters (bidi controls, zero-width spaces and the like). Kept: the
+  joiners ZWNJ and ZWJ (Persian, Indic scripts and emoji need them), the tag characters of subdivision flags, and
+  the number signs that show in Arabic, Syriac and Kaithi text.
+
+A bad one is `bad_request`, and nothing is asked of YouTube (or of the keyring).
+
+Every text field is a string, `""` when there is nothing (never `null`); links are https
+links on YouTube's or Google's image hosts, or `""`.
+
+### browse
+
+`{"browseId": "FEmusic_home"}` gives a page: Home (`FEmusic_home`), the library
+(`FEmusic_library_landing`, `FEmusic_liked_playlists`, ...), a playlist (`VL...`), an album,
+an artist or a podcast. A section's `more` link is opened the same way, with its `params`.
+
+```json
+{"id": 4, "ok": true, "data": {
+  "header": {"title": "An Album", "subtitle": "Album • An Artist • 2024",
+             "thumb": "https://lh3.googleusercontent.com/...=w226-h226",
+             "play": {"watchPlaylistEndpoint": {"playlistId": "OLAK5uy_..."}}},
+  "sections": [
+    {"title": "", "items": [
+      {"title": "A Song", "subtitle": "An Artist", "thumb": "https://...",
+       "videoId": "dQw4w9WgXcQ", "setId": "", "playlistId": "", "browseId": "",
+       "params": "", "play": {"watchEndpoint": {"videoId": "dQw4w9WgXcQ",
+       "playlistId": "OLAK5uy_..."}}, "duration": "3:33", "kind": "song"}],
+     "cont": "", "more": null}],
+  "cont": ""}}
+```
+
+- `header.play` is the page's big play button (`null` when it has none).
+- A section's `cont` is the token for its next rows (`""` at the end), for `more` with
+  `kind: "browse"`. Its `more` is `null` or `{"browseId", "params"}`: a "Show all" page.
+- The page's own `cont` is the token for more sections (Home, as it scrolls).
+- A row's `kind` is `song`, `album`, `artist`, `playlist`, `podcast`, `page` or `""`.
+  `videoId`, `browseId` and `playlistId` say what it opens; `setId` is its place in a
+  playlist (a song can be there twice). `play` is `null` or one endpoint:
+  `{"watchEndpoint": {"videoId"?, "playlistId"?, "index"?, "params"?}}` or
+  `{"watchPlaylistEndpoint": {"playlistId", "params"?}}`, holding only those fields.
+- A section holds at most 300 rows.
+
+### search
+
+`{"query": "some song"}` gives the mixed results; with a chip's `params` it gives that
+filter (Songs, Albums, ...):
+
+```json
+{"id": 5, "ok": true, "data": {
+  "sections": [{"title": "Top result", "items": [...], "cont": "", "more": null}],
+  "chips": [{"label": "Songs", "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"}]}}
+```
+
+Rows are as in `browse`. Mixed results keep 30 rows a section and have no next page; a
+filtered search keeps up to 300 and pages with its section's `cont` (`more` with
+`kind: "search"`).
+
+### more
+
+`{"kind": "browse", "token": "..."}` gives the next page of a list, with a `cont` from a
+`browse` answer (`kind: "browse"`) or a filtered `search` (`kind: "search"`):
+
+```json
+{"id": 6, "ok": true, "data": {"items": [...], "sections": [], "cont": "..."}}
+```
+
+A list's next rows come in `items` (at most 1,000); Home's next shelves come in `sections`.
+`cont` is the token for the page after, `""` at the end.
+
+### Playing a row
+
+`play` with `endpoint` plays a row's `play` as it came:
+
+```json
+{"id": 7, "cmd": "play", "args": {"endpoint":
+  {"watchEndpoint": {"videoId": "dQw4w9WgXcQ", "playlistId": "PL..."}}}}
+```
+
+- A `watchEndpoint` with a `playlistId` plays that list, starting at its `videoId` (that
+  song plays at once), else at its `index`, with its `params`.
+- A `watchEndpoint` with only a `videoId` plays the song and its radio, as `play` with a
+  `videoId` does.
+- A `watchPlaylistEndpoint` plays the list from the start, using its `params` (an artist's
+  shuffle, for example).
+
+Other fields in the endpoint are ignored. In an endpoint, `videoId` is as above,
+`playlistId` is 2 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-` (the rule rows are
+made with, not the plain `play`'s 1 to 256), `index` is a whole number from 0 to 4294967295,
+and `params` is as in browsing. A malformed one is `bad_request`, as is an endpoint that
+plays nothing, and one holding both a `watchEndpoint` and a `watchPlaylistEndpoint` (rows
+carry one or the other, so which was meant is not guessed). The reply is `{}`; what comes
+of the play arrives as events, as with any `play`.
+
+### playPage
+
+`{"browseId": "UC..."}` loads the page and plays its header's button (an artist's
+shuffle, an album's play), or else its first playable row (of the first 5 rows of each
+section). For a tile that has no play of its own, such as an artist. The reply is `{}` once
+the play went to the engine. A page with nothing to play is `bad_request` with the message
+`Nothing here can be played.`
+
+A newer choice wins: when a command that picks what plays reaches the engine after this
+`playPage` and before its page has loaded, the page's play is dropped, and the reply is
+`{"id": ..., "ok": true, "data": {"superseded": true}}`. The commands that pick what plays,
+from any client or MPRIS, are `play`, `playPage`'s own play, `queue.jump`, `next`,
+`previous`, a `seek` at or past the song's end (it plays the next song), and a
+`queue.remove` of the song playing (the next one takes its place). A `play` with no id
+and a `toggle` (and MPRIS Play and PlayPause) count only when the state is `stopped`: then
+they start something. Otherwise they only resume or pause the song, and the page still
+plays.
+
+### lyrics
+
+`{"videoId": "dQw4w9WgXcQ"}` gives the song's lyrics as YouTube Music shows them: plain text,
+no timings.
+
+```json
+{"id": 8, "ok": true, "data": {"text": "First line\nSecond line\n\nChorus",
+                                 "source": "Source: Musixmatch"}}
+```
+
+- `text` is as YouTube gives it, newlines kept. It can run to a few KB; past 256 KiB it is
+  cut there, at a character's end (no real lyrics come close).
+- `source` is the line YouTube shows under them (`"Source: ..."`), or `""`.
+- A song with no lyrics is `{"id": 8, "ok": true, "data": {"none": true}}`.
+
+Lyrics take two requests to YouTube: the song's `next` (whose Lyrics tab names the lyrics
+page), then that page. The engine reads the same `next` for the song playing (its queue's,
+or its like lookup's) and keeps the tab with the like status, for its last 100 songs. So
+lyrics for the song playing take one request, and a `next` made for lyrics gives the engine
+the song's like status in turn.
+
+The daemon keeps the last 20 answers, for every client: asking again for one of those songs
+(reopening the Lyrics tab, or another widget asking) is answered at once, with nothing sent.
+A song with no lyrics is asked about again after an hour (YouTube adds lyrics to songs
+later); found lyrics are kept while the daemon runs. A failure is never kept.
+
+### Errors
+
+A failed browsing request is answered with the error, to that client only, never as an
+`error` event:
+
+```json
+{"id": 4, "ok": false, "error": {"code": "network", "message": "network error: timed out"}}
+```
+
+The code is `bad_request` (a malformed request, or `busy`), `signed_out` (no session, or
+YouTube refused it), `network`, `unavailable` or `internal`. Messages are fixed text: they
+never hold what was sent, a link or a token.
+
 ## Events
 
 Events have no `id`. Every connected client gets every event.
@@ -128,7 +328,8 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 ```json
 {"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ", "title": "...",
  "artist": "...", "lengthSeconds": 213, "thumbnail": "https://...", "position": 12.5,
- "volume": 80, "album": "...", "queueId": 7, "shuffle": false, "repeat": "off"}
+ "volume": 80, "muted": false, "album": "...", "albumId": "MPREb_...", "queueId": 7,
+ "shuffle": false, "repeat": "off", "liked": "like"}
 ```
 
 - `state` is `playing`, `paused`, `buffering` or `stopped`.
@@ -137,12 +338,24 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
   known (`lengthSeconds` is also `null` when the length is unknown). A song queued with its
   details shows them at once. `artist` names every artist, joined with `", "`.
 - `album` is the current song's album, from its queue item; `null` when it has none.
+- `albumId` is that album's `browseId` (`MPREb_...`), from the same queue item, for opening
+  the album with `browse` (the cover, clicked). It is a string, `""` when there is none: a
+  song with no album link (a user upload), one added with `queue.add` (which takes no album
+  id), or nothing current. It is checked as a `browseId` is (see Browsing); a malformed one
+  is `""`.
 - `queueId` is the current song's id in the queue; `null` when there is none.
 - `position` is in seconds; `volume` is a percent. `shuffle` and `repeat` are as in the
   queue.
 - `volume` follows the stream's volume wherever it is changed: a change in a mixer or a
   desktop volume popup sends a new `state` with it, and the engine keeps it (a later song,
   or a restart, plays at it).
+- `muted` is `true` while the stream is silenced by `mute`. `volume` then still shows the
+  volume unmuting goes back to, so a slider keeps its place.
+- `liked` is the shown song's like status on the account: `"like"`, `"dislike"` or `"none"`;
+  `null` until known. It is known from the song's queue answer when the queue was asked for
+  with that song (a song played by id), else from one small request when the song starts,
+  and at once after a `like` of it. A song whose status could not be read stays `null` until
+  it starts again.
 
 The position, once a second while playing and after every seek:
 
@@ -159,17 +372,18 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
 ```json
 {"event": "queue", "items": [
   {"queueId": 7, "videoId": "dQw4w9WgXcQ", "title": "...", "artists": ["..."],
-   "album": "...", "thumbnail": "https://...", "lengthSeconds": 213}],
+   "album": "...", "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213}],
  "currentId": 7, "shuffle": false, "repeat": "off"}
 ```
 
 - `items` are in play order: the shuffled order while shuffle is on.
 - A song added by id alone has `title`, `album`, `thumbnail` and `lengthSeconds` `null`
   and `artists` empty, until it plays.
+- `albumId` is as in the state: the song's album `browseId`, or `""` (never `null`).
 - `currentId` is the current song's `queueId`; `null` when there is none (songs added to
   an empty queue wait for `queue.jump`, `next` or `play`).
 - The whole queue comes every time. The queue holds at most 1,000 songs, so with
-  real-sized details the line is at most about 375 KB.
+  real-sized details the line is at most about 405 KB.
 
 An error:
 
@@ -209,6 +423,8 @@ the same engine as the socket, so a change from either side shows on both.
   `repeat`: `"None"` is `off`, `"Track"` is `one` and `"Playlist"` is `all`.
 - `Metadata` holds the title, the artist, the length, `xesam:album` and `mpris:artUrl`
   (from the song's queue item when it has them).
+- `Volume` is the socket's `volume`. MPRIS has no mute: while muted, `Volume` shows the kept
+  volume, and setting it unmutes, as the socket's `volume` does.
 - `Seeked` comes once for every seek, from any client, with where the song landed.
 - `SetPosition` at or past the song's end is ignored, as the spec says.
 - There is no track list (`HasTrackList` is false): the socket's `queue.get` has the queue.

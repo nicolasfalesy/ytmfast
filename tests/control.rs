@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
+use ytmfast::browse::LikeStatus;
 use ytmfast::control::{self, Exit, Options};
 use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
 use ytmfast::error::Error;
@@ -45,6 +46,12 @@ impl Resolver for Hang {
 #[async_trait]
 impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
+    }
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
         std::future::pending().await
     }
 }
@@ -164,6 +171,7 @@ fn full_song(id: &str) -> SongItem {
         title: "Song".into(),
         artists: vec!["A".into(), "B".into()],
         album: Some("Album".into()),
+        album_id: String::new(),
         thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
         length_seconds: 213,
         playlist_id: None,
@@ -176,7 +184,10 @@ fn fake_queue() -> QueueView {
         items: vec![
             QueueItem {
                 id: 3,
-                song: full_song(SONG),
+                song: SongItem {
+                    album_id: "MPREb_x".into(),
+                    ..full_song(SONG)
+                },
             },
             QueueItem {
                 id: 9,
@@ -199,11 +210,14 @@ fn paused_status(id: &str) -> Status {
         video_id: Some(id.into()),
         meta: None,
         album: None,
+        album_id: String::new(),
         queue_id: None,
         position: 1.5,
         volume: 0.5,
+        muted: false,
         shuffle: false,
         repeat: Repeat::Off,
+        liked: None,
     }
 }
 
@@ -718,6 +732,7 @@ async fn queue_commands_reach_the_engine() {
             video_id: None,
             playlist_id: Some(p),
             index: Some(2),
+            params: None,
             start_seconds,
         } => {
             assert_eq!(p, "OLAK5uy_x-Y");
@@ -757,10 +772,10 @@ async fn queue_get_replies_with_the_queue() {
             "currentId": 3, "shuffle": true, "repeat": "one",
             "items": [
                 {"queueId": 3, "videoId": SONG, "title": "Song", "artists": ["A", "B"],
-                 "album": "Album", "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
-                 "lengthSeconds": 213},
+                 "album": "Album", "albumId": "MPREb_x",
+                 "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg", "lengthSeconds": 213},
                 {"queueId": 9, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                 "album": null, "thumbnail": null, "lengthSeconds": null}]}})
+                 "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]}})
     );
     f.serve.abort();
 }
@@ -973,4 +988,97 @@ async fn an_add_past_the_queue_cap_is_refused() {
             .iter()
             .all(|i| !i["videoId"].as_str().unwrap().starts_with('c'))
     );
+}
+
+#[tokio::test]
+async fn like_and_mute_reach_the_engine() {
+    let mut f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    let mut other = connect(&f.path).await;
+    c.send(r#"{"id":1,"cmd":"mute","args":{"on":true}}"#).await;
+    assert_eq!(c.reply(1).await["ok"], true);
+    assert_eq!(
+        format!("{:?}", f.commands.recv().await.unwrap()),
+        "Mute(true)"
+    );
+
+    // A like is answered once the engine says YouTube took it...
+    c.send(&format!(
+        r#"{{"id":2,"cmd":"like","args":{{"status":"dislike","videoId":"{SONG}"}}}}"#
+    ))
+    .await;
+    let Some(EngineCmd::Like {
+        video_id,
+        status,
+        reply,
+    }) = f.commands.recv().await
+    else {
+        panic!("wanted a like")
+    };
+    assert_eq!(video_id.as_deref(), Some(SONG));
+    assert_eq!(status, LikeStatus::Dislike);
+    // ...and while it waits, the client's other requests are answered.
+    c.send(r#"{"id":3,"cmd":"status"}"#).await;
+    let v = c.next().await.unwrap();
+    assert_eq!(v["id"], 3);
+    assert_eq!(v["data"]["liked"], Value::Null);
+    reply.send(Ok(())).unwrap();
+    assert_eq!(c.reply(2).await, json!({"id": 2, "ok": true, "data": {}}));
+
+    // A refused like is the asker's alone: an error reply, never an error event.
+    c.send(r#"{"id":4,"cmd":"like","args":{"status":"none"}}"#)
+        .await;
+    let Some(EngineCmd::Like {
+        video_id,
+        status,
+        reply,
+    }) = f.commands.recv().await
+    else {
+        panic!("wanted a like")
+    };
+    assert_eq!(video_id, None);
+    assert_eq!(status, LikeStatus::Indifferent);
+    reply.send(Err(Error::SignedOut)).unwrap();
+    assert_eq!(
+        c.reply(4).await,
+        json!({"id": 4, "ok": false,
+               "error": {"code": "signed_out", "message": "signed out"}})
+    );
+    other.send(r#"{"id":9,"cmd":"status"}"#).await;
+    assert_eq!(other.next().await.unwrap()["id"], 9);
+
+    // Checked on the way in.
+    c.send(r#"{"id":5,"cmd":"like","args":{"status":"love"}}"#)
+        .await;
+    assert_eq!(c.reply(5).await["error"]["code"], "bad_request");
+    f.serve.abort();
+}
+
+#[tokio::test]
+async fn like_with_nothing_playing_needs_an_id_and_mute_shows_in_the_state() {
+    let d = daemon(true);
+    let mut c = connect(&d.path).await;
+    c.send(r#"{"id":1,"cmd":"like","args":{"status":"like"}}"#)
+        .await;
+    assert_eq!(
+        c.reply(1).await,
+        json!({"id": 1, "ok": false, "error": {"code": "bad_request",
+               "message": "bad request: nothing is playing: say which song (videoId)"}})
+    );
+    c.send(r#"{"id":2,"cmd":"volume","args":{"percent":40}}"#)
+        .await;
+    c.send(r#"{"id":3,"cmd":"mute","args":{"on":true}}"#).await;
+    loop {
+        let v = c.event("state").await;
+        if v["muted"] == true {
+            // The volume stays, for unmuting.
+            assert_eq!(v["volume"], 40);
+            assert_eq!(v["liked"], Value::Null);
+            break;
+        }
+    }
+    c.send(r#"{"id":4,"cmd":"status"}"#).await;
+    let v = c.reply(4).await;
+    assert_eq!(v["data"]["muted"], true);
+    assert_eq!(v["data"]["volume"], 40);
 }

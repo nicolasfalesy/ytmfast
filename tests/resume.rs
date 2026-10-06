@@ -37,6 +37,7 @@ fn song(id: &str, title: &str) -> SongItem {
         title: title.into(),
         artists: vec!["Artist".into()],
         album: Some("Album".into()),
+        album_id: "MPREb_example".into(),
         thumbnail: Some(format!("https://i.ytimg.com/vi/{id}/hq.jpg")),
         length_seconds: 240,
         playlist_id: Some("OLAK5uy_example".into()),
@@ -174,6 +175,8 @@ fn restart_resumes_paused_at_the_saved_second() {
         assert_eq!(s["title"], "Second");
         assert_eq!(s["position"], 42.5);
         assert_eq!(s["volume"], 30);
+        // Ruling P15: the album link comes back with the song.
+        assert_eq!(s["albumId"], "MPREb_example", "round {round}: {s}");
         // What `systemctl --user restart` sends: the last save, then a clean exit.
         sigterm(&child);
         wait_exit(&mut child);
@@ -244,6 +247,12 @@ impl Resolver for Hang {
 impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
         panic!("a queue was fetched before any play")
+    }
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        std::future::pending().await
     }
 }
 

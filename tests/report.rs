@@ -507,6 +507,13 @@ impl QueueSource for FakeSource {
         }
         Err(Error::Unavailable("YouTube sent no queue".into()))
     }
+    /// Unknown: the reports don't depend on it.
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
+        Ok(ytmfast::innertube::SongNext::default())
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 struct EngineRig {
@@ -563,6 +570,7 @@ impl EngineRig {
                 video_id: video_id.map(String::from),
                 playlist_id: playlist_id.map(String::from),
                 index: None,
+                params: None,
                 start_seconds: 0.0,
             })
             .await

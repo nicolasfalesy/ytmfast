@@ -22,6 +22,12 @@ pub enum Error {
     /// text, because the engine acts on it (it plays the song again once, where it was).
     #[error("internal error: the audio output restarted")]
     OutputRestarted,
+    /// What the caller asked for can't be sent as written (an id or token of the wrong
+    /// shape, an empty or overlong search). Checked before anything goes out, so the socket
+    /// answers it as the client's mistake (`bad_request`), not YouTube's or ours. The text is
+    /// fixed: it says what was wrong, never the value itself (ruling R6).
+    #[error("bad request: {0}")]
+    BadRequest(String),
 }
 
 impl Error {
@@ -32,6 +38,7 @@ impl Error {
             Error::Network(_) => "network",
             Error::StreamFailed(_) => "stream_failed",
             Error::Internal(_) | Error::OutputRestarted => "internal",
+            Error::BadRequest(_) => "bad_request",
         }
     }
 }
@@ -72,6 +79,11 @@ mod tests {
         assert_eq!(Error::StreamFailed("x".into()).code(), "stream_failed");
         assert_eq!(Error::Internal("x".into()).code(), "internal");
         assert_eq!(Error::OutputRestarted.code(), "internal");
+        // The same code the socket uses for a malformed request (`protocol::BAD_REQUEST`).
+        assert_eq!(
+            Error::BadRequest("x".into()).code(),
+            crate::control::protocol::BAD_REQUEST
+        );
     }
 
     #[test]

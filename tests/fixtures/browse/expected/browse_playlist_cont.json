@@ -1,0 +1,167 @@
+{
+ "items": [],
+ "sections": [
+  {
+   "title": "Text 923",
+   "items": [
+    {
+     "title": "Text 926",
+     "subtitle": "Text 927 • Text 928",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000718",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000718",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "3:22",
+     "kind": "song"
+    },
+    {
+     "title": "Text 934",
+     "subtitle": "Text 935 • Text 936",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000724",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000724",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "2:55",
+     "kind": "song"
+    },
+    {
+     "title": "Text 942",
+     "subtitle": "Text 943 • Text 944",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000729",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000729",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "3:29",
+     "kind": "song"
+    },
+    {
+     "title": "Text 950",
+     "subtitle": "Text 951 • Text 950",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000734",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000734",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "3:03",
+     "kind": "song"
+    },
+    {
+     "title": "Text 957",
+     "subtitle": "Text 958 • Text 959",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000739",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000739",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "4:12",
+     "kind": "song"
+    },
+    {
+     "title": "Text 965",
+     "subtitle": "Text 966 • Text 967",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000744",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000744",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "3:06",
+     "kind": "song"
+    },
+    {
+     "title": "Text 973",
+     "subtitle": "Text 974 & Text 975 • Text 976",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "fakeV000749",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000749",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "3:36",
+     "kind": "song"
+    }
+   ],
+   "cont": "",
+   "more": null
+  }
+ ],
+ "cont": "faketoken"
+}

@@ -41,7 +41,10 @@ rtrb = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled", "serialize"] }
 # The session is stored in the keyring as JSON.
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# preserve_order: the browse module lists rows in the order YouTube's JSON holds them (its walk is
+# Page.js's `for (var k in o)`); the default sorted map would reorder a page's shelves and rows.
+# No other dependency turns it on; `sections_follow_page_order_not_key_order` fails without it.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 # SAPISIDHASH is a SHA-1; Chromium v24+ cookies start with a SHA-256 of the host.
 sha1 = "0.10"
 sha2 = "0.10"

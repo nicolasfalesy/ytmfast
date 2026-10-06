@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::player::{RawText, RawThumbnails, widest_thumbnail};
 use super::{Innertube, clients};
+use crate::browse::{self, LikeStatus};
 use crate::error::Error;
 use crate::streams::is_video_id;
 
@@ -39,6 +40,25 @@ pub struct NextPage {
     pub continuation: Option<String>,
     /// The queue's own playlist id (`playlistPanelRenderer.playlistId`).
     pub playlist_id: Option<String>,
+    /// The like status of the song the request named (`NextRequest::video_id`), from the
+    /// answer's like button: the queue fetch already makes this request, so the engine needs
+    /// no second one for that song (ruling P1). `None` when the request named no song (a
+    /// playlist or a continuation, whose answer may be about some other song) or the answer
+    /// has no button for it.
+    pub like: Option<LikeStatus>,
+    /// The browse id of that song's lyrics page (`MPLYt…`), from the answer's Lyrics tab, on
+    /// the same terms as `like`: lyrics for the song then need only that page's browse (Task
+    /// 6). `None` when the request named no song or the song has no Lyrics tab.
+    pub lyrics_tab: Option<String>,
+}
+
+/// What a song's own `next` (one naming just the song) says about it beyond its queue: its
+/// like status and its Lyrics tab. One answer serves both the like lookup and lyrics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SongNext {
+    pub like: Option<LikeStatus>,
+    /// The lyrics page's browse id, shape-checked; `None` when the song has no Lyrics tab.
+    pub lyrics_tab: Option<String>,
 }
 
 /// One song in a queue. Serializable because the queue is saved across restarts and sent to
@@ -50,6 +70,14 @@ pub struct SongItem {
     /// Each artist once, in the byline's order, with any `" - Topic"` suffix removed.
     pub artists: Vec<String>,
     pub album: Option<String>,
+    /// The album's browse id (`MPREb_…`), from the byline's album link, so a widget can open the
+    /// album of the song playing (its cover, clicked). Shape-checked like every browse id
+    /// (`browse::id_ok`); `""` when the byline links no album, or links one with a malformed id.
+    /// A plain string, never null, as in the browsing shapes. `serde(default)`: a `state.json`
+    /// written before it has no such key and still loads (and serde skips the key for an older
+    /// engine reading a newer file), so the file's version stays 1.
+    #[serde(default)]
+    pub album_id: String,
     /// The widest thumbnail on an allowed host.
     pub thumbnail: Option<String>,
     /// 0 when the answer gives no length, which is how an unplayable item shows.
@@ -74,21 +102,15 @@ impl Innertube {
         let client = &clients::WEB_REMIX;
         let body = request_body(client, &req);
         let answer = self.post(client, "next", &body).await?;
-        parse(&answer)
+        parse(&answer, req.video_id.as_deref())
     }
 }
 
 /// The request body: the music web client's context, the audio-only flag, and the fields
 /// of `req` that are set.
-fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::Value {
+pub(super) fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::Value {
     let mut body = json!({
-        "context": {
-            "client": {
-                "clientName": client.name,
-                "clientVersion": client.version,
-                "hl": "en",
-            }
-        },
+        "context": context(client),
         // As the music app's audio mode asks: the queue then prefers the song over its
         // music video.
         "isAudioOnly": true,
@@ -110,6 +132,19 @@ fn request_body(client: &clients::ClientInfo, req: &NextRequest) -> serde_json::
     body
 }
 
+/// The `context` every music web request carries (`next`, and the browsing requests in
+/// `browse.rs`): the client, its version and the language. One builder, so a browse can
+/// never go out as a different client version than the queue.
+pub(super) fn context(client: &clients::ClientInfo) -> serde_json::Value {
+    json!({
+        "client": {
+            "clientName": client.name,
+            "clientVersion": client.version,
+            "hl": "en",
+        }
+    })
+}
+
 // The answer, only the parts we read. Everything is optional, as in `player.rs`.
 
 #[derive(Deserialize)]
@@ -118,6 +153,9 @@ struct Raw {
     contents: Option<RawContents>,
     /// Where a continuation page puts its queue.
     continuation_contents: Option<RawContinuationContents>,
+    /// The player's buttons, the like button among them. Kept raw (it is small) and read by
+    /// `browse::parse_like_for`, the one reader of a like button.
+    player_overlays: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +191,9 @@ struct RawTab {
 #[derive(Deserialize)]
 struct RawTabRenderer {
     content: Option<RawTabContent>,
+    /// Where the tab leads (the Lyrics tab: its page's browse id). Small, kept raw, and read
+    /// by `browse::lyrics_tab_in`, the one reader of a Lyrics tab.
+    endpoint: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +317,9 @@ struct RawBrowseNavigation {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawBrowseEndpoint {
+    /// Kept raw and checked by `browse::id_ok`: as a typed `String`, a non-string id would fail
+    /// the whole song, which only loses its album link.
+    browse_id: Option<serde_json::Value>,
     browse_endpoint_context_supported_configs: Option<RawBrowseConfigs>,
 }
 
@@ -295,6 +339,19 @@ const PAGE_ARTIST: &str = "MUSIC_PAGE_TYPE_ARTIST";
 const PAGE_ALBUM: &str = "MUSIC_PAGE_TYPE_ALBUM";
 
 impl RawBylineRun {
+    /// The linked page's browse id, when it is one (`browse::id_ok`, as for every browse id
+    /// the engine passes on); `None` for a run with no link, no id, or a malformed one.
+    fn browse_id(&self) -> Option<&str> {
+        self.navigation_endpoint
+            .as_ref()?
+            .browse_endpoint
+            .as_ref()?
+            .browse_id
+            .as_ref()?
+            .as_str()
+            .filter(|id| browse::id_ok(id))
+    }
+
     /// The linked page's type (`MUSIC_PAGE_TYPE_…`), when the run is a link.
     fn page_type(&self) -> Option<&str> {
         self.navigation_endpoint
@@ -311,30 +368,46 @@ impl RawBylineRun {
 }
 
 /// Parses a `next` answer: a first page or a continuation page.
-fn parse(answer: &[u8]) -> Result<NextPage, Error> {
+/// `video_id` is the song the request named, if any: the answer's like button is read for it.
+fn parse(answer: &[u8], video_id: Option<&str>) -> Result<NextPage, Error> {
     // Fixed text: serde_json's message can quote part of the answer.
     let raw: Raw = serde_json::from_slice(answer)
         .map_err(|_| Error::Internal("the next answer could not be read".into()))?;
 
+    let like = match (video_id, raw.player_overlays) {
+        (Some(id), Some(overlays)) => {
+            browse::parse_like_for(&json!({ "playerOverlays": overlays }), id)
+        }
+        _ => None,
+    };
+    let tabs = raw
+        .contents
+        .and_then(|c| c.single_column_music_watch_next_results_renderer)
+        .and_then(|w| w.tabbed_renderer)
+        .and_then(|t| t.watch_next_tabbed_results_renderer)
+        .map(|t| t.tabs)
+        .unwrap_or_default();
+    // Only for a song the request named, as with the like button: a playlist's answer is
+    // about whichever song YouTube picked.
+    let lyrics_tab = video_id.and_then(|_| {
+        browse::lyrics_tab_in(
+            tabs.iter()
+                .filter_map(|t| t.tab_renderer.as_ref()?.endpoint.as_ref()),
+        )
+    });
     // A continuation answer can also carry `contents` (the tab headers), so its own queue
     // is looked at first.
     let panel = raw
         .continuation_contents
         .and_then(|c| c.playlist_panel_continuation)
         .or_else(|| {
-            raw.contents?
-                .single_column_music_watch_next_results_renderer?
-                .tabbed_renderer?
-                .watch_next_tabbed_results_renderer?
-                .tabs
-                .into_iter()
-                .find_map(|t| {
-                    t.tab_renderer?
-                        .content?
-                        .music_queue_renderer?
-                        .content?
-                        .playlist_panel_renderer
-                })
+            tabs.into_iter().find_map(|t| {
+                t.tab_renderer?
+                    .content?
+                    .music_queue_renderer?
+                    .content?
+                    .playlist_panel_renderer
+            })
         });
     let Some(panel) = panel else {
         return Err(Error::Unavailable("YouTube sent no queue".into()));
@@ -364,6 +437,8 @@ fn parse(answer: &[u8]) -> Result<NextPage, Error> {
         items,
         continuation,
         playlist_id: panel.playlist_id,
+        like,
+        lyrics_tab,
     })
 }
 
@@ -378,12 +453,17 @@ fn song(v: RawVideo) -> Option<SongItem> {
     // The id ends up in a URL and a yt-dlp argument, where `&` or `/` would change what is
     // asked for; the control socket applies the same check to the ids it is given.
     let video_id = v.video_id.or(watch_id).filter(|id| is_video_id(id))?;
-    let (artists, album) = v.long_byline_text.map(byline).unwrap_or_default();
+    let Byline {
+        artists,
+        album,
+        album_id,
+    } = v.long_byline_text.map(byline).unwrap_or_default();
     Some(SongItem {
         video_id,
         title: v.title.map(RawText::text).unwrap_or_default(),
         artists,
         album,
+        album_id,
         thumbnail: v.thumbnail.and_then(widest_thumbnail),
         length_seconds: v.length_text.map(|t| parse_length(&t.text())).unwrap_or(0),
         playlist_id,
@@ -396,17 +476,28 @@ fn is_separator(text: &str) -> bool {
     matches!(text.trim(), "" | "•" | "&" | ",")
 }
 
+/// What a song's byline says.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Byline {
+    artists: Vec<String>,
+    album: Option<String>,
+    /// The album link's browse id, `""` without a valid one (ruling P15).
+    album_id: String,
+}
+
 /// The artists and the album from a byline such as `Artist & Artist • Album • 2024`.
 ///
 /// The artists are the names before the first `" • "` (linked or not: a featured artist
 /// often has no link, and a user upload's channel links to a channel page, not an artist),
-/// plus any artist link further on. The album is the run linked to an album page.
-fn byline(b: RawByline) -> (Vec<String>, Option<String>) {
-    let album = b
-        .runs
-        .iter()
-        .find(|r| r.page_type() == Some(PAGE_ALBUM))
-        .and_then(|r| r.text.clone());
+/// plus any artist link further on. The album is the run linked to an album page, and its
+/// browse id is that link's (a malformed id leaves the name, without the link).
+fn byline(b: RawByline) -> Byline {
+    let album_run = b.runs.iter().find(|r| r.page_type() == Some(PAGE_ALBUM));
+    let album = album_run.and_then(|r| r.text.clone());
+    let album_id = album_run
+        .and_then(RawBylineRun::browse_id)
+        .unwrap_or_default()
+        .to_string();
 
     let first_section = b
         .runs
@@ -431,7 +522,11 @@ fn byline(b: RawByline) -> (Vec<String>, Option<String>) {
             }
         }
     }
-    (artists, album)
+    Byline {
+        artists,
+        album,
+        album_id,
+    }
 }
 
 /// `"m:ss"` or `"h:mm:ss"` in seconds; 0 for anything else.
@@ -489,12 +584,33 @@ mod tests {
     }
 
     #[test]
+    fn queue_item_thumbnail_is_sent_in_its_checked_form() {
+        let v: RawVideo = serde_json::from_value(json!({
+            "videoId": "abcdefghijk",
+            "thumbnail": {"thumbnails": [
+                {"url": "//lh3.googleusercontent.com\\@evil.example/a\t=w120", "width": 120}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            song(v).unwrap().thumbnail.as_deref(),
+            Some("https://lh3.googleusercontent.com/@evil.example/a=w120")
+        );
+    }
+
+    #[test]
     fn repeated_artist_listed_once() {
         let b: RawByline = serde_json::from_value(json!({"runs": [
             {"text": "Same"}, {"text": " & "}, {"text": "Same - Topic"}, {"text": " • "},
             {"text": "2024"}
         ]}))
         .unwrap();
-        assert_eq!(byline(b), (vec!["Same".to_string()], None));
+        assert_eq!(
+            byline(b),
+            Byline {
+                artists: vec!["Same".to_string()],
+                ..Byline::default()
+            }
+        );
     }
 }

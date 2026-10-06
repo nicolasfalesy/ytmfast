@@ -1,0 +1,41 @@
+{
+ "header": {
+  "title": "",
+  "subtitle": "",
+  "thumb": "",
+  "play": null
+ },
+ "sections": [
+  {
+   "title": "",
+   "items": [
+    {
+     "title": "Text 3",
+     "subtitle": "Text 22 • Text 75 • Text 74",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "",
+     "setId": "",
+     "playlistId": "",
+     "browseId": "MPREb_fake000653",
+     "params": "",
+     "play": {
+      "watchEndpoint": {
+       "videoId": "fakeV000001",
+       "playlistId": "OLAK5uy_fake000002",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "duration": "",
+     "kind": "album"
+    }
+   ],
+   "cont": "",
+   "more": null
+  }
+ ],
+ "cont": ""
+}

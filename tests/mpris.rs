@@ -212,11 +212,14 @@ fn stopped() -> Status {
         video_id: None,
         meta: None,
         album: None,
+        album_id: String::new(),
         queue_id: None,
         position: 0.0,
         volume: 1.0,
+        muted: false,
         shuffle: false,
         repeat: Repeat::Off,
+        liked: None,
     }
 }
 
@@ -235,11 +238,14 @@ fn playing(id: &str, position: f64) -> Status {
         video_id: Some(id.into()),
         meta: Some(meta()),
         album: None,
+        album_id: String::new(),
         queue_id: None,
         position,
         volume: 1.0,
+        muted: false,
         shuffle: false,
         repeat: Repeat::Off,
+        liked: None,
     }
 }
 
@@ -353,6 +359,7 @@ async fn playpause_sends_toggle() {
             video_id: None,
             playlist_id: None,
             index: None,
+            params: None,
             start_seconds: 0.0
         }
     ));
@@ -971,6 +978,12 @@ impl Resolver for Hang {
 #[async_trait]
 impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
+    }
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
         std::future::pending().await
     }
 }

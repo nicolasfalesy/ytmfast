@@ -10,10 +10,10 @@
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use url::Url;
 
+use crate::browse::{Endpoint, LikeStatus, id_ok, token_ok};
 use crate::engine::{EngineEvent, PlayState, QueueView, Status};
-use crate::innertube::SongItem;
+use crate::innertube::{MoreKind, SongItem, check_query};
 use crate::queue::{AddAt, QueueItem, Repeat};
 use crate::state::{MAX_ARTISTS, MAX_TEXT, is_playlist_id};
 use crate::streams::is_video_id;
@@ -27,8 +27,9 @@ pub const MAX_LINE: usize = 1024 * 1024;
 /// add can't push a whole saved queue out.
 pub const MAX_ADD: usize = 500;
 
-/// The error code for a request the engine can't take as written. Protocol only: it is
-/// never an `Error` (see the ledger's pre-flight scan).
+/// The error code for a request the engine can't take as written. The socket's own checks
+/// answer with it directly; since step 3 a request the browsing calls refuse before sending
+/// (`Error::BadRequest`, a bad id, token or search) carries the same code.
 pub const BAD_REQUEST: &str = "bad_request";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +42,31 @@ pub enum Request {
         playlist_id: Option<String>,
         index: Option<usize>,
         start_seconds: f64,
+    },
+    /// `play {endpoint}`: a row's (or a page header's) play endpoint, sent back as the row
+    /// gave it. Cleaned on the way in (see `parse_endpoint`); the engine turns it into a play
+    /// (`EngineCmd::play_endpoint`).
+    PlayEndpoint(Endpoint),
+    /// The browsing commands. Answered from a task of their own, to the asking client only
+    /// (`control::answer`); nothing is broadcast and the engine is not involved, except for
+    /// `PlayPage`'s play.
+    Browse {
+        browse_id: String,
+        params: Option<String>,
+    },
+    /// `query` is trimmed and checked (`innertube::check_query`).
+    Search {
+        query: String,
+        params: Option<String>,
+    },
+    More {
+        kind: MoreKind,
+        token: String,
+    },
+    /// Browses the page, then plays its header's button or else its first playable row.
+    PlayPage {
+        browse_id: String,
+        params: Option<String>,
     },
     Pause,
     Toggle,
@@ -74,6 +100,22 @@ pub enum Request {
     },
     Repeat {
         mode: Repeat,
+    },
+    /// Sets a song's like status: `video_id`'s, else the song playing (`EngineCmd::Like`).
+    /// Answered once YouTube took it, from a task of its own like the browsing commands, to
+    /// the asking client only.
+    Like {
+        status: LikeStatus,
+        video_id: Option<String>,
+    },
+    /// Silences the output, keeping the volume for unmuting (`EngineCmd::Mute`).
+    Mute {
+        on: bool,
+    },
+    /// A song's plain lyrics (`control::lyrics`): answered like a browsing command, to the
+    /// asking client only.
+    Lyrics {
+        video_id: String,
     },
     Quit,
 }
@@ -109,6 +151,23 @@ impl Request {
                 args.insert("startSeconds".into(), json!(start_seconds));
                 ("play", Some(Value::Object(args)))
             }
+            Request::PlayEndpoint(endpoint) => ("play", Some(json!({ "endpoint": endpoint }))),
+            Request::Browse { browse_id, params } => {
+                ("browse", Some(page_args(browse_id, params.as_deref())))
+            }
+            Request::Search { query, params } => {
+                let mut args = json!({ "query": query });
+                if let Some(p) = params {
+                    args["params"] = json!(p);
+                }
+                ("search", Some(args))
+            }
+            Request::More { kind, token } => {
+                ("more", Some(json!({ "kind": kind, "token": token })))
+            }
+            Request::PlayPage { browse_id, params } => {
+                ("playPage", Some(page_args(browse_id, params.as_deref())))
+            }
             Request::Pause => ("pause", None),
             Request::Toggle => ("toggle", None),
             Request::Seek { seconds } => ("seek", Some(json!({ "seconds": seconds }))),
@@ -142,6 +201,15 @@ impl Request {
             }
             Request::Shuffle { on } => ("shuffle", Some(json!({ "on": on }))),
             Request::Repeat { mode } => ("repeat", Some(json!({ "mode": repeat_name(*mode) }))),
+            Request::Like { status, video_id } => {
+                let mut args = json!({ "status": status });
+                if let Some(v) = video_id {
+                    args["videoId"] = json!(v);
+                }
+                ("like", Some(args))
+            }
+            Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
+            Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -152,7 +220,31 @@ impl Request {
     }
 }
 
+/// `browse` and `playPage`'s arguments.
+fn page_args(browse_id: &str, params: Option<&str>) -> Value {
+    let mut args = json!({ "browseId": browse_id });
+    if let Some(p) = params {
+        args["params"] = json!(p);
+    }
+    args
+}
+
 const VIDEO_ID_RULE: &str = "videoId must be 11 characters of A-Z, a-z, 0-9, _ and -";
+const PLAYLIST_ID_RULE: &str = "playlistId must be 1 to 256 characters of A-Z, a-z, 0-9, _ and -";
+const BROWSE_ID_RULE: &str = "browseId must be 2 to 128 characters of A-Z, a-z, 0-9, _ and -";
+const PARAMS_RULE: &str =
+    "params must be up to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
+const TOKEN_RULE: &str = "token must be 1 to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
+const LIKE_STATUS_RULE: &str = "status must be \"like\", \"dislike\" or \"none\"";
+const QUERY_RULE: &str =
+    "query must be text of 1 to 200 characters with no control or invisible characters";
+const ENDPOINT_RULE: &str = "endpoint must be a row's play: {\"watchEndpoint\": {videoId, playlistId, index, params}} or {\"watchPlaylistEndpoint\": {playlistId, params}}";
+/// An endpoint's ids follow the browse rule (`browse::id_ok`, as rows are cleaned with), not
+/// the plain `play`'s 1 to 256: an endpoint only ever comes from a row.
+const ENDPOINT_PLAYLIST_ID_RULE: &str =
+    "the endpoint's playlistId must be 2 to 128 characters of A-Z, a-z, 0-9, _ and -";
+const ENDPOINT_INDEX_RULE: &str =
+    "the endpoint's index must be a whole number from 0 to 4294967295";
 
 /// Reads one request line (without its newline).
 pub fn parse_request(text: &[u8]) -> Result<(u64, Request), BadRequest> {
@@ -201,6 +293,47 @@ fn index_of(v: &Value) -> Option<usize> {
 fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'static str> {
     Ok(match cmd {
         "status" => Request::Status,
+        "play" if field(args, "endpoint").is_some() => {
+            // One way to say what to play, not two: an endpoint already names its song and
+            // list, and its play starts at the first second.
+            if ["videoId", "playlistId", "index", "startSeconds"]
+                .iter()
+                .any(|k| field(args, k).is_some())
+            {
+                return Err(
+                    "endpoint can't be mixed with videoId, playlistId, index or startSeconds",
+                );
+            }
+            Request::PlayEndpoint(parse_endpoint(&args["endpoint"])?)
+        }
+        "browse" => Request::Browse {
+            browse_id: browse_id(args)?,
+            params: params(args)?,
+        },
+        "playPage" => Request::PlayPage {
+            browse_id: browse_id(args)?,
+            params: params(args)?,
+        },
+        // Checked here with the request's own rule, not left to the request: a bad search
+        // must not first load the session, which can mean a keyring prompt.
+        "search" => Request::Search {
+            query: match field(args, "query") {
+                Some(Value::String(q)) => check_query(q).map_err(|_| QUERY_RULE)?.to_owned(),
+                _ => return Err(QUERY_RULE),
+            },
+            params: params(args)?,
+        },
+        "more" => Request::More {
+            kind: match field(args, "kind").and_then(Value::as_str) {
+                Some("browse") => MoreKind::Browse,
+                Some("search") => MoreKind::Search,
+                _ => return Err("kind must be \"browse\" or \"search\""),
+            },
+            token: match field(args, "token") {
+                Some(Value::String(t)) if token_ok(t) => t.clone(),
+                _ => return Err(TOKEN_RULE),
+            },
+        },
         "play" => {
             let video_id = match field(args, "videoId") {
                 None => None,
@@ -210,9 +343,7 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
             let playlist_id = match field(args, "playlistId") {
                 None => None,
                 Some(Value::String(s)) if is_playlist_id(s) => Some(s.clone()),
-                Some(_) => {
-                    return Err("playlistId must be 1 to 256 characters of A-Z, a-z, 0-9, _ and -");
-                }
+                Some(_) => return Err(PLAYLIST_ID_RULE),
             };
             let index = match field(args, "index") {
                 None => None,
@@ -282,9 +413,99 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 _ => return Err("mode must be \"off\", \"all\" or \"one\""),
             },
         },
+        "like" => Request::Like {
+            status: match field(args, "status").and_then(Value::as_str) {
+                Some("like") => LikeStatus::Like,
+                Some("dislike") => LikeStatus::Dislike,
+                Some("none") => LikeStatus::Indifferent,
+                _ => return Err(LIKE_STATUS_RULE),
+            },
+            video_id: match field(args, "videoId") {
+                None => None,
+                Some(Value::String(s)) if is_video_id(s) => Some(s.clone()),
+                Some(_) => return Err(VIDEO_ID_RULE),
+            },
+        },
+        "mute" => Request::Mute {
+            on: args
+                .get("on")
+                .and_then(Value::as_bool)
+                .ok_or("on must be true or false")?,
+        },
+        "lyrics" => Request::Lyrics {
+            video_id: match field(args, "videoId") {
+                Some(Value::String(s)) if is_video_id(s) => s.clone(),
+                _ => return Err(VIDEO_ID_RULE),
+            },
+        },
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
+}
+
+/// `browse` and `playPage`'s page.
+fn browse_id(args: &Map<String, Value>) -> Result<String, &'static str> {
+    match field(args, "browseId") {
+        Some(Value::String(s)) if id_ok(s) => Ok(s.clone()),
+        _ => Err(BROWSE_ID_RULE),
+    }
+}
+
+/// An optional `params`. `""` is none: rows and "more" links carry `""` for "no params" (the
+/// `Page.js` shapes never use null), and that is how a client sends one back.
+fn params(args: &Map<String, Value>) -> Result<Option<String>, &'static str> {
+    match field(args, "params") {
+        None => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) if token_ok(s) => Ok(Some(s.clone())),
+        Some(_) => Err(PARAMS_RULE),
+    }
+}
+
+/// A play endpoint a client sends back (Review Focus 3). Cleaning it (`Endpoint`) keeps only
+/// the fields that play something: unknown keys, YouTube's extras (`playerParams`, a start
+/// time, logging blocks) are dropped. But a field that cleaning drops for being malformed (a
+/// bad id, params of the wrong charset, an index past u32) is refused here instead: right for
+/// YouTube's own answers, a silent drop would turn a client's bad `videoId` into "play the
+/// whole list from the top". An empty string counts as absent, as in a row.
+fn parse_endpoint(v: &Value) -> Result<Endpoint, &'static str> {
+    if !v.is_object() {
+        return Err(ENDPOINT_RULE);
+    }
+    // One endpoint, one key. `Endpoint::from_endpoint` would take the `watchEndpoint` and drop
+    // the other, so "this song" and "this list from the top" sent together would quietly be
+    // read as the one the client may not have meant. A `null` one is absent, as below.
+    if !v["watchEndpoint"].is_null() && !v["watchPlaylistEndpoint"].is_null() {
+        return Err(ENDPOINT_RULE);
+    }
+    let endpoint = Endpoint::from_endpoint(v).ok_or(ENDPOINT_RULE)?;
+    let given = |raw: &Value, key: &str| {
+        raw.get(key)
+            .is_some_and(|x| !x.is_null() && x.as_str() != Some(""))
+    };
+    match &endpoint {
+        Endpoint::Watch(w) => {
+            let raw = &v["watchEndpoint"];
+            if given(raw, "videoId") && w.video_id.is_none() {
+                return Err(VIDEO_ID_RULE);
+            }
+            if given(raw, "playlistId") && w.playlist_id.is_none() {
+                return Err(ENDPOINT_PLAYLIST_ID_RULE);
+            }
+            if given(raw, "index") && w.index.is_none() {
+                return Err(ENDPOINT_INDEX_RULE);
+            }
+            if given(raw, "params") && w.params.is_none() {
+                return Err(PARAMS_RULE);
+            }
+        }
+        Endpoint::WatchPlaylist(w) => {
+            if given(&v["watchPlaylistEndpoint"], "params") && w.params.is_none() {
+                return Err(PARAMS_RULE);
+            }
+        }
+    }
+    Ok(endpoint)
 }
 
 /// `queue.add`: `songs` (objects with details) or `videoIds` (bare ids, whose details the
@@ -364,10 +585,12 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
     };
     let thumbnail = match field(song, "thumbnail") {
         None => None,
+        // Kept in its parsed form, the link that was checked (see `net::allowed_link`); the cap is
+        // checked on both, as parsing can lengthen a link (percent-escapes).
         Some(Value::String(s)) => Some(s)
             .filter(|s| s.len() <= MAX_TEXT)
-            .filter(|s| Url::parse(s).is_ok_and(|u| crate::net::allowed_host(&u)))
-            .cloned(),
+            .and_then(|s| crate::net::allowed_link(s))
+            .filter(|s| s.len() <= MAX_TEXT),
         Some(_) => return Err("thumbnail must be a link"),
     };
     let length_seconds = match field(song, "lengthSeconds") {
@@ -382,6 +605,7 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         title,
         artists,
         album,
+        album_id: String::new(),
         thumbnail,
         length_seconds,
         playlist_id: None,
@@ -391,6 +615,22 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
 /// `{"id", "ok": true, "data"}`.
 pub fn ok_reply(id: u64, data: Value) -> String {
     line(json!({ "id": id, "ok": true, "data": data }))
+}
+
+/// `{"id", "ok": true, "data"}` with `data` serialized straight to text: a browsing answer (a
+/// page of up to 1,000 rows) never becomes a `Value` tree first, which would copy every string
+/// once more. The same keys, in the same order, as `ok_reply`.
+pub fn data_reply<T: Serialize>(id: u64, data: &T) -> String {
+    #[derive(Serialize)]
+    struct Reply<'a, T> {
+        id: u64,
+        ok: bool,
+        data: &'a T,
+    }
+    // The browse shapes are plain strings, numbers, lists and options: serializing can't fail.
+    let mut s = serde_json::to_string(&Reply { id, ok: true, data }).expect("a reply serializes");
+    s.push('\n');
+    s
 }
 
 /// `{"id", "ok": false, "error": {"code", "message"}}`; the id is null when the request
@@ -462,11 +702,17 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
         json!(meta.and_then(|m| m.thumbnail.as_ref())),
     );
     m.insert("position".into(), json!(seconds(status.position)));
+    // While muted, the volume unmuting goes back to: a slider keeps its place.
     m.insert("volume".into(), volume_to_percent(status.volume));
+    m.insert("muted".into(), json!(status.muted));
     m.insert("album".into(), json!(status.album));
+    // A string, "" when there is none (never null), as browse ids are in the browsing shapes.
+    m.insert("albumId".into(), json!(status.album_id));
     m.insert("queueId".into(), json!(status.queue_id));
     m.insert("shuffle".into(), json!(status.shuffle));
     m.insert("repeat".into(), json!(repeat_name(status.repeat)));
+    // "like", "dislike", "none", or null until known.
+    m.insert("liked".into(), json!(status.liked));
     m
 }
 
@@ -482,6 +728,8 @@ struct WireItem<'a> {
     title: Option<&'a str>,
     artists: &'a [String],
     album: Option<&'a str>,
+    /// `""` when the song has none, as in a state.
+    album_id: &'a str,
     thumbnail: Option<&'a str>,
     /// Null when unknown (0), as in a state.
     length_seconds: Option<u32>,
@@ -517,6 +765,7 @@ impl<'a> WireQueue<'a> {
                     title: Some(i.song.title.as_str()).filter(|t| !t.is_empty()),
                     artists: &i.song.artists,
                     album: i.song.album.as_deref(),
+                    album_id: &i.song.album_id,
                     thumbnail: i.song.thumbnail.as_deref(),
                     length_seconds: Some(i.song.length_seconds).filter(|s| *s > 0),
                 })
@@ -605,6 +854,7 @@ mod tests {
             title: "Song".into(),
             artists: vec!["A".into(), "B".into()],
             album: Some("Album".into()),
+            album_id: String::new(),
             thumbnail: Some("https://lh3.googleusercontent.com/x=w544-h544".into()),
             length_seconds: 213,
             playlist_id: None,
@@ -640,6 +890,42 @@ mod tests {
                 index: Some(3),
                 start_seconds: 0.0,
             },
+            Request::PlayEndpoint(Endpoint::Watch(crate::browse::WatchEndpoint {
+                video_id: Some("dQw4w9WgXcQ".into()),
+                playlist_id: Some("PLfake".into()),
+                index: Some(3),
+                params: Some("wAEB+/=".into()),
+            })),
+            Request::PlayEndpoint(Endpoint::WatchPlaylist(
+                crate::browse::WatchPlaylistEndpoint {
+                    playlist_id: "RDAOfake".into(),
+                    params: None,
+                },
+            )),
+            Request::Browse {
+                browse_id: "FEmusic_home".into(),
+                params: None,
+            },
+            Request::Browse {
+                browse_id: "UCfake".into(),
+                params: Some("ggMIegYIARoCAQI%3D".into()),
+            },
+            Request::Search {
+                query: "a song".into(),
+                params: Some("EgWKAQIIAQ%3D%3D".into()),
+            },
+            Request::More {
+                kind: MoreKind::Browse,
+                token: "fake+token/==".into(),
+            },
+            Request::More {
+                kind: MoreKind::Search,
+                token: "faketoken".into(),
+            },
+            Request::PlayPage {
+                browse_id: "UCfake".into(),
+                params: None,
+            },
             Request::Pause,
             Request::Toggle,
             Request::Seek { seconds: 42.5 },
@@ -663,6 +949,23 @@ mod tests {
             Request::Repeat { mode: Repeat::Off },
             Request::Repeat { mode: Repeat::All },
             Request::Repeat { mode: Repeat::One },
+            Request::Like {
+                status: LikeStatus::Like,
+                video_id: None,
+            },
+            Request::Like {
+                status: LikeStatus::Dislike,
+                video_id: Some("dQw4w9WgXcQ".into()),
+            },
+            Request::Like {
+                status: LikeStatus::Indifferent,
+                video_id: None,
+            },
+            Request::Mute { on: true },
+            Request::Mute { on: false },
+            Request::Lyrics {
+                video_id: "dQw4w9WgXcQ".into(),
+            },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {
@@ -732,6 +1035,78 @@ mod tests {
     }
 
     #[test]
+    fn like_and_mute_parse_from_the_wire() {
+        assert_eq!(
+            parse(r#"{"id":1,"cmd":"like","args":{"status":"like"}}"#),
+            Ok((
+                1,
+                Request::Like {
+                    status: LikeStatus::Like,
+                    video_id: None
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":2,"cmd":"like","args":{"status":"none","videoId":"dQw4w9WgXcQ"}}"#),
+            Ok((
+                2,
+                Request::Like {
+                    status: LikeStatus::Indifferent,
+                    video_id: Some("dQw4w9WgXcQ".into())
+                }
+            ))
+        );
+        // A null videoId is none: the song playing.
+        assert_eq!(
+            parse(r#"{"id":3,"cmd":"like","args":{"status":"dislike","videoId":null}}"#),
+            Ok((
+                3,
+                Request::Like {
+                    status: LikeStatus::Dislike,
+                    video_id: None
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":4,"cmd":"mute","args":{"on":true}}"#),
+            Ok((4, Request::Mute { on: true }))
+        );
+        for (line, message) in [
+            (r#"{"id":5,"cmd":"like"}"#, LIKE_STATUS_RULE),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"LIKE"}}"#,
+                LIKE_STATUS_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"indifferent"}}"#,
+                LIKE_STATUS_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"like","videoId":"../etc"}}"#,
+                VIDEO_ID_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"like","videoId":5}}"#,
+                VIDEO_ID_RULE,
+            ),
+            (r#"{"id":5,"cmd":"mute"}"#, "on must be true or false"),
+            (
+                r#"{"id":5,"cmd":"mute","args":{"on":"yes"}}"#,
+                "on must be true or false",
+            ),
+        ] {
+            assert_eq!(
+                bad(line),
+                BadRequest {
+                    id: Some(5),
+                    message: message.into()
+                },
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn queue_requests_parse_from_the_wire() {
         assert_eq!(
             parse(
@@ -788,6 +1163,28 @@ mod tests {
             match parse(&line) {
                 Ok((4, Request::QueueAdd { songs, .. })) => {
                     assert_eq!(songs[0].thumbnail, None, "{thumb}")
+                }
+                other => panic!("{thumb}: {other:?}"),
+            }
+        }
+        // A kept thumbnail is stored in its parsed form, the link that was checked: QUrl would
+        // read the backslash one's host as evil.example, and the newline is dropped.
+        for (thumb, want) in [
+            (
+                "https://i.ytimg.com\\@evil.example/x.jpg",
+                "https://i.ytimg.com/@evil.example/x.jpg",
+            ),
+            (
+                "https://i.ytimg.com/vi/\nx.jpg",
+                "https://i.ytimg.com/vi/x.jpg",
+            ),
+        ] {
+            let line = json!({"id": 4, "cmd": "queue.add",
+                "args": {"songs": [{"videoId": "dQw4w9WgXcQ", "thumbnail": thumb}]}})
+            .to_string();
+            match parse(&line) {
+                Ok((4, Request::QueueAdd { songs, .. })) => {
+                    assert_eq!(songs[0].thumbnail.as_deref(), Some(want), "{thumb}")
                 }
                 other => panic!("{thumb}: {other:?}"),
             }
@@ -926,8 +1323,17 @@ mod tests {
 
     #[test]
     fn queue_event_and_reply_shape() {
-        let items: Arc<[QueueItem]> =
-            vec![item(1, song("dQw4w9WgXcQ")), item(2, bare("AAAAAAAAAAA"))].into();
+        let items: Arc<[QueueItem]> = vec![
+            item(
+                1,
+                SongItem {
+                    album_id: "MPREb_abc".into(),
+                    ..song("dQw4w9WgXcQ")
+                },
+            ),
+            item(2, bare("AAAAAAAAAAA")),
+        ]
+        .into();
         let event = EngineEvent::Queue {
             items: items.clone(),
             current_id: Some(2),
@@ -940,12 +1346,12 @@ mod tests {
             json!({"event": "queue", "currentId": 2, "shuffle": true, "repeat": "all",
                    "items": [
                        {"queueId": 1, "videoId": "dQw4w9WgXcQ", "title": "Song",
-                        "artists": ["A", "B"], "album": "Album",
+                        "artists": ["A", "B"], "album": "Album", "albumId": "MPREb_abc",
                         "thumbnail": "https://lh3.googleusercontent.com/x=w544-h544",
                         "lengthSeconds": 213},
-                       // A bare id: details are null until the song plays.
+                       // A bare id: details are null until the song plays; no album id is "".
                        {"queueId": 2, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                        "album": null, "thumbnail": null, "lengthSeconds": null}]})
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]})
         );
         // `queue.get`'s data is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -988,6 +1394,7 @@ mod tests {
                         title: "A Song Title Of Typical Length (Remastered)".into(),
                         artists: vec!["First Artist".into(), "Second Artist".into()],
                         album: Some("An Album Name Of Typical Length".into()),
+                        album_id: "MPREb_abcdefghijk".into(),
                         thumbnail: Some(format!(
                             "https://lh3.googleusercontent.com/{}=w544-h544-l90-rj",
                             "x".repeat(110)
@@ -1019,6 +1426,12 @@ mod tests {
     fn replies_have_the_spec_shape() {
         let v: Value = serde_json::from_str(&ok_reply(7, json!({}))).unwrap();
         assert_eq!(v, json!({"id": 7, "ok": true, "data": {}}));
+        // A browsing answer: the same keys, in the same order, as one line.
+        let line = data_reply(8, &crate::browse::MorePage::default());
+        assert_eq!(
+            line,
+            "{\"id\":8,\"ok\":true,\"data\":{\"items\":[],\"sections\":[],\"cont\":\"\"}}\n"
+        );
         let line = error_reply(None, BAD_REQUEST, "not valid JSON");
         assert!(line.ends_with('\n'));
         let v: Value = serde_json::from_str(&line).unwrap();
@@ -1050,11 +1463,14 @@ mod tests {
                 thumbnail: Some("https://i.ytimg.com/x.jpg".into()),
             }),
             album: Some("Album".into()),
+            album_id: "MPREb_abc".into(),
             queue_id: Some(7),
             position: 1.234_567,
             volume: 0.8,
+            muted: true,
             shuffle: true,
             repeat: Repeat::All,
+            liked: Some(LikeStatus::Dislike),
         };
         let v: Value =
             serde_json::from_str(&event_line(&EngineEvent::State(status.clone()))).unwrap();
@@ -1063,7 +1479,9 @@ mod tests {
             json!({"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ",
                    "title": "Song", "artist": "Artist", "lengthSeconds": 213,
                    "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80,
-                   "album": "Album", "queueId": 7, "shuffle": true, "repeat": "all"})
+                   "muted": true, "album": "Album", "albumId": "MPREb_abc", "queueId": 7,
+                   "shuffle": true,
+                   "repeat": "all", "liked": "dislike"})
         );
         // The status reply is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1075,18 +1493,35 @@ mod tests {
             video_id: None,
             meta: None,
             album: None,
+            album_id: String::new(),
             queue_id: None,
             position: 0.0,
             volume: 1.0,
+            muted: false,
             shuffle: false,
             repeat: Repeat::Off,
+            liked: None,
         };
         assert_eq!(
             Value::Object(status_data(&empty)),
             json!({"state": "stopped", "videoId": null, "title": null, "artist": null,
                    "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100,
-                   "album": null, "queueId": null, "shuffle": false, "repeat": "off"})
+                   "muted": false, "album": null, "albumId": "", "queueId": null,
+                   "shuffle": false,
+                   "repeat": "off", "liked": null})
         );
+        // Each like status by its socket name.
+        for (liked, name) in [
+            (LikeStatus::Like, "like"),
+            (LikeStatus::Dislike, "dislike"),
+            (LikeStatus::Indifferent, "none"),
+        ] {
+            let s = Status {
+                liked: Some(liked),
+                ..empty.clone()
+            };
+            assert_eq!(status_data(&s)["liked"], name);
+        }
 
         let v: Value = serde_json::from_str(&event_line(&EngineEvent::Position {
             seconds: 42.5,

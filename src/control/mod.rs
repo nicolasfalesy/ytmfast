@@ -8,14 +8,20 @@
 //!   writer task fed through a bounded queue. A client whose queue fills (it stopped
 //!   reading) is dropped: nothing here ever waits on a client, so a stuck widget can't hold
 //!   up the engine or the other widgets.
+//! - A browsing request (`browse`, `search`, `more`, `playPage`, `lyrics`), and a `like`, runs in a task
+//!   of the client's own, so a request that waits on YouTube never holds up that client's
+//!   other requests, and its answer goes back to that client alone. At most `MAX_BROWSING` at
+//!   once per client.
 //!
 //! The listening socket comes from systemd (socket activation) when it passed one, else the
 //! daemon binds `$XDG_RUNTIME_DIR/ytmfast/socket` itself.
 
 pub mod idle;
+pub mod lyrics;
 pub mod protocol;
 pub mod stop;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::RawFd;
@@ -30,12 +36,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{self, JoinSet};
 use tokio::time::{Instant, Sleep};
 
+use crate::browse::{self, Browser};
 use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
+use crate::error::Error;
 use crate::mpris;
 use idle::IdlePolicy;
+use lyrics::{EngineTabs, LyricsCache};
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
 
 /// The socket's name in the runtime folder.
@@ -65,6 +74,16 @@ const READ_CHUNK: usize = 64 * 1024;
 /// the hub doesn't spin on the same error.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Browsing requests one client may have waiting on YouTube at once; more are refused with
+/// `bad_request` "busy". A widget opens a page, maybe its next page and a search: 4 covers
+/// that, and bounds how many answers (each up to a few hundred KB while being built) one
+/// client can make the daemon hold.
+const MAX_BROWSING: usize = 4;
+
+/// `playPage`'s answer for a page with nothing to play: `Page.js`'s words, which the widget
+/// shows as they are.
+const NOTHING_TO_PLAY: &str = "Nothing here can be played.";
+
 /// systemd's first passed descriptor (`SD_LISTEN_FDS_START`).
 const LISTEN_FDS_START: RawFd = 3;
 
@@ -75,7 +94,7 @@ pub fn peer_allowed(peer_uid: u32, my_uid: u32) -> bool {
 }
 
 /// How the daemon behaves.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Options {
     pub idle: IdlePolicy,
     /// `/sys/class/power_supply` in production; tests point it at a folder they fill.
@@ -84,6 +103,21 @@ pub struct Options {
     /// never registers a player on the user's real session bus by accident; the daemon
     /// asks for the session bus.
     pub mpris: Option<mpris::Bus>,
+    /// Serves the browsing commands. `None` answers them `unavailable` (tests that don't
+    /// browse); the daemon passes the lazily loaded session, so a browse shares the session
+    /// (and its one keyring read) with the resolver and the queue source.
+    pub browser: Option<Arc<dyn Browser>>,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("idle", &self.idle)
+            .field("power_supply_root", &self.power_supply_root)
+            .field("mpris", &self.mpris)
+            .field("browser", &self.browser.is_some())
+            .finish()
+    }
 }
 
 impl Default for Options {
@@ -92,6 +126,7 @@ impl Default for Options {
             idle: IdlePolicy::default(),
             power_supply_root: PathBuf::from(idle::POWER_SUPPLY_ROOT),
             mpris: None,
+            browser: None,
         }
     }
 }
@@ -211,6 +246,9 @@ struct Shared {
     events: broadcast::Sender<EngineEvent>,
     /// Activity and quit, shared with MPRIS.
     hub: Hub,
+    browser: Option<Arc<dyn Browser>>,
+    /// Lyrics answers kept for every client, and the engine's Lyrics tabs.
+    lyrics: LyricsCache,
 }
 
 /// Serves the socket until `quit`, idle, or the engine stopping. Leaves the engine running.
@@ -233,7 +271,13 @@ async fn serve_with(
 ) -> Exit {
     let my_uid = current_uid();
     let mut monitor = events.subscribe();
-    let shared = Arc::new(Shared { cmds, events, hub });
+    let shared = Arc::new(Shared {
+        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone()))),
+        cmds,
+        events,
+        hub,
+        browser: options.browser,
+    });
     // Dropping the set when this returns aborts every client task.
     let mut clients = JoinSet::new();
     let policy = options.idle;
@@ -366,20 +410,41 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     let mut events = shared.events.subscribe();
     let mut lines = LineReader::new(read_half);
     let mut quit = false;
+    // The client's browsing requests on their way, and which request id each task answers
+    // (for a task that panics). Dropping the set when the client goes aborts them.
+    let mut browsing: JoinSet<String> = JoinSet::new();
+    let mut asking: HashMap<task::Id, u64> = HashMap::new();
+    // False once the client closed its sending side: its browsing answers still go out.
+    let mut reading = true;
 
     let close = loop {
         tokio::select! {
-            line = lines.next() => match line {
+            line = lines.next(), if reading => match line {
                 Ok(Line::Text(text)) => {
                     if text.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
-                    let (reply, is_quit) = handle(&shared, &text).await;
+                    let reply = match handle(&shared, &text).await {
+                        Handled::Reply(reply) => reply,
+                        Handled::Quit(reply) => {
+                            quit = true;
+                            reply
+                        }
+                        Handled::Browse(id, request, epoch) => {
+                            if browsing.len() >= MAX_BROWSING {
+                                protocol::error_reply(Some(id), BAD_REQUEST, "busy")
+                            } else {
+                                let task =
+                                    browsing.spawn(answer(shared.clone(), id, request, epoch));
+                                asking.insert(task.id(), id);
+                                continue;
+                            }
+                        }
+                    };
                     if !push(&out, reply) {
                         break Close::Now;
                     }
-                    if is_quit {
-                        quit = true;
+                    if quit {
                         break Close::Flush;
                     }
                 }
@@ -387,9 +452,35 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                     let _ = push(&out, protocol::error_reply(None, BAD_REQUEST, "line too long"));
                     break Close::Flush;
                 }
-                // The client is done sending; what it asked for still goes out.
-                Ok(Line::Eof) => break Close::Flush,
+                // The client is done sending; what it asked for still goes out, browsing
+                // answers included.
+                Ok(Line::Eof) => {
+                    if browsing.is_empty() {
+                        break Close::Flush;
+                    }
+                    reading = false;
+                }
                 Err(_) => break Close::Now,
+            },
+            Some(done) = browsing.join_next_with_id(), if !browsing.is_empty() => {
+                let reply = match done {
+                    Ok((task, reply)) => {
+                        asking.remove(&task);
+                        reply
+                    }
+                    // A panic in a browsing task is a bug; the client still gets an answer.
+                    Err(e) => protocol::error_reply(
+                        asking.remove(&e.id()),
+                        "internal",
+                        "internal error: the request failed",
+                    ),
+                };
+                if !push(&out, reply) {
+                    break Close::Now;
+                }
+                if !reading && browsing.is_empty() {
+                    break Close::Flush;
+                }
             },
             event = events.recv() => {
                 // A big queue goes through the same bounded queue as everything else: a
@@ -463,35 +554,63 @@ fn push(out: &Outbox, line: String) -> bool {
     true
 }
 
-/// One request: its reply line, and whether it was `quit`.
-async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
+/// What a request comes to.
+enum Handled {
+    Reply(String),
+    /// `quit`'s reply; the client closes once it is out, then the daemon quits.
+    Quit(String),
+    /// A browsing request (or a `like`), answered from a task of its own (`answer`). For
+    /// `playPage`, the engine's play epoch when it came in (ruling P7).
+    Browse(u64, Request, Option<u64>),
+}
+
+/// One request.
+async fn handle(shared: &Shared, text: &[u8]) -> Handled {
     let (id, request) = match protocol::parse_request(text) {
         Ok(r) => r,
         Err(bad) => {
-            return (
-                protocol::error_reply(bad.id, BAD_REQUEST, &bad.message),
-                false,
-            );
+            return Handled::Reply(protocol::error_reply(bad.id, BAD_REQUEST, &bad.message));
         }
     };
+    // Browsing counts as activity too (ruling R21): a user looking through pages with
+    // nothing playing is not idle.
     shared.hub.touch();
     let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
     let cmd = match request {
         Request::Status => {
-            let reply = match query_status(&shared.cmds).await {
+            return Handled::Reply(match query_status(&shared.cmds).await {
                 Some(s) => protocol::ok_reply(id, Value::Object(protocol::status_data(&s))),
                 None => gone(),
-            };
-            return (reply, false);
+            });
         }
         Request::QueueGet => {
-            let reply = match query_queue(&shared.cmds).await {
+            return Handled::Reply(match query_queue(&shared.cmds).await {
                 Some(q) => protocol::ok_reply(id, protocol::queue_data(&q)),
                 None => gone(),
-            };
-            return (reply, false);
+            });
         }
-        Request::Quit => return (protocol::ok_reply(id, json!({})), true),
+        Request::Quit => return Handled::Quit(protocol::ok_reply(id, json!({}))),
+        // Read now, in this client's command order (through the engine's channel): any play
+        // the user makes after this, from anywhere, wins over the page's (ruling P7).
+        request @ Request::PlayPage { .. } => {
+            let (tx, rx) = oneshot::channel();
+            if shared.cmds.send(EngineCmd::PlayEpoch(tx)).await.is_err() {
+                return Handled::Reply(gone());
+            }
+            return match rx.await {
+                Ok(epoch) => Handled::Browse(id, request, Some(epoch)),
+                Err(_) => Handled::Reply(gone()),
+            };
+        }
+        // A like waits on YouTube (the engine sends it from a task of its own): answered like
+        // a browse, so this client's other requests go on meanwhile.
+        request @ (Request::Browse { .. }
+        | Request::Search { .. }
+        | Request::More { .. }
+        | Request::Lyrics { .. }
+        | Request::Like { .. }) => {
+            return Handled::Browse(id, request, None);
+        }
         Request::Play {
             video_id,
             playlist_id,
@@ -501,7 +620,19 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
             video_id,
             playlist_id,
             index,
+            params: None,
             start_seconds,
+        },
+        Request::PlayEndpoint(endpoint) => match EngineCmd::play_endpoint(endpoint) {
+            Some(cmd) => cmd,
+            // `parse_endpoint` never lets one through that plays nothing.
+            None => {
+                return Handled::Reply(protocol::error_reply(
+                    Some(id),
+                    BAD_REQUEST,
+                    "the endpoint plays nothing",
+                ));
+            }
         },
         Request::Pause => EngineCmd::Pause,
         Request::Toggle => EngineCmd::Toggle,
@@ -518,25 +649,149 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
                 .await
                 .is_err()
             {
-                return (gone(), false);
+                return Handled::Reply(gone());
             }
-            let reply = match ok.await {
+            return Handled::Reply(match ok.await {
                 Ok(true) => protocol::ok_reply(id, json!({})),
                 Ok(false) => protocol::error_reply(Some(id), BAD_REQUEST, "the queue is full"),
                 Err(_) => gone(),
-            };
-            return (reply, false);
+            });
         }
         Request::QueueRemove { id } => EngineCmd::QueueRemove(id),
         Request::QueueJump { id } => EngineCmd::QueueJump(id),
         Request::QueueMove { id, index } => EngineCmd::QueueMove { id, index },
         Request::Shuffle { on } => EngineCmd::Shuffle(on),
         Request::Repeat { mode } => EngineCmd::Repeat(mode),
+        Request::Mute { on } => EngineCmd::Mute(on),
     };
     // "ok" means the engine took the command; what came of it arrives as events.
-    match shared.cmds.send(cmd).await {
-        Ok(()) => (protocol::ok_reply(id, json!({})), false),
-        Err(_) => (gone(), false),
+    Handled::Reply(match shared.cmds.send(cmd).await {
+        Ok(()) => protocol::ok_reply(id, json!({})),
+        Err(_) => gone(),
+    })
+}
+
+/// A browsing request's reply line, for the client that asked. A failure is answered with its
+/// code and fixed text (`Error`'s `Display`, which never holds a value the client sent, a link
+/// or a token; ruling R6) and is never broadcast as an `error` event: it is this client's
+/// news alone, and a refused id (`bad_request`) is the client's own mistake. Nothing is logged
+/// here either: the request already logged its failure by endpoint and code.
+///
+/// `playPage`'s play is sent as `EngineCmd::PlayIfLatest` with the epoch read when it came in
+/// (`epoch`): when the user picked something else to play while the page loaded, the page's
+/// play is dropped and the reply says `{"superseded": true}` (ruling P7).
+async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u64>) -> String {
+    // Through the engine, which knows the song playing and keeps its like status.
+    if let Request::Like { status, video_id } = request {
+        return like(&shared.cmds, id, status, video_id).await;
+    }
+    let Some(browser) = shared.browser.clone() else {
+        return protocol::error_reply(Some(id), "unavailable", "browsing is not available");
+    };
+    let result =
+        match request {
+            Request::Browse { browse_id, params } => browser
+                .browse(&browse_id, params.as_deref())
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::Search { query, params } => browser
+                .search(&query, params.as_deref())
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::More { kind, token } => browser
+                .more(kind, &token)
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::Lyrics { video_id } => shared
+                .lyrics
+                .get(browser.as_ref(), &video_id)
+                .await
+                .map(|lyrics| match lyrics {
+                    Some(l) => protocol::data_reply(id, &l),
+                    None => protocol::ok_reply(id, json!({ "none": true })),
+                }),
+            Request::PlayPage { browse_id, params } => {
+                match browser.browse(&browse_id, params.as_deref()).await {
+                    Ok(page) => {
+                        let play = browse::page_play(&page)
+                            .cloned()
+                            .and_then(EngineCmd::play_endpoint);
+                        Ok(match play {
+                            Some(cmd) => play_if_latest(&shared.cmds, id, cmd, epoch).await,
+                            None => protocol::error_reply(Some(id), BAD_REQUEST, NOTHING_TO_PLAY),
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            // `handle` sends only the browsing requests here.
+            _ => Err(Error::Internal("not a browsing request".into())),
+        };
+    match result {
+        // Widgets read lines of at most `MAX_LINE`, as the socket does. The parsing caps
+        // (300 rows a section, 1,000 a continuation) keep real answers under it (a full
+        // continuation with long fields is about 550 KB; tests/control_browse.rs), so this
+        // only guards against a freak page.
+        Ok(line) if line.len() > MAX_LINE => protocol::error_reply(
+            Some(id),
+            "unavailable",
+            "unavailable: the page is too big to send",
+        ),
+        Ok(line) => line,
+        Err(e) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
+    }
+}
+
+/// A like's reply line: ok once YouTube took it. A failure is the asker's alone, with its code
+/// and fixed text, as for browsing; the engine never broadcasts it either.
+async fn like(
+    cmds: &mpsc::Sender<EngineCmd>,
+    id: u64,
+    status: browse::LikeStatus,
+    video_id: Option<String>,
+) -> String {
+    let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
+    let (reply, answer) = oneshot::channel();
+    let cmd = EngineCmd::Like {
+        video_id,
+        status,
+        reply,
+    };
+    if cmds.send(cmd).await.is_err() {
+        return gone();
+    }
+    match answer.await {
+        Ok(Ok(())) => protocol::ok_reply(id, json!({})),
+        Ok(Err(e)) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
+        Err(_) => gone(),
+    }
+}
+
+/// Sends a late play (`playPage`'s) unless a newer one came in since `epoch`; its reply line.
+async fn play_if_latest(
+    cmds: &mpsc::Sender<EngineCmd>,
+    id: u64,
+    play: EngineCmd,
+    epoch: Option<u64>,
+) -> String {
+    let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
+    // `handle` always reads one for a `playPage`.
+    let Some(epoch) = epoch else {
+        return gone();
+    };
+    let (played, rx) = oneshot::channel();
+    let cmd = EngineCmd::PlayIfLatest {
+        epoch,
+        play: Box::new(play),
+        played,
+    };
+    if cmds.send(cmd).await.is_err() {
+        return gone();
+    }
+    match rx.await {
+        Ok(true) => protocol::ok_reply(id, json!({})),
+        Ok(false) => protocol::ok_reply(id, json!({ "superseded": true })),
+        Err(_) => gone(),
     }
 }
 

@@ -281,11 +281,12 @@ fn backend() -> Result<Arc<LazySession>, String> {
             Arc::new(YtDlpCommand::new(runtime_dir.clone())),
             cache.clone(),
         ));
-        // One `Innertube` (so one session) for links, queues and play reports.
+        // One `Innertube` (so one session) for links, queues, play reports and browsing.
         lazy::Loaded {
             resolver: resolver.clone(),
-            queue: api,
+            queue: api.clone(),
             reports: resolver,
+            browser: api,
         }
     });
     Ok(Arc::new(LazySession::new(store, build)))
@@ -376,7 +377,7 @@ async fn serve(
     let (mut engine, cmds, events) = Engine::new(backend.clone(), backend.clone(), player);
     // Every song heard counts in the account's YouTube Music history, as with the official
     // player (its pings go through the same lazily loaded session).
-    engine.report_with(Reporter::new(backend));
+    engine.report_with(Reporter::new(backend.clone()));
     // The queue, song and second from before the restart (paused: resume never plays by
     // itself), and saving from now on. Without a state folder the engine still plays; it
     // just starts fresh each time.
@@ -394,8 +395,10 @@ async fn serve(
     }
     // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
     // session bus it logs one line and the socket carries on alone.
+    // The socket's browsing commands go through the same lazily loaded session.
     let options = control::Options {
         mpris: Some(ytmfast::mpris::Bus::Session),
+        browser: Some(backend),
         ..control::Options::default()
     };
     Ok(control::run(listener, engine, cmds, events, options, shutdown).await)

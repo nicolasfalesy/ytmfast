@@ -737,9 +737,9 @@ fn from_ytdlp(json: &[u8], video_id: &str) -> Result<Stream, Error> {
         .and_then(|digits| digits.parse().ok())
         .ok_or_else(|| Error::StreamFailed("yt-dlp gave no itag".into()))?;
     let mime = ytdlp_mime(info.ext.as_deref(), info.acodec.as_deref());
-    let thumbnail = info
-        .thumbnail
-        .filter(|t| Url::parse(t).is_ok_and(|u| net::allowed_host(&u)));
+    // The thumbnail reaches clients (status, MPRIS artUrl) when the song has none of its own:
+    // kept in its parsed form, the link that was checked (see `net::allowed_link`).
+    let thumbnail = info.thumbnail.and_then(|t| net::allowed_link(&t));
     Ok(Stream {
         video_id: video_id.to_string(),
         expires_unix: expires_unix(&url),
@@ -811,6 +811,31 @@ mod tests {
         let before = now_unix();
         assert!(expires_unix("https://h/v?x=1") >= before);
         assert_eq!(expires_unix("https://h/v?expire=100"), 0);
+    }
+
+    #[test]
+    fn ytdlp_thumbnail_is_sent_in_its_checked_form() {
+        let thumb = |t: &str| {
+            let json = serde_json::to_vec(&serde_json::json!({
+                "id": "abcdefghijk",
+                "url": "https://rr2---sn-test.googlevideo.com/videoplayback?expire=1",
+                "format_id": "251",
+                "thumbnail": t,
+            }))
+            .unwrap();
+            from_ytdlp(&json, "abcdefghijk").unwrap().meta.thumbnail
+        };
+        // QUrl would read the backslash one's host as evil.example; the newline is dropped.
+        assert_eq!(
+            thumb("https://i.ytimg.com\\@evil.example/a.jpg").as_deref(),
+            Some("https://i.ytimg.com/@evil.example/a.jpg")
+        );
+        assert_eq!(
+            thumb("https://i.ytimg.com/vi/\nx.jpg").as_deref(),
+            Some("https://i.ytimg.com/vi/x.jpg")
+        );
+        assert_eq!(thumb("https://evil.example/a.jpg"), None);
+        assert_eq!(thumb("http://i.ytimg.com/a.jpg"), None);
     }
 
     #[test]

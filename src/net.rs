@@ -51,6 +51,19 @@ pub fn allowed_host(url: &Url) -> bool {
     })
 }
 
+/// A link found in data (a thumbnail) that another program will load: its parsed form when that is
+/// https on an allowed host, else `None`.
+///
+/// Always the PARSED form, never the raw string, so the link sent is the link checked. The url crate
+/// (WHATWG) and other parsers read odd links differently: `https://i.ytimg.com\@evil.example/a.jpg`
+/// has the host `i.ytimg.com` here, but `evil.example` in Qt's QUrl (the bar widget's loader), and
+/// WHATWG drops tabs and newlines that the raw string would keep. The serialized form has `\` turned
+/// into `/` and those characters gone, so every reader sees the same host.
+pub fn allowed_link(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    allowed_host(&url).then(|| url.into())
+}
+
 /// Decides one redirect hop. Split out of the reqwest closure so it can be unit tested:
 /// reqwest's `Attempt` can't be built outside reqwest.
 fn redirect_allowed(next: &Url, hops_so_far: usize) -> bool {
@@ -122,6 +135,33 @@ mod tests {
 
     fn ok(s: &str) -> bool {
         allowed_host(&Url::parse(s).unwrap())
+    }
+
+    #[test]
+    fn allowed_link_sends_what_it_checked() {
+        // A backslash is a path separator to WHATWG but not to QUrl, which would read the host as
+        // evil.example; the parsed form has a plain slash, so both read i.ytimg.com.
+        assert_eq!(
+            allowed_link("https://i.ytimg.com\\@evil.example/a.jpg").as_deref(),
+            Some("https://i.ytimg.com/@evil.example/a.jpg")
+        );
+        // Tabs and newlines are dropped before the check; the link sent has none either.
+        assert_eq!(
+            allowed_link("https://i.ytimg.com/vi/a\n/b\tc.jpg").as_deref(),
+            Some("https://i.ytimg.com/vi/a/bc.jpg")
+        );
+        assert_eq!(
+            allowed_link("https://lh3.googleusercontent.com/x=w226").as_deref(),
+            Some("https://lh3.googleusercontent.com/x=w226")
+        );
+        for bad in [
+            "http://i.ytimg.com/a.jpg",
+            "https://evil.example\\@i.ytimg.com/a.jpg",
+            "https://i.ytimg.com.evil.example/a.jpg",
+            "not a url",
+        ] {
+            assert_eq!(allowed_link(bad), None, "{bad}");
+        }
     }
 
     #[test]
