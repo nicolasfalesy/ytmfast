@@ -183,11 +183,12 @@ async fn follow(
             Ok(EngineEvent::State(s)) => s,
             // Read on demand only: the spec says Position never comes as PropertiesChanged
             // (clients count from the last read or `Seeked`).
-            Ok(EngineEvent::Position { seconds }) => {
+            Ok(EngineEvent::Position { seconds, .. }) => {
                 lock(&state).position = seconds;
                 continue;
             }
-            Ok(EngineEvent::Error { .. }) => continue,
+            // The queue's MPRIS side (CanGoNext and the rest) arrives with Task 8.
+            Ok(EngineEvent::Error { .. } | EngineEvent::Queue { .. }) => continue,
             // Missed some events: ask for the whole state again (Task 8 carry).
             Err(RecvError::Lagged(_)) => match fresh_status(&mut events, &cmds).await {
                 Some(s) => s,
@@ -381,7 +382,12 @@ impl Player {
         let mut landed = None;
         loop {
             match probe.try_recv() {
-                Ok(EngineEvent::Position { seconds }) => landed = Some(seconds),
+                // Only the seek's own event: a tick that slipped in before it is not where
+                // the seek landed.
+                Ok(EngineEvent::Position {
+                    seconds,
+                    seeked: true,
+                }) => landed = Some(seconds),
                 Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
@@ -431,6 +437,8 @@ impl Player {
     async fn play(&self) -> fdo::Result<()> {
         self.send(EngineCmd::Play {
             video_id: None,
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         })
         .await

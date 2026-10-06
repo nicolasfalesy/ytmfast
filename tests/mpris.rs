@@ -20,9 +20,11 @@ use tokio::sync::{broadcast, mpsc};
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::control::{self, Exit, Hub, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, Status};
 use ytmfast::error::Error;
+use ytmfast::innertube::{NextPage, NextRequest};
 use ytmfast::mpris::{self, Bus, Mpris};
+use ytmfast::queue::Repeat;
 use ytmfast::streams::{Resolver, Stream, TrackMeta};
 use zbus::zvariant::{ObjectPath, OwnedValue};
 use zbus::{Connection, Proxy};
@@ -126,7 +128,10 @@ fn fake_engine(initial: Status) -> FakeEngine {
                 }
                 EngineCmd::Seek(seconds) => {
                     st.lock().unwrap().position = seconds;
-                    let _ = ev.send(EngineEvent::Position { seconds });
+                    let _ = ev.send(EngineEvent::Position {
+                        seconds,
+                        seeked: true,
+                    });
                     let _ = seen_tx.send(EngineCmd::Seek(seconds));
                 }
                 other => {
@@ -163,8 +168,12 @@ fn stopped() -> Status {
         state: PlayState::Stopped,
         video_id: None,
         meta: None,
+        album: None,
+        queue_id: None,
         position: 0.0,
         volume: 1.0,
+        shuffle: false,
+        repeat: Repeat::Off,
     }
 }
 
@@ -182,8 +191,12 @@ fn playing(id: &str, position: f64) -> Status {
         state: PlayState::Playing,
         video_id: Some(id.into()),
         meta: Some(meta()),
+        album: None,
+        queue_id: None,
         position,
         volume: 1.0,
+        shuffle: false,
+        repeat: Repeat::Off,
     }
 }
 
@@ -295,6 +308,8 @@ async fn playpause_sends_toggle() {
         r.engine.next().await,
         EngineCmd::Play {
             video_id: None,
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0
         }
     ));
@@ -443,7 +458,10 @@ async fn position_is_read_on_demand_without_change_signals() {
     let mut changes = props.receive_properties_changed().await.unwrap();
     r.engine
         .events
-        .send(EngineEvent::Position { seconds: 42.5 })
+        .send(EngineEvent::Position {
+            seconds: 42.5,
+            seeked: false,
+        })
         .unwrap();
     let player = &r.player;
     eventually(
@@ -625,6 +643,13 @@ impl Resolver for Hang {
     }
 }
 
+#[async_trait]
+impl QueueSource for Hang {
+    async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
+    }
+}
+
 fn listener(dir: &Path) -> (UnixListener, std::path::PathBuf) {
     let path = dir.join(control::SOCKET_NAME);
     let (std, _bound) = control::bind_socket(&path).unwrap();
@@ -634,7 +659,7 @@ fn listener(dir: &Path) -> (UnixListener, std::path::PathBuf) {
 fn run_daemon(dir: &Path, bus: Bus) -> (tokio::task::JoinHandle<Exit>, std::path::PathBuf) {
     let (listener, path) = listener(dir);
     let player = AudioPlayer::spawn(Box::new(NullSink::new()));
-    let (engine, cmds, events) = Engine::new(Arc::new(Hang), player);
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Hang), player);
     let options = Options {
         mpris: Some(bus),
         // An empty folder: no mains, so "battery"; the limit is minutes away either way.

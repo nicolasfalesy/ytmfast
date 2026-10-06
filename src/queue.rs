@@ -189,19 +189,29 @@ impl Queue {
     /// Repeat::One play it again; a skip moves on as if One were Off. With no current item yet,
     /// the first item becomes current.
     pub fn next(&mut self, auto: bool) -> Option<&QueueItem> {
+        let next = self.next_index(auto)?;
+        self.current = Some(next);
+        self.items.get(next)
+    }
+
+    /// The item `next(auto)` would make current, without moving: the engine prefetches its
+    /// link.
+    pub fn peek_next(&self, auto: bool) -> Option<&QueueItem> {
+        self.next_index(auto).and_then(|n| self.items.get(n))
+    }
+
+    fn next_index(&self, auto: bool) -> Option<usize> {
         let len = self.items.len();
         if len == 0 {
             return None;
         }
-        let next = match self.current {
-            None => 0,
-            Some(c) if auto && self.repeat == Repeat::One => c,
-            Some(c) if c + 1 < len => c + 1,
-            Some(_) if self.repeat == Repeat::All => 0,
-            Some(_) => return None,
-        };
-        self.current = Some(next);
-        self.items.get(next)
+        match self.current {
+            None => Some(0),
+            Some(c) if auto && self.repeat == Repeat::One => Some(c),
+            Some(c) if c + 1 < len => Some(c + 1),
+            Some(_) if self.repeat == Repeat::All => Some(0),
+            Some(_) => None,
+        }
     }
 
     /// Previous: restart when more than 3 s in; else the item before, if there is one
@@ -812,5 +822,23 @@ mod tests {
             serde_json::from_str::<AddAt>("\"next\"").unwrap(),
             AddAt::Next
         );
+    }
+
+    #[test]
+    fn peek_next_matches_next_without_moving() {
+        let mut q = queue(3, 1);
+        for repeat in [Repeat::Off, Repeat::All, Repeat::One] {
+            q.set_repeat(repeat);
+            for auto in [false, true] {
+                for at in 0..3 {
+                    q.jump(id_of(&q, &format!("s{at}")));
+                    let peeked = q.peek_next(auto).map(|i| i.id);
+                    assert_eq!(cur(&q), Some(format!("s{at}")), "peek doesn't move");
+                    let moved = q.next(auto).map(|i| i.id);
+                    assert_eq!(peeked, moved, "{repeat:?} auto={auto} at={at}");
+                }
+            }
+        }
+        assert!(Queue::with_seed(1).peek_next(true).is_none());
     }
 }

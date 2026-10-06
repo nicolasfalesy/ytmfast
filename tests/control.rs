@@ -18,8 +18,10 @@ use tokio::time::Instant;
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::control::{self, Exit, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, Status};
 use ytmfast::error::Error;
+use ytmfast::innertube::{NextPage, NextRequest};
+use ytmfast::queue::Repeat;
 use ytmfast::streams::{Resolver, Stream};
 
 const SONG: &str = "dQw4w9WgXcQ";
@@ -37,6 +39,13 @@ impl Resolver for Hang {
     }
     async fn resolve_fresh(&self, id: &str) -> Result<Stream, Error> {
         self.resolve(id).await
+    }
+}
+
+#[async_trait]
+impl QueueSource for Hang {
+    async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
     }
 }
 
@@ -69,7 +78,7 @@ fn daemon(on_ac: bool) -> Daemon {
     let power = power(on_ac);
     let (listener, path) = listener(dir.path());
     let player = AudioPlayer::spawn(Box::new(NullSink::new()));
-    let (engine, cmds, events) = Engine::new(Arc::new(Hang), player);
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Hang), player);
     let options = Options {
         power_supply_root: power.path().to_path_buf(),
         ..Options::default()
@@ -142,8 +151,12 @@ fn paused_status(id: &str) -> Status {
         state: PlayState::Paused,
         video_id: Some(id.into()),
         meta: None,
+        album: None,
+        queue_id: None,
         position: 1.5,
         volume: 0.5,
+        shuffle: false,
+        repeat: Repeat::Off,
     }
 }
 
@@ -455,6 +468,7 @@ async fn lagged_client_gets_a_fresh_state() {
     for i in 0..200 {
         let _ = f.events.send(EngineEvent::Position {
             seconds: f64::from(i),
+            seeked: false,
         });
     }
     let v = c.event("state").await;
@@ -492,6 +506,7 @@ async fn client_that_stops_reading_is_dropped() {
     for i in 0..50_000 {
         let _ = f.events.send(EngineEvent::Position {
             seconds: f64::from(i),
+            seeked: false,
         });
         if i % 16 == 0 {
             tokio::task::yield_now().await;

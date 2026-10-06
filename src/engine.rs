@@ -23,37 +23,108 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
+use async_trait::async_trait;
+
 use crate::audio::decode::loudness_gain;
 use crate::audio::fetch::{Relink, TrackBuffer};
 use crate::audio::player::{AudioEvent, AudioPlayer};
 use crate::error::Error;
+use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
+use crate::queue::{AddAt, Queue, QueueItem, Repeat};
 use crate::streams::{Resolver, Stream, TrackMeta};
+
+/// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
+/// production; a trait so the engine's tests can answer with their own pages. Used as
+/// `Arc<dyn QueueSource>`, hence async-trait (ruling R1).
+#[async_trait]
+pub trait QueueSource: Send + Sync {
+    async fn next(&self, req: NextRequest) -> Result<NextPage, Error>;
+}
+
+#[async_trait]
+impl QueueSource for Innertube {
+    async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
+        // The inherent method, not this one.
+        Innertube::next(self, req).await
+    }
+}
 
 /// What the socket and MPRIS ask of the engine.
 #[derive(Debug)]
 pub enum EngineCmd {
-    /// Play `video_id` from `start_seconds`. Without an id: resume what is loaded, or play the
-    /// last song again once it has ended; with nothing at all, an `internal` error.
+    /// A new queue, or the one there is.
+    ///
+    /// - `playlist_id` (an album or a playlist): its songs become the queue, starting at
+    ///   `video_id` if given (it plays at once, before the list arrives), else at `index`.
+    /// - `video_id` alone: that song plays at once, and its radio fills the queue behind it.
+    /// - Neither: resume what is loaded, or play the current song again once it has ended
+    ///   (from where it stopped, after a mid-song error); with nothing at all, Liked songs.
+    ///
+    /// `start_seconds` is where the first song starts.
     Play {
         video_id: Option<String>,
+        playlist_id: Option<String>,
+        index: Option<usize>,
         start_seconds: f64,
     },
     Pause,
     Toggle,
+    /// A seek at or past the song's end acts like `Next`.
     Seek(f64),
     /// 0.0 to 1.0 (clamped).
     Volume(f32),
     Status(oneshot::Sender<Status>),
+    Next,
+    /// Restarts the song when more than 3 s in, else plays the item before.
+    Previous,
+    QueueGet(oneshot::Sender<QueueView>),
+    QueueAdd {
+        songs: Vec<SongItem>,
+        at: AddAt,
+    },
+    /// By queue id.
+    QueueRemove(u64),
+    /// Plays the item with this queue id.
+    QueueJump(u64),
+    /// Moves the item with this queue id to `index` in the play order.
+    QueueMove {
+        id: u64,
+        index: usize,
+    },
+    Shuffle(bool),
+    Repeat(Repeat),
     Quit,
+}
+
+/// The queue as the widgets see it: the `queue` event's fields, and `QueueGet`'s reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueView {
+    /// In play order (the shuffled order while shuffle is on). Shared, not copied: the
+    /// broadcast channel clones every event once per listener, and a radio queue runs to
+    /// hundreds of items.
+    pub items: Arc<[QueueItem]>,
+    pub current_id: Option<u64>,
+    pub shuffle: bool,
+    pub repeat: Repeat,
 }
 
 /// What the engine reports.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     State(Status),
-    /// Once a second while playing, and right after every seek.
+    /// Once a second while playing, and right after every seek. `seeked` is true only for a
+    /// seek's own event (MPRIS sends `Seeked` for those, and never for ticks).
     Position {
         seconds: f64,
+        seeked: bool,
+    },
+    /// The queue, on every change: songs added, removed or moved, a new current item, shuffle
+    /// or repeat.
+    Queue {
+        items: Arc<[QueueItem]>,
+        current_id: Option<u64>,
+        shuffle: bool,
+        repeat: Repeat,
     },
     /// `code` is `Error::code()`; `message` its `Display`, which never holds a link (R6).
     Error {
@@ -75,11 +146,18 @@ pub struct Status {
     pub state: PlayState,
     /// The current song, or the last one once it has ended (so the bar can still show it).
     pub video_id: Option<String>,
-    /// Known once the song's link is resolved.
+    /// From the queue item when it has details (at once); else known once the song's link
+    /// is resolved.
     pub meta: Option<TrackMeta>,
+    /// The current song's album, from its queue item.
+    pub album: Option<String>,
+    /// The current song's queue id.
+    pub queue_id: Option<u64>,
     pub position: f64,
     /// 0.0 to 1.0 (the socket turns it into a percent).
     pub volume: f32,
+    pub shuffle: bool,
+    pub repeat: Repeat,
 }
 
 /// Starts a track's download. `TrackBuffer::start` in production; tests swap in one that
@@ -102,6 +180,10 @@ struct Resolved {
 
 pub struct Engine {
     resolver: Arc<dyn Resolver>,
+    #[allow(dead_code)]
+    source: Arc<dyn QueueSource>,
+    #[allow(dead_code)]
+    queue: Queue,
     player: AudioPlayer,
     start_buffer: Starter,
     commands: mpsc::Receiver<EngineCmd>,
@@ -133,17 +215,19 @@ pub struct Engine {
 impl Engine {
     pub fn new(
         resolver: Arc<dyn Resolver>,
+        source: Arc<dyn QueueSource>,
         player: AudioPlayer,
     ) -> (
         Engine,
         mpsc::Sender<EngineCmd>,
         broadcast::Sender<EngineEvent>,
     ) {
-        Self::with_starter(resolver, player, Box::new(TrackBuffer::start))
+        Self::with_starter(resolver, source, player, Box::new(TrackBuffer::start))
     }
 
     fn with_starter(
         resolver: Arc<dyn Resolver>,
+        source: Arc<dyn QueueSource>,
         player: AudioPlayer,
         start_buffer: Starter,
     ) -> (
@@ -156,6 +240,8 @@ impl Engine {
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let engine = Engine {
             resolver,
+            source,
+            queue: Queue::new(),
             player,
             start_buffer,
             commands,
@@ -166,8 +252,12 @@ impl Engine {
                 state: PlayState::Stopped,
                 video_id: None,
                 meta: None,
+                album: None,
+                queue_id: None,
                 position: 0.0,
                 volume: 1.0,
+                shuffle: false,
+                repeat: Repeat::Off,
             },
             generation: 0,
             resolving: None,
@@ -218,6 +308,7 @@ impl Engine {
             EngineCmd::Play {
                 video_id,
                 start_seconds,
+                ..
             } => self.play(video_id, start_seconds),
             EngineCmd::Pause => self.pause(),
             EngineCmd::Toggle => match self.status.state {
@@ -230,6 +321,17 @@ impl Engine {
             EngineCmd::Status(reply) => {
                 let _ = reply.send(self.snapshot());
             }
+            EngineCmd::QueueGet(reply) => {
+                let _ = reply.send(self.queue_view());
+            }
+            EngineCmd::Next
+            | EngineCmd::Previous
+            | EngineCmd::QueueAdd { .. }
+            | EngineCmd::QueueRemove(_)
+            | EngineCmd::QueueJump(_)
+            | EngineCmd::QueueMove { .. }
+            | EngineCmd::Shuffle(_)
+            | EngineCmd::Repeat(_) => {}
             // Handled by `run`.
             EngineCmd::Quit => {}
         }
@@ -401,7 +503,10 @@ impl Engine {
             // The next tick a whole second after the seek's own position event.
             t.reset();
         }
-        self.emit(EngineEvent::Position { seconds: at });
+        self.emit(EngineEvent::Position {
+            seconds: at,
+            seeked: true,
+        });
     }
 
     fn volume(&mut self, v: f32) {
@@ -493,7 +598,19 @@ impl Engine {
     fn on_tick(&mut self) {
         let seconds = self.player.position();
         self.status.position = seconds;
-        self.emit(EngineEvent::Position { seconds });
+        self.emit(EngineEvent::Position {
+            seconds,
+            seeked: false,
+        });
+    }
+
+    fn queue_view(&self) -> QueueView {
+        QueueView {
+            items: self.queue.items().into(),
+            current_id: self.queue.current().map(|i| i.id),
+            shuffle: self.queue.shuffle(),
+            repeat: self.queue.repeat(),
+        }
     }
 
     /// The status, with the position fresh from the audio thread once the song has started
@@ -561,7 +678,6 @@ mod tests {
     use crate::audio::sink::{NullSink, NullStats};
     use crate::error::Error;
     use crate::innertube::Tracking;
-    use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -680,8 +796,40 @@ mod tests {
         }
     }
 
+    /// A queue source: answers by playlist id (or the continuation token), after an optional
+    /// delay; anything else is "no queue". Records every request.
+    #[derive(Default)]
+    struct FakeSource {
+        pages: HashMap<String, (Duration, Result<NextPage, Error>)>,
+        requests: Mutex<Vec<NextRequest>>,
+    }
+
+    #[async_trait]
+    impl QueueSource for FakeSource {
+        async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
+            self.requests.lock().unwrap().push(req.clone());
+            let key = req.continuation.or(req.playlist_id).unwrap_or_default();
+            match self.pages.get(&key) {
+                Some((delay, answer)) => {
+                    tokio::time::sleep(*delay).await;
+                    answer.clone()
+                }
+                None => Err(Error::Unavailable("YouTube sent no queue".into())),
+            }
+        }
+    }
+
+    impl FakeSource {
+        #[allow(dead_code)] // the queue tests come next
+        fn requests(&self) -> Vec<NextRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
     #[derive(Default)]
     struct Setup {
+        /// Queue pages: (playlist id or continuation, delay in ms, answer).
+        pages: Vec<(String, u64, Result<NextPage, Error>)>,
         delays: Vec<(&'static str, u64)>,
         failures: Vec<(&'static str, Error)>,
         /// A sink that plays as fast as it can, instead of in real time.
@@ -697,6 +845,8 @@ mod tests {
         started: Arc<Mutex<Vec<String>>>,
         stats: Arc<NullStats>,
         resolver: Arc<Fake>,
+        #[allow(dead_code)] // the queue tests come next
+        source: Arc<FakeSource>,
         server: Server,
         task: JoinHandle<()>,
     }
@@ -740,7 +890,13 @@ mod tests {
         }
     }
 
-    fn engine_for(server: &Server, resolver: Arc<Fake>, fast: bool, no_output: bool) -> Built {
+    fn engine_for(
+        server: &Server,
+        resolver: Arc<Fake>,
+        source: Arc<FakeSource>,
+        fast: bool,
+        no_output: bool,
+    ) -> Built {
         let (null, stats) = sink(fast);
         let sink: Box<dyn crate::audio::sink::Sink> =
             if no_output { Box::new(NoOutput) } else { null };
@@ -753,7 +909,7 @@ mod tests {
             TrackBuffer::start_with_test_base(stream, relink, base.clone(), reqwest::Client::new())
         });
         let (engine, cmds, events) =
-            Engine::with_starter(resolver, AudioPlayer::spawn(sink), starter);
+            Engine::with_starter(resolver, source, AudioPlayer::spawn(sink), starter);
         Built {
             engine,
             cmds,
@@ -779,13 +935,27 @@ mod tests {
                 .collect(),
             calls: Mutex::new(Vec::new()),
         });
+        let source = Arc::new(FakeSource {
+            pages: setup
+                .pages
+                .into_iter()
+                .map(|(key, ms, answer)| (key, (Duration::from_millis(ms), answer)))
+                .collect(),
+            ..FakeSource::default()
+        });
         let Built {
             engine,
             cmds,
             events,
             started,
             stats,
-        } = engine_for(&server, resolver.clone(), setup.fast, setup.no_output);
+        } = engine_for(
+            &server,
+            resolver.clone(),
+            source.clone(),
+            setup.fast,
+            setup.no_output,
+        );
         let events = events.subscribe();
         let task = tokio::spawn(engine.run());
         Rig {
@@ -794,6 +964,7 @@ mod tests {
             started,
             stats,
             resolver,
+            source,
             server,
             task,
         }
@@ -807,6 +978,8 @@ mod tests {
         async fn play(&self, id: &str) {
             self.send(EngineCmd::Play {
                 video_id: Some(id.into()),
+                playlist_id: None,
+                index: None,
                 start_seconds: 0.0,
             })
             .await;
@@ -1114,7 +1287,7 @@ mod tests {
         r.until(PlayState::Playing).await;
         r.send(EngineCmd::Seek(1.0)).await;
         loop {
-            if let EngineEvent::Position { seconds } = r.next().await {
+            if let EngineEvent::Position { seconds, .. } = r.next().await {
                 assert_eq!(seconds, 1.0);
                 break;
             }
@@ -1150,10 +1323,12 @@ mod tests {
         });
         let Built {
             mut engine, events, ..
-        } = engine_for(&server, fake.clone(), true, false);
+        } = engine_for(&server, fake.clone(), Arc::default(), true, false);
         let mut rx = events.subscribe();
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         });
         // A 318 s song, loaded (not yet started, so the status shows the engine's own
@@ -1169,14 +1344,20 @@ mod tests {
         engine.handle(EngineCmd::Seek(9999.0));
         assert_eq!(
             rx.try_recv().unwrap(),
-            EngineEvent::Position { seconds: 317.0 }
+            EngineEvent::Position {
+                seconds: 317.0,
+                seeked: true
+            }
         );
         assert!((engine.snapshot().position - 317.0).abs() < 1e-9);
         // Below zero still clamps to the start.
         engine.handle(EngineCmd::Seek(-5.0));
         assert_eq!(
             rx.try_recv().unwrap(),
-            EngineEvent::Position { seconds: 0.0 }
+            EngineEvent::Position {
+                seconds: 0.0,
+                seeked: true
+            }
         );
     }
 
@@ -1241,6 +1422,8 @@ mod tests {
         let mut r = rig(Setup::default()).await;
         r.send(EngineCmd::Play {
             video_id: None,
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         })
         .await;
@@ -1317,6 +1500,8 @@ mod tests {
         assert!(end.position > 1.5, "{}", end.position);
         r.send(EngineCmd::Play {
             video_id: None,
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         })
         .await;
@@ -1368,14 +1553,18 @@ mod tests {
             events,
             started,
             ..
-        } = engine_for(&server, fake.clone(), true, false);
+        } = engine_for(&server, fake.clone(), Arc::default(), true, false);
         let mut rx = events.subscribe();
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         });
         engine.handle(EngineCmd::Play {
             video_id: Some("BBBBBBBBBBB".into()),
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         });
         while rx.try_recv().is_ok() {}
@@ -1399,10 +1588,13 @@ mod tests {
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
         });
-        let Built { mut engine, .. } = engine_for(&server, fake.clone(), true, false);
+        let Built { mut engine, .. } =
+            engine_for(&server, fake.clone(), Arc::default(), true, false);
         // A was loaded and started; B is picked and loaded.
         engine.handle(EngineCmd::Play {
             video_id: Some("AAAAAAAAAAA".into()),
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         });
         engine.on_resolved(Resolved {
@@ -1414,6 +1606,8 @@ mod tests {
         assert_eq!(engine.status.state, PlayState::Playing);
         engine.handle(EngineCmd::Play {
             video_id: Some("BBBBBBBBBBB".into()),
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         });
         // A's end, sent before the audio thread took B's load: B is still resolving.

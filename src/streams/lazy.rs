@@ -1,10 +1,14 @@
-//! A resolver that loads the session on first use.
+//! The resolver and the queue source, over a session loaded on first use.
 //!
 //! The daemon serves its socket and watches for signals at once, and only reads the keyring
 //! when a song is first asked for. Reading it at start would hold every reply (and a stop)
 //! behind the keyring's unlock prompt, which has no timeout of its own. Until a session is
 //! found, every resolve tries the store again, so `ytmfast import-session` takes effect
 //! without restarting the engine.
+//!
+//! The resolver and the queue source come from one load and share one session: two loads
+//! could each open an unlock prompt, and two copies of the session would drift apart as
+//! YouTube rotates its cookies.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,28 +16,37 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::auth::{Session, SessionStore};
+use crate::engine::QueueSource;
 use crate::error::Error;
+use crate::innertube::{NextPage, NextRequest};
 use crate::streams::{Resolver, Stream};
 
 /// How long one session load may take: long enough to type a keyring password into the
 /// unlock prompt, short enough that a play doesn't hang on a prompt nobody sees.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Builds the real resolver once the session is loaded.
-pub type Build = Box<dyn Fn(Session) -> Arc<dyn Resolver> + Send + Sync>;
+/// What one session load builds: the real resolver and the real queue source.
+#[derive(Clone)]
+pub struct Loaded {
+    pub resolver: Arc<dyn Resolver>,
+    pub queue: Arc<dyn QueueSource>,
+}
 
-pub struct LazyResolver {
+/// Builds the real resolver and queue source once the session is loaded.
+pub type Build = Box<dyn Fn(Session) -> Loaded + Send + Sync>;
+
+pub struct LazySession {
     store: Arc<dyn SessionStore>,
     build: Build,
     load_timeout: Duration,
-    /// The real resolver once a session was loaded. A tokio mutex, held across the load, so
-    /// songs asked for at the same moment wait for one load instead of each prompting.
-    inner: tokio::sync::Mutex<Option<Arc<dyn Resolver>>>,
+    /// The real pair once a session was loaded. A tokio mutex, held across the load, so
+    /// requests made at the same moment wait for one load instead of each prompting.
+    inner: tokio::sync::Mutex<Option<Loaded>>,
 }
 
-impl LazyResolver {
-    pub fn new(store: Arc<dyn SessionStore>, build: Build) -> LazyResolver {
-        LazyResolver {
+impl LazySession {
+    pub fn new(store: Arc<dyn SessionStore>, build: Build) -> LazySession {
+        LazySession {
             store,
             build,
             load_timeout: LOAD_TIMEOUT,
@@ -42,14 +55,14 @@ impl LazyResolver {
     }
 
     /// A shorter load timeout, for tests.
-    pub fn with_load_timeout(mut self, timeout: Duration) -> LazyResolver {
+    pub fn with_load_timeout(mut self, timeout: Duration) -> LazySession {
         self.load_timeout = timeout;
         self
     }
 
-    /// The real resolver, loading the session first if there is none yet. A failed load is
-    /// not remembered: the next call tries again.
-    async fn get(&self) -> Result<Arc<dyn Resolver>, Error> {
+    /// The real pair, loading the session first if there is none yet. A failed load is not
+    /// remembered: the next call tries again.
+    async fn get(&self) -> Result<Loaded, Error> {
         let mut inner = self.inner.lock().await;
         if let Some(r) = &*inner {
             return Ok(r.clone());
@@ -74,13 +87,20 @@ impl LazyResolver {
 }
 
 #[async_trait]
-impl Resolver for LazyResolver {
+impl Resolver for LazySession {
     async fn resolve(&self, video_id: &str) -> Result<Stream, Error> {
-        self.get().await?.resolve(video_id).await
+        self.get().await?.resolver.resolve(video_id).await
     }
 
     async fn resolve_fresh(&self, video_id: &str) -> Result<Stream, Error> {
-        self.get().await?.resolve_fresh(video_id).await
+        self.get().await?.resolver.resolve_fresh(video_id).await
+    }
+}
+
+#[async_trait]
+impl QueueSource for LazySession {
+    async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
+        self.get().await?.queue.next(req).await
     }
 }
 
@@ -133,10 +153,31 @@ mod tests {
         }
     }
 
+    /// Answers every queue request with one song whose title is the session's first cookie
+    /// value, like `Echo`.
+    struct EchoQueue(String);
+
+    #[async_trait]
+    impl QueueSource for EchoQueue {
+        async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+            Ok(NextPage {
+                items: vec![crate::innertube::SongItem {
+                    title: self.0.clone(),
+                    ..Default::default()
+                }],
+                ..NextPage::default()
+            })
+        }
+    }
+
     fn counting_build(builds: Arc<AtomicUsize>) -> Build {
         Box::new(move |s: Session| {
             builds.fetch_add(1, Ordering::SeqCst);
-            Arc::new(Echo(s.cookies[0].value.clone())) as Arc<dyn Resolver>
+            let value = s.cookies[0].value.clone();
+            Loaded {
+                resolver: Arc::new(Echo(value.clone())),
+                queue: Arc::new(EchoQueue(value)),
+            }
         })
     }
 
@@ -144,10 +185,14 @@ mod tests {
     async fn picks_up_a_session_imported_later() {
         let store = Arc::new(MemoryStore::new());
         let builds = Arc::new(AtomicUsize::new(0));
-        let lazy = LazyResolver::new(store.clone(), counting_build(builds.clone()));
+        let lazy = LazySession::new(store.clone(), counting_build(builds.clone()));
 
         // No session yet: signed out, and nothing built.
         assert_eq!(lazy.resolve("testvideo01").await, Err(Error::SignedOut));
+        assert_eq!(
+            lazy.next(NextRequest::default()).await,
+            Err(Error::SignedOut)
+        );
         assert_eq!(builds.load(Ordering::SeqCst), 0);
 
         // The user imports one: the next resolve uses it, without a restart.
@@ -156,6 +201,9 @@ mod tests {
         assert_eq!(s.meta.title, "first");
         let s = lazy.resolve_fresh("testvideo01").await.unwrap();
         assert_eq!(s.meta.title, "first");
+        // The queue source comes from the same load, over the same session.
+        let page = lazy.next(NextRequest::default()).await.unwrap();
+        assert_eq!(page.items[0].title, "first");
         // Built once, then kept: the store isn't read on every song.
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
@@ -181,7 +229,7 @@ mod tests {
     async fn a_stuck_keyring_times_out() {
         let store = Arc::new(StuckStore::default());
         let builds = Arc::new(AtomicUsize::new(0));
-        let lazy = LazyResolver::new(store.clone(), counting_build(builds.clone()))
+        let lazy = LazySession::new(store.clone(), counting_build(builds.clone()))
             .with_load_timeout(Duration::from_millis(50));
         let started = std::time::Instant::now();
         assert_eq!(

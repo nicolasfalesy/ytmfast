@@ -360,6 +360,8 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
             },
             event = events.recv() => {
                 let line = match event {
+                    // The socket's `queue` event arrives with Task 8.
+                    Ok(EngineEvent::Queue { .. }) => continue,
                     Ok(e) => protocol::event_line(&e),
                     // It missed some events: a fresh state covers them (Task 8 carry).
                     Err(RecvError::Lagged(_)) => match query_status(&shared.cmds).await {
@@ -426,6 +428,9 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
             start_seconds,
         } => EngineCmd::Play {
             video_id,
+            // The socket's queue arguments arrive with Task 8.
+            playlist_id: None,
+            index: None,
             start_seconds,
         },
         Request::Pause => EngineCmd::Pause,

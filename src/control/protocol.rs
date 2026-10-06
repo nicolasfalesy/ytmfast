@@ -223,9 +223,11 @@ pub fn event_line(event: &EngineEvent) -> String {
             m.extend(status_data(status));
             line(Value::Object(m))
         }
-        EngineEvent::Position { seconds: s } => {
+        EngineEvent::Position { seconds: s, .. } => {
             line(json!({ "event": "position", "seconds": seconds(*s) }))
         }
+        // Not sent on the socket yet (Task 8); `control` skips it before getting here.
+        EngineEvent::Queue { .. } => String::new(),
         EngineEvent::Error { code, message } => line(json!({
             "event": "error",
             "code": code,
@@ -248,6 +250,7 @@ fn line(v: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::Repeat;
     use crate::streams::TrackMeta;
 
     fn parse(s: &str) -> Result<(u64, Request), BadRequest> {
@@ -374,8 +377,12 @@ mod tests {
                 length_seconds: 213,
                 thumbnail: Some("https://i.ytimg.com/x.jpg".into()),
             }),
+            album: None,
+            queue_id: None,
             position: 1.234_567,
             volume: 0.8,
+            shuffle: false,
+            repeat: Repeat::Off,
         };
         let v: Value =
             serde_json::from_str(&event_line(&EngineEvent::State(status.clone()))).unwrap();
@@ -394,8 +401,12 @@ mod tests {
             state: PlayState::Stopped,
             video_id: None,
             meta: None,
+            album: None,
+            queue_id: None,
             position: 0.0,
             volume: 1.0,
+            shuffle: false,
+            repeat: Repeat::Off,
         };
         assert_eq!(
             Value::Object(status_data(&empty)),
@@ -403,8 +414,11 @@ mod tests {
                    "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100})
         );
 
-        let v: Value =
-            serde_json::from_str(&event_line(&EngineEvent::Position { seconds: 42.5 })).unwrap();
+        let v: Value = serde_json::from_str(&event_line(&EngineEvent::Position {
+            seconds: 42.5,
+            seeked: false,
+        }))
+        .unwrap();
         assert_eq!(v, json!({"event": "position", "seconds": 42.5}));
         let v: Value = serde_json::from_str(&event_line(&EngineEvent::Error {
             code: "network",
