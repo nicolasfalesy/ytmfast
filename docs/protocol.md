@@ -170,8 +170,9 @@ Ids and tokens are checked before anything is sent:
 - `params` and `token` are up to 4096 characters of those, plus `+`, `/`, `=` and `%`.
   An empty `params` (`""`, as rows carry it) is the same as none.
 - `query` is trimmed, then must be 1 to 200 characters with no control characters, no line or paragraph
-  separators, no bidi controls and no invisible zero-width characters (joiners, which Persian, Indic scripts and
-  emoji need, are fine).
+  separators and no invisible format characters (bidi controls, zero-width spaces and the like). Kept: the
+  joiners ZWNJ and ZWJ (Persian, Indic scripts and emoji need them), the tag characters of subdivision flags, and
+  the number signs that show in Arabic, Syriac and Kaithi text.
 
 A bad one is `bad_request`, and nothing is asked of YouTube (or of the keyring).
 

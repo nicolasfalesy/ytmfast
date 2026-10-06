@@ -1244,28 +1244,35 @@ impl Engine {
                     None => self.queue.replace_unpicked(page.items, room),
                 };
                 let start_id = self.queue.current().map(|i| i.id);
-                if let (Some(now), Some(start)) = (playing_kept, start_id) {
-                    // What the user heard goes before the list's start song, which comes
-                    // next: it was never heard. (While shuffled this moves it in the play
-                    // order only, like any move.)
+                if let Some(now) = playing_kept {
+                    // What the user heard is put back and stays current, also when the list
+                    // got no room at all (the user filled the queue while it loaded: no start
+                    // song, an empty queue to put it back into).
                     self.queue.insert_items(kept.played, AddAt::Next);
                     self.queue.jump(now);
-                    // `move_to` takes the index after the start song is taken out: it sits
-                    // before the current song (the played ones went in right after it), so
-                    // the current song's index is the place right after it.
-                    let c = self.queue.current_index().unwrap_or(0);
-                    let s = self.queue.items().iter().position(|i| i.id == start);
-                    let to = if s.is_some_and(|s| s < c) { c } else { c + 1 };
-                    self.queue.move_to(start, to);
+                    // The list's start song comes next: it was never heard. (While shuffled
+                    // this moves it in the play order only, like any move.) `move_to` takes
+                    // the index after the start song is taken out: it sits before the current
+                    // song (the played ones went in right after it), so the current song's
+                    // index is the place right after it.
+                    if let Some(start) = start_id {
+                        let c = self.queue.current_index().unwrap_or(0);
+                        let s = self.queue.items().iter().position(|i| i.id == start);
+                        let to = if s.is_some_and(|s| s < c) { c } else { c + 1 };
+                        self.queue.move_to(start, to);
+                    }
                 }
                 self.queue.insert_items(kept.next, AddAt::Next);
                 self.queue.insert_items(kept.end, AddAt::End);
-                // A list with no room left (the user filled the queue while it loaded) has
-                // no start song: the first song added plays, rather than nothing at all.
+                // A list with no room left and no added song playing has no start song: the
+                // first song added plays, from its start (the play's second was for the
+                // list's song), rather than nothing at all.
+                let mut start = plan.start;
                 if self.queue.current().is_none()
                     && let Some(first) = self.queue.items().first().map(|i| i.id)
                 {
                     self.queue.jump(first);
+                    start = 0.0;
                 }
                 self.emit_queue();
                 if playing_kept.is_some() {
@@ -1277,7 +1284,7 @@ impl Engine {
                     }
                 } else {
                     let paused = self.status.state == PlayState::Paused;
-                    self.start_current(plan.start);
+                    self.start_current(start);
                     if paused {
                         self.pause();
                     }
@@ -5189,7 +5196,7 @@ mod tests {
             playlist_id: Some("PLlist".into()),
             index: None,
             params: None,
-            start_seconds: 0.0,
+            start_seconds: 30.0,
         });
         add_songs(engine, named_songs("u", MAX_ITEMS), AddAt::End);
         engine.on_load(Ok(named_page("p", 50)));
@@ -5198,6 +5205,46 @@ mod tests {
         assert_eq!(engine.queue.current().unwrap().song.video_id, "u0");
         assert_eq!(engine.status.video_id.as_deref(), Some("u0"));
         assert_ne!(engine.status.state, PlayState::Stopped);
+        // From its start: the second the play named was the list's start song's.
+        assert_eq!(engine.status.position, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_list_with_no_room_left_keeps_the_added_song_playing() {
+        // As above, but the user skipped to the first song added, which plays: it stays
+        // current with its queue id, and nothing added is lost.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLlist".into()),
+            index: None,
+            params: None,
+            start_seconds: 0.0,
+        });
+        add_songs(engine, named_songs("u", MAX_ITEMS), AddAt::End);
+        engine.handle(EngineCmd::Next);
+        assert_eq!(engine.status.video_id.as_deref(), Some("u0"));
+        let u0 = engine.queue.current().unwrap().id;
+        engine.on_load(Ok(named_page("p", 50)));
+        assert_eq!(engine.queue.len(), MAX_ITEMS);
+        assert_eq!(
+            order(engine),
+            named_songs("u", MAX_ITEMS)
+                .into_iter()
+                .map(|s| s.video_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(engine.queue.current().map(|i| i.id), Some(u0));
+        assert_eq!(engine.status.queue_id, Some(u0));
+        assert_eq!(engine.status.video_id.as_deref(), Some("u0"));
+        assert_eq!(
+            engine
+                .queue
+                .peek_next(false)
+                .map(|i| i.song.video_id.clone()),
+            Some("u1".into())
+        );
     }
 
     #[tokio::test]

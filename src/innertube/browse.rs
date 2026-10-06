@@ -265,12 +265,17 @@ pub fn check_query(query: &str) -> Result<&str, Error> {
     Ok(q)
 }
 
-/// The line and paragraph separators (Unicode Zl, Zp), the bidi controls, and the
-/// zero-width or invisible format characters (Cf) nobody types: pasted in, they make a query
-/// look like something else (a bidi override reverses the text) or miss what it looks like.
-/// Not every Cf: ZWNJ and ZWJ (U+200C, U+200D) are part of how Persian, Indic scripts and
-/// emoji sequences are written, the tag characters (U+E0020 to U+E007F) spell subdivision
-/// flags, and the Arabic number signs (U+0600 to U+0605 and kin) are visible marks.
+/// The line and paragraph separators (Unicode Zl, Zp) and the format characters (Cf) that
+/// are invisible: bidi controls, zero-width spaces, invisible operators and the script format
+/// controls nobody types into a search box. Pasted in, they make a query look like something
+/// else (a bidi override reverses the text) or miss what it looks like.
+///
+/// That is every Cf but these, which are kept (rulings P12, P12a):
+/// - ZWNJ and ZWJ (U+200C, U+200D): part of how Persian, Indic scripts and emoji sequences
+///   are written;
+/// - the tag characters (U+E0020 to U+E007F): they spell subdivision flags;
+/// - the prepended number marks (U+0600 to U+0605, U+06DD, U+070F, U+0890, U+0891, U+08E2,
+///   U+110BD, U+110CD): they show as signs in Arabic, Syriac and Kaithi text.
 fn invisible(c: char) -> bool {
     matches!(
         c,
@@ -285,6 +290,9 @@ fn invisible(c: char) -> bool {
             | '\u{206A}'..='\u{206F}' // deprecated shaping controls
             | '\u{FEFF}' // zero-width no-break space (byte order mark)
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{13430}'..='\u{1343F}' // Egyptian hieroglyph format controls
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical symbol format controls
             | '\u{E0001}' // language tag
     )
 }
@@ -344,6 +352,12 @@ mod tests {
             "a\u{206A}b",
             "a\u{FFF9}b",
             "a\u{E0001}b",
+            "a\u{13430}b",
+            "a\u{1343F}b",
+            "a\u{1BCA0}b",
+            "a\u{1BCA3}b",
+            "a\u{1D173}b",
+            "a\u{1D17A}b",
         ] {
             assert_eq!(
                 check_query(bad).unwrap_err().code(),
@@ -352,11 +366,21 @@ mod tests {
             );
         }
         // Joiners stay: Persian and Indic text (ZWNJ, ZWJ) and emoji sequences need them, as
-        // do the tag characters of subdivision flags.
+        // do the tag characters of subdivision flags; and the prepended number marks, which
+        // show as signs (rulings P12, P12a).
         for good in [
             "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0645}",
             "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
             "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+            "\u{0600}12",
+            "\u{0605}12",
+            "\u{06DD}12",
+            "\u{070F}a",
+            "\u{0890}12",
+            "\u{0891}12",
+            "\u{08E2}12",
+            "\u{110BD}12",
+            "\u{110CD}12",
         ] {
             assert_eq!(check_query(good), Ok(good), "{good:?}");
         }
