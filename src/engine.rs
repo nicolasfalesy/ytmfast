@@ -849,9 +849,10 @@ impl Engine {
 
     /// A queue id the queue doesn't have (a widget acting on an old copy of the queue).
     fn not_in_queue(&self) {
+        let e = Error::Unavailable("not in the queue".into());
         self.emit(EngineEvent::Error {
-            code: Error::Unavailable(String::new()).code(),
-            message: Error::Unavailable("not in the queue".into()).to_string(),
+            code: e.code(),
+            message: e.to_string(),
         });
     }
 
