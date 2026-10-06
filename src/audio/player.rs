@@ -812,6 +812,20 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_in_the_last_200_ms_plays_on() {
+        // The song's end is decoded up to 200 ms before it is heard: a seek then lands in a
+        // decoder that has read to the end (the demuxer is read again, see `Decoder::seek`),
+        // not in a "damaged audio" error.
+        let (p, events, _) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 1.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(900));
+        p.seek(0.5);
+        assert_eq!(next_event(&events), AudioEvent::Ended);
+    }
+
+    #[test]
     fn length_hint_reaches_the_decoder() {
         let (p, _events, _) = player(NullSink::new());
         p.load(

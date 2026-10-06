@@ -357,6 +357,17 @@ impl TrackBuffer {
 }
 
 impl TrackReader {
+    /// Another cursor over the same track, at its start, cancelled together with this one:
+    /// for reading its headers again (`Decoder` does when a seek after the end fails).
+    pub(crate) fn sibling(&self) -> TrackReader {
+        TrackReader {
+            shared: self.shared.clone(),
+            _owner: self._owner.clone(),
+            pos: 0,
+            cancelled: self.cancelled.clone(),
+        }
+    }
+
     /// A handle that cancels this reader from any thread.
     pub fn canceller(&self) -> ReaderCancel {
         ReaderCancel {

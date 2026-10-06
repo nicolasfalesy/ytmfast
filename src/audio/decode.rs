@@ -120,13 +120,21 @@ pub struct Decoder {
     /// A symphonia packet's frames in its own channel layout, before the stereo mapping.
     scratch: Vec<f32>,
     bad_packets: u32,
+    /// A spare cursor over the same track, to read its headers again (`reopen_format`).
+    spare: Option<TrackReader>,
+    /// The container's extension and type, for that second probe.
+    ext: &'static str,
+    kind: String,
 }
 
 impl Decoder {
     /// Opens a track. `mime` is the format's type from the player answer, such as
     /// `audio/webm; codecs="opus"` or `audio/mp4; codecs="mp4a.40.2"`.
     pub fn open(reader: TrackReader, mime: &str) -> Result<Decoder, Error> {
-        Self::open_source(reader, mime)
+        let spare = reader.sibling();
+        let mut dec = Self::open_source(reader, mime)?;
+        dec.spare = Some(spare);
+        Ok(dec)
     }
 
     fn open_source<R: MediaSource + 'static>(mut source: R, mime: &str) -> Result<Decoder, Error> {
@@ -145,17 +153,7 @@ impl Decoder {
             None
         };
 
-        let mut hint = Hint::new();
-        hint.with_extension(ext).mime_type(kind);
-        let mss = MediaSourceStream::new(Box::new(source), Default::default());
-        let format = probe()
-            .probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-            .map_err(open_error)?;
+        let format = probe_format(Box::new(source), ext, kind)?;
 
         let track = format
             .default_track(TrackType::Audio)
@@ -235,6 +233,9 @@ impl Decoder {
             out: Vec::with_capacity(OPUS_MAX_FRAMES * 2),
             scratch: Vec::new(),
             bad_packets: 0,
+            spare: None,
+            ext,
+            kind: kind.to_string(),
         };
         dec.fill_next()?;
         match &dec.next {
@@ -337,6 +338,14 @@ impl Decoder {
             self.rate,
         ));
 
+        if self.eof && self.spare.is_some() {
+            // symphonia 0.6's demuxers can't seek once they have read to the end of the file:
+            // MKV's element stack has left the Segment ("not an ancestor", mkv 0.6.1) and MP4
+            // has no atom left to read ("no atom pending read"). That is any seek in a song's
+            // last 200 ms (its end is decoded that far ahead), and every seek in the gapless
+            // handover window. A demuxer read fresh from the headers seeks fine.
+            self.reopen_format()?;
+        }
         let seeked = self.format.seek(
             SeekMode::Accurate,
             SeekTo::Timestamp {
@@ -372,6 +381,16 @@ impl Decoder {
         // An accurate seek lands at or before the target; if a container lands after it,
         // output starts where it landed.
         Ok(landed.max(target_frame) as f64 / rate)
+    }
+
+    /// A new demuxer over the same track, from a fresh cursor (the headers are in memory by
+    /// now, so this doesn't wait on the download).
+    fn reopen_format(&mut self) -> Result<(), Error> {
+        let Some(spare) = &self.spare else {
+            return Err(Error::Internal("the track can't be read again".into()));
+        };
+        self.format = probe_format(Box::new(spare.sibling()), self.ext, &self.kind)?;
+        Ok(())
     }
 
     /// The output frame a packet starts at, from its timestamp.
@@ -432,6 +451,25 @@ impl Decoder {
             }
         }
     }
+}
+
+/// The demuxer for `source`, a WebM or MP4 (`ext`) of type `kind`.
+fn probe_format(
+    source: Box<dyn MediaSource>,
+    ext: &str,
+    kind: &str,
+) -> Result<Box<dyn FormatReader>, Error> {
+    let mut hint = Hint::new();
+    hint.with_extension(ext).mime_type(kind);
+    let mss = MediaSourceStream::new(source, Default::default());
+    probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(open_error)
 }
 
 /// Interleaved frames of any channel count to interleaved stereo: mono is copied to both
