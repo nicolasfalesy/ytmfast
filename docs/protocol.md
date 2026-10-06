@@ -57,6 +57,7 @@ failing) arrives as events.
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
 | `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
 | `playPage`     | `browseId`, `params` (optional)                         | `{}`, or `{"superseded": true}` |
+| `lyrics`       | `videoId`                                               | `{text, source}` or `{"none": true}` (below) |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -151,8 +152,8 @@ restart, as the volume is.
 
 ## Browsing
 
-`browse`, `search`, `more` and `playPage` ask YouTube Music for pages, the ones the bar
-widget lists. They answer only the client that asked (nothing is broadcast), and they never
+`browse`, `search`, `more`, `playPage` and `lyrics` ask YouTube Music for pages, the ones
+the bar widget lists. They answer only the client that asked (nothing is broadcast), and they never
 start playback or change the queue, except `playPage`, whose job is to play.
 
 Each one runs on its own: a client keeps getting replies and events while a page loads, and
@@ -267,6 +268,31 @@ A newer choice wins: when a command that picks what plays (`play`, `playPage`'s 
 `queue.jump`, `next`, `previous`, from any client or MPRIS) reaches the engine after this
 `playPage` and before its page has loaded, the page's play is dropped, and the reply is
 `{"id": ..., "ok": true, "data": {"superseded": true}}`.
+
+### lyrics
+
+`{"videoId": "dQw4w9WgXcQ"}` gives the song's lyrics as YouTube Music shows them: plain text,
+no timings.
+
+```json
+{"id": 8, "ok": true, "data": {"text": "First line\nSecond line\n\nChorus",
+                                 "source": "Source: Musixmatch"}}
+```
+
+- `text` is as YouTube gives it, newlines kept. It can run to a few KB.
+- `source` is the line YouTube shows under them (`"Source: ..."`), or `""`.
+- A song with no lyrics is `{"id": 8, "ok": true, "data": {"none": true}}`.
+
+Lyrics take two requests to YouTube: the song's `next` (whose Lyrics tab names the lyrics
+page), then that page. The engine reads the same `next` for the song playing (its queue's,
+or its like lookup's) and keeps the tab with the like status, for its last 100 songs. So
+lyrics for the song playing take one request, and a `next` made for lyrics gives the engine
+the song's like status in turn.
+
+The daemon keeps the last 20 answers, for every client: asking again for one of those songs
+(reopening the Lyrics tab, or another widget asking) is answered at once, with nothing sent.
+A song with no lyrics is asked about again after an hour (YouTube adds lyrics to songs
+later); found lyrics are kept while the daemon runs. A failure is never kept.
 
 ### Errors
 
