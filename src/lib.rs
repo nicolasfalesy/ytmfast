@@ -11,5 +11,6 @@ pub mod net;
 pub mod paths;
 pub mod queue;
 pub mod solver;
+pub mod state;
 pub mod streams;
 pub mod trace;
