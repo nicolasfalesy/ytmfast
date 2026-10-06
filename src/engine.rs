@@ -53,7 +53,7 @@ use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
 use crate::report::{self, PlayReport, Reporter};
-use crate::state::{self, Saved, SourceKind, Writer};
+use crate::state::{self, Saved, Writer};
 use crate::streams::{Resolver, Stream, TrackMeta};
 use url::Url;
 
@@ -399,10 +399,8 @@ pub struct Engine {
     /// later, so until then its position is still the old one (a paused song would be saved
     /// at its old second, and stay so until the next save).
     seeked_to: Option<f64>,
-    /// The playlist the queue came from, and what kind it is (saved, so a resumed queue
-    /// refills the same way).
+    /// The playlist the queue came from (saved with the queue).
     source_playlist: Option<String>,
-    source_kind: SourceKind,
     /// Starts play reports; `None` when nothing is reported (most tests).
     reporter: Option<Reporter>,
     /// The report of the song playing now: from when it was first heard until it stops.
@@ -493,7 +491,6 @@ impl Engine {
             restored: false,
             seeked_to: None,
             source_playlist: None,
-            source_kind: SourceKind::List,
             reporter: None,
             report: None,
         };
@@ -511,7 +508,6 @@ impl Engine {
             .then(|| saved.original_order.unwrap_or_default());
         self.queue = Queue::restore(saved.queue, current, original, saved.repeat);
         self.source_playlist = saved.source_playlist;
-        self.source_kind = saved.source_kind;
         self.continuation = saved.continuation;
         self.exhausted = saved.exhausted;
         let volume = if saved.volume.is_finite() {
@@ -714,11 +710,6 @@ impl Engine {
             },
         };
         self.new_queue();
-        // Mixes and radios from YouTube are `RDAMVM` + a song (a lone song's radio too).
-        self.source_kind = match &request.playlist_id {
-            Some(p) if p.starts_with(RADIO_PREFIX) => SourceKind::Radio,
-            _ => SourceKind::List,
-        };
         self.source_playlist = request.playlist_id.clone();
         match &video_id {
             Some(id) => {
@@ -2017,7 +2008,6 @@ impl Engine {
             original_order,
             repeat: status.repeat,
             source_playlist: self.source_playlist.clone(),
-            source_kind: self.source_kind,
             continuation: self.continuation.clone(),
             exhausted: self.exhausted,
             saved_unix: SystemTime::now()
@@ -4504,7 +4494,6 @@ mod tests {
         let saved = Saved {
             queue: vec![song('A'), song('B')],
             source_playlist: Some(radio_of('A')),
-            source_kind: crate::state::SourceKind::Radio,
             continuation: Some("CONT9".into()),
             volume: 0.3,
             repeat: Repeat::Off,
@@ -4606,7 +4595,6 @@ mod tests {
         assert!(s.shuffle);
         assert_eq!(s.repeat, Repeat::All);
         assert_eq!(s.source_playlist.as_deref(), Some("PLlist"));
-        assert_eq!(s.source_kind, crate::state::SourceKind::List);
         // The current song first in the shuffled order; the original order kept.
         assert_eq!(s.current_index, 0);
         let original: Vec<String> = s

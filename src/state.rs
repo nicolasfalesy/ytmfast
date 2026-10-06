@@ -45,7 +45,8 @@ const TEMP_NAME: &str = "state.json.tmp";
 /// left running for days can't grow the file (or each write) without bound.
 pub const MAX_ITEMS: usize = 500;
 
-/// Read cap. 500 songs come to well under 1 MiB; anything far bigger is not ours.
+/// Read cap. 500 songs come to well under 1 MiB; anything far bigger is not ours. A save
+/// never writes more (`encode`), so whatever is saved loads again.
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A playlist id: YouTube's are short and URL-safe (`LM`, `PL…`, `OLAK5uy_…`, `RDAMVM…`).
@@ -63,17 +64,6 @@ pub const MAX_ARTISTS: usize = 20;
 
 /// A second to resume at, for a song whose length isn't known: a day is past any song.
 const MAX_POSITION_UNKNOWN_LENGTH: f64 = 24.0 * 60.0 * 60.0;
-
-/// Where the queue came from. Saved so a resumed queue keeps the same refill behaviour.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceKind {
-    /// A finite list: an album, a playlist, Liked songs (it may still page).
-    #[default]
-    List,
-    /// An endless radio (a song's radio or a mix): it refills from `continuation`.
-    Radio,
-}
 
 /// Everything a restart needs. `queue` is in play order (the shuffled order while shuffle
 /// is on), as the user saw it.
@@ -100,8 +90,9 @@ pub struct Saved {
     pub repeat: Repeat,
     /// The playlist the queue was made from (a radio's is `RDAMVM` + the seed song).
     pub source_playlist: Option<String>,
-    #[serde(default)]
-    pub source_kind: SourceKind,
+    // Files written before this version also hold a `source_kind` ("list" or "radio"). The
+    // refill never read it (`continuation` and `exhausted` say all it needs), so it is no
+    // longer saved; serde skips the unknown key, so those files still load.
     /// The token for the queue's next page. Not a secret (it names a list, not a user), but
     /// opaque: it is never logged.
     #[serde(default)]
@@ -125,7 +116,6 @@ impl Default for Saved {
             original_order: None,
             repeat: Repeat::Off,
             source_playlist: None,
-            source_kind: SourceKind::List,
             continuation: None,
             exhausted: false,
             saved_unix: 0,
@@ -149,7 +139,7 @@ pub fn window(len: usize, current: usize, max: usize) -> Range<usize> {
 /// which is synced and then renamed over `state.json`; the folder is synced too so the
 /// rename survives a power loss. A reader (or a crash) sees the old file or the new one.
 pub fn save(dir: &Path, saved: &Saved) -> io::Result<()> {
-    let bytes = serde_json::to_vec(saved).map_err(io::Error::other)?;
+    let bytes = encode(saved)?;
     let temp = dir.join(TEMP_NAME);
     // A temp file left by a crash: removed, not reused, so its mode and owner can't carry
     // over. (`create_new` below then refuses anything that appears in between.)
@@ -176,6 +166,106 @@ pub fn save(dir: &Path, saved: &Saved) -> io::Result<()> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// `saved` as the file's bytes, never over `MAX_FILE_BYTES`, so a save always loads again.
+/// Real songs are a few hundred bytes each, so 500 of them are far under the cap and this is
+/// one plain serialization. Songs whose text is at the caps a load allows (`MAX_TEXT` per
+/// field, `MAX_ARTISTS` artists, and JSON writes some characters as six bytes) come to over
+/// 100 KB each, and 500 of them to far more than the cap: then the songs farthest from the
+/// current one are left out until it fits (`fit`).
+fn encode(saved: &Saved) -> io::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(saved).map_err(io::Error::other)?;
+    if bytes.len() as u64 <= MAX_FILE_BYTES {
+        return Ok(bytes);
+    }
+    serde_json::to_vec(&fit(saved, MAX_FILE_BYTES)).map_err(io::Error::other)
+}
+
+/// The part of `saved` whose JSON is at most `cap` bytes: the songs farthest from the current
+/// one are dropped first (a played one before one still to come at the same distance), and
+/// the current one is always kept. The size is counted per song (its JSON, a comma, and its
+/// entry in the shuffle order), over everything else as written, so it is an upper bound.
+fn fit(saved: &Saved, cap: u64) -> Saved {
+    let n = saved.queue.len();
+    let current = saved.current_index.min(n.saturating_sub(1));
+    // An entry in the shuffle order: an index (at most as many digits as `n`) and a comma.
+    let order_entry = if saved.original_order.is_some() {
+        n.to_string().len() as u64 + 1
+    } else {
+        0
+    };
+    let sizes: Vec<u64> = saved
+        .queue
+        .iter()
+        .map(|song| json_len(song) + 1 + order_entry)
+        .collect();
+    // Everything but the songs and the shuffle order's entries, counted as written.
+    let mut out = Saved {
+        version: saved.version,
+        queue: Vec::new(),
+        current_index: saved.current_index,
+        position: saved.position,
+        volume: saved.volume,
+        shuffle: saved.shuffle,
+        original_order: saved.original_order.as_ref().map(|_| Vec::new()),
+        repeat: saved.repeat,
+        source_playlist: saved.source_playlist.clone(),
+        continuation: saved.continuation.clone(),
+        exhausted: saved.exhausted,
+        saved_unix: saved.saved_unix,
+    };
+    let mut total = json_len(&out) + sizes.iter().sum::<u64>();
+    let mut range = 0..n;
+    while total > cap && range.len() > 1 {
+        let before = current - range.start;
+        let after = range.end - 1 - current;
+        if after > before {
+            range.end -= 1;
+            total -= sizes[range.end];
+        } else if before > 0 {
+            total -= sizes[range.start];
+            range.start += 1;
+        } else {
+            range.end -= 1;
+            total -= sizes[range.end];
+        }
+    }
+    out.queue = saved.queue[range.clone()].to_vec();
+    out.current_index = current - range.start;
+    out.original_order = saved
+        .original_order
+        .as_ref()
+        .map(|order| order_within(order, &range));
+    out
+}
+
+/// A shuffle order (indexes into the queue) cut to the songs in `range`, renumbered from its
+/// start.
+fn order_within(order: &[usize], range: &Range<usize>) -> Vec<usize> {
+    order
+        .iter()
+        .filter(|p| range.contains(p))
+        .map(|p| p - range.start)
+        .collect()
+}
+
+/// How many bytes `value`'s JSON takes, counted without keeping them.
+fn json_len<T: Serialize>(value: &T) -> u64 {
+    struct Count(u64);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0 += b.len() as u64;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Writing into `Count` can't fail, and our types always serialize.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// Reads `dir/state.json`. `None` when there is none, or when it can't be used (then it is
@@ -322,13 +412,7 @@ fn sanitize(mut s: Saved) -> Saved {
         s.queue.truncate(range.end);
         s.queue.drain(..range.start);
         s.current_index -= range.start;
-        s.original_order = s.original_order.map(|order| {
-            order
-                .into_iter()
-                .filter(|p| range.contains(p))
-                .map(|p| p - range.start)
-                .collect()
-        });
+        s.original_order = s.original_order.map(|order| order_within(&order, &range));
     }
     s
 }
@@ -518,7 +602,6 @@ mod tests {
             position: 42.5,
             volume: 0.4,
             source_playlist: Some("RDAMVMAAAAAAAAAAA".into()),
-            source_kind: SourceKind::Radio,
             continuation: Some("CONT-token_1%3D".into()),
             saved_unix: 1_790_000_000,
             ..Saved::default()
@@ -866,5 +949,74 @@ mod tests {
         w.submit(saved_of("AB", 1));
         assert!(w.finish(saved_of("ABC", 2), Duration::from_secs(5)).await);
         assert_eq!(load(dir.path()), Some(saved_of("ABC", 2)));
+    }
+
+    /// A song with every text field at its cap (`MAX_TEXT` bytes, `MAX_ARTISTS` artists), the
+    /// title made of characters JSON writes as six bytes each: the biggest song a save can
+    /// hold.
+    fn biggest_song(i: usize) -> SongItem {
+        let text = |c: char| c.to_string().repeat(MAX_TEXT);
+        let host = "https://i.ytimg.com/vi/";
+        SongItem {
+            video_id: format!("{i:0>11}"),
+            title: text('\u{1}'),
+            artists: vec![text('a'); MAX_ARTISTS],
+            album: Some(text('b')),
+            thumbnail: Some(format!("{host}{}", "c".repeat(MAX_TEXT - host.len()))),
+            length_seconds: 200,
+            playlist_id: Some(text('d')),
+        }
+    }
+
+    #[test]
+    fn a_save_of_the_biggest_songs_always_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue: Vec<SongItem> = (0..MAX_ITEMS).map(biggest_song).collect();
+        assert!(queue.iter().all(song_ok), "every song is one a load takes");
+        let current = 300;
+        let shuffled: Vec<usize> = (0..MAX_ITEMS).rev().collect();
+        let saved = Saved {
+            queue,
+            current_index: current,
+            position: 42.5,
+            shuffle: true,
+            original_order: Some(shuffled),
+            continuation: Some("C".repeat(MAX_CONTINUATION)),
+            ..Saved::default()
+        };
+        save(dir.path(), &saved).unwrap();
+        let size = std::fs::metadata(dir.path().join(FILE_NAME)).unwrap().len();
+        assert!(size <= MAX_FILE_BYTES, "{size} bytes");
+        let loaded = load(dir.path()).expect("the save loads");
+        // The songs farthest from the current one were left out; the current one is kept,
+        // with its second, and the songs around it on both sides.
+        assert!(loaded.queue.len() < MAX_ITEMS && loaded.queue.len() > 10);
+        let now = &loaded.queue[loaded.current_index];
+        assert_eq!(now.video_id, saved.queue[current].video_id);
+        assert_eq!(loaded.position, 42.5);
+        let first: usize = loaded.queue[0].video_id.parse().unwrap();
+        let last: usize = loaded.queue.last().unwrap().video_id.parse().unwrap();
+        assert!(first < current && last > current);
+        assert!(
+            (current - first).abs_diff(last - current) <= 1,
+            "{first}..={last}"
+        );
+        // The shuffle order is cut to match: still every kept song once, in the same order.
+        let order = loaded.original_order.unwrap();
+        assert_eq!(order, (0..loaded.queue.len()).rev().collect::<Vec<_>>());
+        assert_eq!(loaded.continuation, saved.continuation);
+    }
+
+    #[test]
+    fn source_kind_is_no_longer_saved_but_old_files_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &saved_of("AB", 1)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(!text.contains("source_kind"), "{text}");
+        // A file written before it went still loads.
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        old["source_kind"] = "radio".into();
+        std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
+        assert_eq!(load(dir.path()), Some(saved_of("AB", 1)));
     }
 }

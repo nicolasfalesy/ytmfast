@@ -25,7 +25,7 @@ use ytmfast::engine::{Engine, QueueSource};
 use ytmfast::error::Error;
 use ytmfast::innertube::{NextPage, NextRequest, SongItem};
 use ytmfast::queue::Repeat;
-use ytmfast::state::{self, Saved, SourceKind, Writer};
+use ytmfast::state::{self, Saved, Writer};
 use ytmfast::streams::{Resolver, Stream};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -54,7 +54,6 @@ fn saved() -> Saved {
         original_order: Some(vec![1, 0]),
         repeat: Repeat::All,
         source_playlist: Some("OLAK5uy_example".into()),
-        source_kind: SourceKind::List,
         continuation: None,
         saved_unix: 1,
         ..Saved::default()
