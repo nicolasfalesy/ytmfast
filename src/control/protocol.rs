@@ -599,6 +599,7 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         title,
         artists,
         album,
+        album_id: String::new(),
         thumbnail,
         length_seconds,
         playlist_id: None,
@@ -699,6 +700,8 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
     m.insert("volume".into(), volume_to_percent(status.volume));
     m.insert("muted".into(), json!(status.muted));
     m.insert("album".into(), json!(status.album));
+    // A string, "" when there is none (never null), as browse ids are in the browsing shapes.
+    m.insert("albumId".into(), json!(status.album_id));
     m.insert("queueId".into(), json!(status.queue_id));
     m.insert("shuffle".into(), json!(status.shuffle));
     m.insert("repeat".into(), json!(repeat_name(status.repeat)));
@@ -719,6 +722,8 @@ struct WireItem<'a> {
     title: Option<&'a str>,
     artists: &'a [String],
     album: Option<&'a str>,
+    /// `""` when the song has none, as in a state.
+    album_id: &'a str,
     thumbnail: Option<&'a str>,
     /// Null when unknown (0), as in a state.
     length_seconds: Option<u32>,
@@ -754,6 +759,7 @@ impl<'a> WireQueue<'a> {
                     title: Some(i.song.title.as_str()).filter(|t| !t.is_empty()),
                     artists: &i.song.artists,
                     album: i.song.album.as_deref(),
+                    album_id: &i.song.album_id,
                     thumbnail: i.song.thumbnail.as_deref(),
                     length_seconds: Some(i.song.length_seconds).filter(|s| *s > 0),
                 })
@@ -842,6 +848,7 @@ mod tests {
             title: "Song".into(),
             artists: vec!["A".into(), "B".into()],
             album: Some("Album".into()),
+            album_id: String::new(),
             thumbnail: Some("https://lh3.googleusercontent.com/x=w544-h544".into()),
             length_seconds: 213,
             playlist_id: None,
@@ -1310,8 +1317,17 @@ mod tests {
 
     #[test]
     fn queue_event_and_reply_shape() {
-        let items: Arc<[QueueItem]> =
-            vec![item(1, song("dQw4w9WgXcQ")), item(2, bare("AAAAAAAAAAA"))].into();
+        let items: Arc<[QueueItem]> = vec![
+            item(
+                1,
+                SongItem {
+                    album_id: "MPREb_abc".into(),
+                    ..song("dQw4w9WgXcQ")
+                },
+            ),
+            item(2, bare("AAAAAAAAAAA")),
+        ]
+        .into();
         let event = EngineEvent::Queue {
             items: items.clone(),
             current_id: Some(2),
@@ -1324,12 +1340,12 @@ mod tests {
             json!({"event": "queue", "currentId": 2, "shuffle": true, "repeat": "all",
                    "items": [
                        {"queueId": 1, "videoId": "dQw4w9WgXcQ", "title": "Song",
-                        "artists": ["A", "B"], "album": "Album",
+                        "artists": ["A", "B"], "album": "Album", "albumId": "MPREb_abc",
                         "thumbnail": "https://lh3.googleusercontent.com/x=w544-h544",
                         "lengthSeconds": 213},
-                       // A bare id: details are null until the song plays.
+                       // A bare id: details are null until the song plays; no album id is "".
                        {"queueId": 2, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                        "album": null, "thumbnail": null, "lengthSeconds": null}]})
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]})
         );
         // `queue.get`'s data is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1372,6 +1388,7 @@ mod tests {
                         title: "A Song Title Of Typical Length (Remastered)".into(),
                         artists: vec!["First Artist".into(), "Second Artist".into()],
                         album: Some("An Album Name Of Typical Length".into()),
+                        album_id: "MPREb_abcdefghijk".into(),
                         thumbnail: Some(format!(
                             "https://lh3.googleusercontent.com/{}=w544-h544-l90-rj",
                             "x".repeat(110)
@@ -1440,6 +1457,7 @@ mod tests {
                 thumbnail: Some("https://i.ytimg.com/x.jpg".into()),
             }),
             album: Some("Album".into()),
+            album_id: "MPREb_abc".into(),
             queue_id: Some(7),
             position: 1.234_567,
             volume: 0.8,
@@ -1455,7 +1473,8 @@ mod tests {
             json!({"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ",
                    "title": "Song", "artist": "Artist", "lengthSeconds": 213,
                    "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80,
-                   "muted": true, "album": "Album", "queueId": 7, "shuffle": true,
+                   "muted": true, "album": "Album", "albumId": "MPREb_abc", "queueId": 7,
+                   "shuffle": true,
                    "repeat": "all", "liked": "dislike"})
         );
         // The status reply is the same without "event".
@@ -1468,6 +1487,7 @@ mod tests {
             video_id: None,
             meta: None,
             album: None,
+            album_id: String::new(),
             queue_id: None,
             position: 0.0,
             volume: 1.0,
@@ -1480,7 +1500,8 @@ mod tests {
             Value::Object(status_data(&empty)),
             json!({"state": "stopped", "videoId": null, "title": null, "artist": null,
                    "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100,
-                   "muted": false, "album": null, "queueId": null, "shuffle": false,
+                   "muted": false, "album": null, "albumId": "", "queueId": null,
+                   "shuffle": false,
                    "repeat": "off", "liked": null})
         );
         // Each like status by its socket name.

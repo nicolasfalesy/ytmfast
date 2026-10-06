@@ -323,8 +323,8 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 ```json
 {"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ", "title": "...",
  "artist": "...", "lengthSeconds": 213, "thumbnail": "https://...", "position": 12.5,
- "volume": 80, "muted": false, "album": "...", "queueId": 7, "shuffle": false,
- "repeat": "off", "liked": "like"}
+ "volume": 80, "muted": false, "album": "...", "albumId": "MPREb_...", "queueId": 7,
+ "shuffle": false, "repeat": "off", "liked": "like"}
 ```
 
 - `state` is `playing`, `paused`, `buffering` or `stopped`.
@@ -333,6 +333,11 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
   known (`lengthSeconds` is also `null` when the length is unknown). A song queued with its
   details shows them at once. `artist` names every artist, joined with `", "`.
 - `album` is the current song's album, from its queue item; `null` when it has none.
+- `albumId` is that album's `browseId` (`MPREb_...`), from the same queue item, for opening
+  the album with `browse` (the cover, clicked). It is a string, `""` when there is none: a
+  song with no album link (a user upload), one added with `queue.add` (which takes no album
+  id), or nothing current. It is checked as a `browseId` is (see Browsing); a malformed one
+  is `""`.
 - `queueId` is the current song's id in the queue; `null` when there is none.
 - `position` is in seconds; `volume` is a percent. `shuffle` and `repeat` are as in the
   queue.
@@ -362,17 +367,18 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
 ```json
 {"event": "queue", "items": [
   {"queueId": 7, "videoId": "dQw4w9WgXcQ", "title": "...", "artists": ["..."],
-   "album": "...", "thumbnail": "https://...", "lengthSeconds": 213}],
+   "album": "...", "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213}],
  "currentId": 7, "shuffle": false, "repeat": "off"}
 ```
 
 - `items` are in play order: the shuffled order while shuffle is on.
 - A song added by id alone has `title`, `album`, `thumbnail` and `lengthSeconds` `null`
   and `artists` empty, until it plays.
+- `albumId` is as in the state: the song's album `browseId`, or `""` (never `null`).
 - `currentId` is the current song's `queueId`; `null` when there is none (songs added to
   an empty queue wait for `queue.jump`, `next` or `play`).
 - The whole queue comes every time. The queue holds at most 1,000 songs, so with
-  real-sized details the line is at most about 375 KB.
+  real-sized details the line is at most about 405 KB.
 
 An error:
 

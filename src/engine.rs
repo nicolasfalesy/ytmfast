@@ -287,6 +287,8 @@ pub struct Status {
     pub meta: Option<TrackMeta>,
     /// The current song's album, from its queue item.
     pub album: Option<String>,
+    /// The current song's album browse id, from its queue item; `""` when it has none.
+    pub album_id: String,
     /// The current song's queue id.
     pub queue_id: Option<u64>,
     pub position: f64,
@@ -711,6 +713,7 @@ impl Engine {
                 video_id: None,
                 meta: None,
                 album: None,
+                album_id: String::new(),
                 queue_id: None,
                 position: 0.0,
                 volume: 1.0,
@@ -805,6 +808,7 @@ impl Engine {
         self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
+        self.status.album_id = item.song.album_id.clone();
         self.status.meta = song_meta(&item.song, None);
         self.status.position = at;
         self.start_seconds = at;
@@ -1316,6 +1320,7 @@ impl Engine {
                 {
                     self.status.queue_id = Some(item.id);
                     self.status.album = item.song.album.clone();
+                    self.status.album_id = item.song.album_id.clone();
                 }
                 self.refresh_meta();
                 self.emit_queue();
@@ -1582,6 +1587,7 @@ impl Engine {
         self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
+        self.status.album_id = item.song.album_id.clone();
         self.status.meta = song_meta(&item.song, None);
         self.status.position = 0.0;
         self.resume_from = None;
@@ -1594,6 +1600,7 @@ impl Engine {
         self.reset_liked();
         self.status.queue_id = None;
         self.status.album = None;
+        self.status.album_id.clear();
         self.status.meta = None;
     }
 
@@ -1608,6 +1615,7 @@ impl Engine {
         self.resolved_meta = None;
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
+        self.status.album_id = item.song.album_id.clone();
         // The queue item's details show at once; the link's only fill its gaps.
         self.status.meta = song_meta(&item.song, None);
         // The old song's report ends now, while the preload still tells whether the audio
@@ -2298,6 +2306,7 @@ impl Engine {
         self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
+        self.status.album_id = item.song.album_id.clone();
         self.resolved_meta = Some(source.meta.clone());
         self.status.meta = song_meta(&item.song, self.resolved_meta.as_ref());
         self.current = Some(source);
@@ -3314,6 +3323,7 @@ mod tests {
             title: format!("Title {c}"),
             artists: vec!["One".into(), "Two".into()],
             album: Some("Album".into()),
+            album_id: format!("MPREb_{c}"),
             thumbnail: Some(format!("https://i.ytimg.com/{c}.jpg")),
             length_seconds: 2,
             playlist_id: None,
@@ -4080,6 +4090,8 @@ mod tests {
         let status = r.status().await;
         assert_eq!(status.queue_id, Some(id_of(&q, 'B')));
         assert_eq!(status.album.as_deref(), Some("Album"));
+        // Ruling P15: the album's browse id comes with it, from the same queue item.
+        assert_eq!(status.album_id, "MPREb_B");
         // B plays first; C (the 2 s song's next) may be preloaded already.
         assert_eq!(r.started()[0], vid('B'));
         assert!(!r.started().contains(&vid('A')));
@@ -4832,6 +4844,8 @@ mod tests {
             "no seek is reported: {seen:?}"
         );
         assert_eq!(r.started(), [vid('A'), vid('B')]);
+        // The next song shows its own album link.
+        assert_eq!(r.status().await.album_id, "MPREb_B");
     }
 
     #[tokio::test]
@@ -4875,11 +4889,15 @@ mod tests {
             })
         );
         assert_eq!(status.album.as_deref(), Some("Album"));
+        assert_eq!(first.album_id, "MPREb_A", "known at once, as the album is");
+        assert_eq!(status.album_id, "MPREb_A");
 
-        // A raw song id with no queue details: the resolver's details.
+        // A raw song id with no queue details: the resolver's details, and no album link.
         r.play("XXXXXXXXXXX").await;
         r.until_song("XXXXXXXXXXX", PlayState::Playing).await;
-        assert_eq!(r.status().await.meta, Some(meta("XXXXXXXXXXX")));
+        let status = r.status().await;
+        assert_eq!(status.meta, Some(meta("XXXXXXXXXXX")));
+        assert_eq!(status.album_id, "");
     }
 
     #[tokio::test]

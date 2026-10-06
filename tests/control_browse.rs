@@ -174,6 +174,7 @@ fn status() -> Status {
         video_id: None,
         meta: None,
         album: None,
+        album_id: String::new(),
         queue_id: None,
         position: 0.0,
         volume: 1.0,

@@ -161,6 +161,8 @@ async fn parses_album_queue() {
     for s in &page.items {
         assert_eq!(s.artists, ["Text 3"], "{}", s.video_id);
         assert_eq!(s.album.as_deref(), Some("Text 4"), "{}", s.video_id);
+        // Ruling P15: the album link's browse id, so a widget can open the album.
+        assert_eq!(s.album_id, "MPREb_fakeB0002", "{}", s.video_id);
         assert_eq!(s.thumbnail.as_deref(), Some(FIXTURE_THUMB));
         assert_eq!(s.playlist_id.as_deref(), Some("OLAK5uy_fakeP0004"));
     }
@@ -189,12 +191,14 @@ async fn parses_radio_with_continuation() {
     assert_eq!(first.title, "Text 22");
     assert_eq!(first.artists, ["Text 23"]);
     assert_eq!(first.album.as_deref(), Some("Text 22"));
+    assert_eq!(first.album_id, "MPREb_fakeB0016");
     assert_eq!(first.length_seconds, 5 * 60 + 18);
     // A plain (unwrapped) item parses the same way.
     let third = &page.items[2];
     assert_eq!(third.video_id, "fakeV000025");
     assert_eq!(third.artists, ["Text 33"]);
     assert_eq!(third.album.as_deref(), Some("Text 34"));
+    assert_eq!(third.album_id, "MPREb_fakeB0024");
     assert_eq!(third.length_seconds, 3 * 60 + 50);
     assert_eq!(page.items[11].video_id, "fakeV000057");
 
@@ -283,6 +287,7 @@ async fn parses_liked_byline_variants() {
     let two = by_id("fakeV000106");
     assert_eq!(two.artists, ["Text 138", "Text 139"]);
     assert_eq!(two.album.as_deref(), Some("Text 140"));
+    assert_eq!(two.album_id, "MPREb_fakeB0105");
     // Over an hour is still m:ss on YouTube Music.
     assert_eq!(two.length_seconds, 13 * 60 + 42);
 
@@ -293,6 +298,69 @@ async fn parses_liked_byline_variants() {
     let upload = by_id("fakeV000113");
     assert_eq!(upload.artists, ["Text 149"]);
     assert_eq!(upload.album, None);
+    // No album link: "", never null (the channel link is not an album).
+    assert_eq!(upload.album_id, "");
+}
+
+/// Ruling P15: the album id is shape-checked like every browse id. A malformed one (spaces,
+/// too long, not a string) or a link without one leaves `""`, and the song is still queued
+/// with its album name; only a link to an album page counts.
+#[tokio::test]
+async fn album_id_is_shape_checked() {
+    let album_run = |browse_id: Value| {
+        json!({"text": "An Album", "navigationEndpoint": {"browseEndpoint": {
+            "browseId": browse_id,
+            "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }}
+        }}})
+    };
+    let byline = |album: Value| {
+        json!([
+            plain("Artist"),
+            plain(" • "),
+            album,
+            plain(" • "),
+            plain("2024")
+        ])
+    };
+    let cases = [
+        (album_run(json!("MPREb_good-1")), "MPREb_good-1"),
+        (album_run(json!("MPREb bad")), ""),
+        (album_run(json!("MPREb_\"}")), ""),
+        (album_run(json!("M".repeat(129))), ""),
+        (album_run(json!(42)), ""),
+        (album_run(Value::Null), ""),
+        (
+            json!({"text": "An Album", "navigationEndpoint": {"browseEndpoint": {
+                "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                }}
+            }}}),
+            "",
+        ),
+        // A link to some other page is not an album, whatever its id.
+        (browse("An Album", "MUSIC_PAGE_TYPE_PLAYLIST"), ""),
+    ];
+    let items: Vec<Value> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (run, _))| song(&format!("fakeV{i:06}"), byline(run.clone())))
+        .collect();
+    let page = next_from(&queue_answer(json!(items)), playlist("RDfakeQ"))
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), cases.len(), "every song is kept");
+    for (song, (run, want)) in page.items.iter().zip(&cases) {
+        assert_eq!(song.album_id, *want, "{run}");
+        assert_eq!(song.artists, ["Artist"], "{run}");
+    }
+    assert_eq!(page.items[0].album.as_deref(), Some("An Album"));
+    assert_eq!(
+        page.items[1].album.as_deref(),
+        Some("An Album"),
+        "the name is kept"
+    );
 }
 
 /// Task 6: a queue asked for with a song carries that song's Lyrics tab (the lyrics page's

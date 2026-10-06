@@ -70,6 +70,14 @@ pub struct SongItem {
     /// Each artist once, in the byline's order, with any `" - Topic"` suffix removed.
     pub artists: Vec<String>,
     pub album: Option<String>,
+    /// The album's browse id (`MPREb_…`), from the byline's album link, so a widget can open the
+    /// album of the song playing (its cover, clicked). Shape-checked like every browse id
+    /// (`browse::id_ok`); `""` when the byline links no album, or links one with a malformed id.
+    /// A plain string, never null, as in the browsing shapes. `serde(default)`: a `state.json`
+    /// written before it has no such key and still loads (and serde skips the key for an older
+    /// engine reading a newer file), so the file's version stays 1.
+    #[serde(default)]
+    pub album_id: String,
     /// The widest thumbnail on an allowed host.
     pub thumbnail: Option<String>,
     /// 0 when the answer gives no length, which is how an unplayable item shows.
@@ -309,6 +317,9 @@ struct RawBrowseNavigation {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawBrowseEndpoint {
+    /// Kept raw and checked by `browse::id_ok`: as a typed `String`, a non-string id would fail
+    /// the whole song, which only loses its album link.
+    browse_id: Option<serde_json::Value>,
     browse_endpoint_context_supported_configs: Option<RawBrowseConfigs>,
 }
 
@@ -328,6 +339,19 @@ const PAGE_ARTIST: &str = "MUSIC_PAGE_TYPE_ARTIST";
 const PAGE_ALBUM: &str = "MUSIC_PAGE_TYPE_ALBUM";
 
 impl RawBylineRun {
+    /// The linked page's browse id, when it is one (`browse::id_ok`, as for every browse id
+    /// the engine passes on); `None` for a run with no link, no id, or a malformed one.
+    fn browse_id(&self) -> Option<&str> {
+        self.navigation_endpoint
+            .as_ref()?
+            .browse_endpoint
+            .as_ref()?
+            .browse_id
+            .as_ref()?
+            .as_str()
+            .filter(|id| browse::id_ok(id))
+    }
+
     /// The linked page's type (`MUSIC_PAGE_TYPE_…`), when the run is a link.
     fn page_type(&self) -> Option<&str> {
         self.navigation_endpoint
@@ -429,12 +453,17 @@ fn song(v: RawVideo) -> Option<SongItem> {
     // The id ends up in a URL and a yt-dlp argument, where `&` or `/` would change what is
     // asked for; the control socket applies the same check to the ids it is given.
     let video_id = v.video_id.or(watch_id).filter(|id| is_video_id(id))?;
-    let (artists, album) = v.long_byline_text.map(byline).unwrap_or_default();
+    let Byline {
+        artists,
+        album,
+        album_id,
+    } = v.long_byline_text.map(byline).unwrap_or_default();
     Some(SongItem {
         video_id,
         title: v.title.map(RawText::text).unwrap_or_default(),
         artists,
         album,
+        album_id,
         thumbnail: v.thumbnail.and_then(widest_thumbnail),
         length_seconds: v.length_text.map(|t| parse_length(&t.text())).unwrap_or(0),
         playlist_id,
@@ -447,17 +476,28 @@ fn is_separator(text: &str) -> bool {
     matches!(text.trim(), "" | "•" | "&" | ",")
 }
 
+/// What a song's byline says.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Byline {
+    artists: Vec<String>,
+    album: Option<String>,
+    /// The album link's browse id, `""` without a valid one (ruling P15).
+    album_id: String,
+}
+
 /// The artists and the album from a byline such as `Artist & Artist • Album • 2024`.
 ///
 /// The artists are the names before the first `" • "` (linked or not: a featured artist
 /// often has no link, and a user upload's channel links to a channel page, not an artist),
-/// plus any artist link further on. The album is the run linked to an album page.
-fn byline(b: RawByline) -> (Vec<String>, Option<String>) {
-    let album = b
-        .runs
-        .iter()
-        .find(|r| r.page_type() == Some(PAGE_ALBUM))
-        .and_then(|r| r.text.clone());
+/// plus any artist link further on. The album is the run linked to an album page, and its
+/// browse id is that link's (a malformed id leaves the name, without the link).
+fn byline(b: RawByline) -> Byline {
+    let album_run = b.runs.iter().find(|r| r.page_type() == Some(PAGE_ALBUM));
+    let album = album_run.and_then(|r| r.text.clone());
+    let album_id = album_run
+        .and_then(RawBylineRun::browse_id)
+        .unwrap_or_default()
+        .to_string();
 
     let first_section = b
         .runs
@@ -482,7 +522,11 @@ fn byline(b: RawByline) -> (Vec<String>, Option<String>) {
             }
         }
     }
-    (artists, album)
+    Byline {
+        artists,
+        album,
+        album_id,
+    }
 }
 
 /// `"m:ss"` or `"h:mm:ss"` in seconds; 0 for anything else.
@@ -561,6 +605,12 @@ mod tests {
             {"text": "2024"}
         ]}))
         .unwrap();
-        assert_eq!(byline(b), (vec!["Same".to_string()], None));
+        assert_eq!(
+            byline(b),
+            Byline {
+                artists: vec!["Same".to_string()],
+                ..Byline::default()
+            }
+        );
     }
 }

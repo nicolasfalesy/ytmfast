@@ -171,6 +171,7 @@ fn full_song(id: &str) -> SongItem {
         title: "Song".into(),
         artists: vec!["A".into(), "B".into()],
         album: Some("Album".into()),
+        album_id: String::new(),
         thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
         length_seconds: 213,
         playlist_id: None,
@@ -183,7 +184,10 @@ fn fake_queue() -> QueueView {
         items: vec![
             QueueItem {
                 id: 3,
-                song: full_song(SONG),
+                song: SongItem {
+                    album_id: "MPREb_x".into(),
+                    ..full_song(SONG)
+                },
             },
             QueueItem {
                 id: 9,
@@ -206,6 +210,7 @@ fn paused_status(id: &str) -> Status {
         video_id: Some(id.into()),
         meta: None,
         album: None,
+        album_id: String::new(),
         queue_id: None,
         position: 1.5,
         volume: 0.5,
@@ -767,10 +772,10 @@ async fn queue_get_replies_with_the_queue() {
             "currentId": 3, "shuffle": true, "repeat": "one",
             "items": [
                 {"queueId": 3, "videoId": SONG, "title": "Song", "artists": ["A", "B"],
-                 "album": "Album", "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
-                 "lengthSeconds": 213},
+                 "album": "Album", "albumId": "MPREb_x",
+                 "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg", "lengthSeconds": 213},
                 {"queueId": 9, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                 "album": null, "thumbnail": null, "lengthSeconds": null}]}})
+                 "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]}})
     );
     f.serve.abort();
 }

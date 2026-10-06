@@ -342,6 +342,11 @@ fn sanitize(mut s: Saved) -> Saved {
             .take()
             .and_then(|t| net::allowed_link(&t))
             .filter(|t| text_ok(t));
+        // The widgets browse it (ruling P15): one that `next` would not have let through loses
+        // the album link, not the song, as a bad thumbnail loses the picture.
+        if !song.album_id.is_empty() && !crate::browse::id_ok(&song.album_id) {
+            song.album_id.clear();
+        }
     }
     let keep: Vec<bool> = s.queue.iter().map(song_ok).collect();
     // Old index -> new index, for the songs kept.
@@ -594,6 +599,7 @@ mod tests {
             title: format!("Title {v}"),
             artists: vec!["Artist".into()],
             album: Some("Album".into()),
+            album_id: "MPREb_abc".into(),
             thumbnail: Some(format!("https://i.ytimg.com/vi/{v}/hq.jpg")),
             length_seconds: 200,
             playlist_id: Some("OLAK5uy_abc".into()),
@@ -770,6 +776,20 @@ mod tests {
         s.queue[0].thumbnail = None;
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()).unwrap().queue.len(), 1);
+        // A malformed album id (it goes to the widgets, which browse it) only loses the album
+        // link, as a bad thumbnail loses the picture: the song is kept.
+        let mut s = saved_of("ABCD", 0);
+        s.queue[1].album_id = "MPREb bad".into();
+        s.queue[2].album_id = "e".repeat(129);
+        s.queue[3].album_id = "M".into();
+        save(dir.path(), &s).unwrap();
+        let ids: Vec<String> = load(dir.path())
+            .unwrap()
+            .queue
+            .into_iter()
+            .map(|i| i.album_id)
+            .collect();
+        assert_eq!(ids, ["MPREb_abc", "", "", ""]);
     }
 
     #[test]
@@ -991,6 +1011,8 @@ mod tests {
             title: text('\u{1}'),
             artists: vec![text('a'); MAX_ARTISTS],
             album: Some(text('b')),
+            // The longest browse id `browse::id_ok` takes.
+            album_id: "e".repeat(128),
             thumbnail: Some(format!("{host}{}", "c".repeat(MAX_TEXT - host.len()))),
             length_seconds: 200,
             playlist_id: Some(text('d')),
@@ -1064,5 +1086,50 @@ mod tests {
         old.as_object_mut().unwrap().remove("muted").unwrap();
         std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
         assert_eq!(load(dir.path()), Some(saved_of("AB", 1)));
+    }
+
+    /// Ruling P15: each song's album id is saved. A step 2 file has none and still loads (with
+    /// `""`), and a step 2 engine can still read a file with them (it skips the key), so the
+    /// version stays 1 both ways.
+    #[test]
+    fn album_id_is_saved_and_files_without_it_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = saved_of("AB", 1);
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).unwrap().queue[1].album_id, "MPREb_abc");
+        assert_eq!(load(dir.path()), Some(s.clone()));
+
+        // A step 2 file: no `album_id` on any song.
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(text.contains("\"album_id\":\"MPREb_abc\""), "{text}");
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for song in old["queue"].as_array_mut().unwrap() {
+            song.as_object_mut().unwrap().remove("album_id").unwrap();
+        }
+        std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
+        let back = load(dir.path()).expect("a step 2 file loads");
+        assert!(back.queue.iter().all(|i| i.album_id.is_empty()));
+        let mut want = s.clone();
+        want.queue.iter_mut().for_each(|i| i.album_id.clear());
+        assert_eq!(back, want);
+
+        // A step 2 engine's song, as it was (no `album_id`, no `deny_unknown_fields`), reads
+        // this file's songs: serde skips the new key.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Step2Song {
+            video_id: String,
+            title: String,
+            artists: Vec<String>,
+            album: Option<String>,
+            thumbnail: Option<String>,
+            length_seconds: u32,
+            playlist_id: Option<String>,
+        }
+        let new: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for song in new["queue"].as_array().unwrap() {
+            let s2: Step2Song = serde_json::from_value(song.clone()).unwrap();
+            assert_eq!(s2.album.as_deref(), Some("Album"));
+        }
     }
 }
