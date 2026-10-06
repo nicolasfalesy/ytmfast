@@ -49,6 +49,10 @@ pub struct AudioFormat {
 pub struct Tracking {
     pub playback_url: Option<String>,
     pub watchtime_url: Option<String>,
+    /// The answer's `responseContext.visitorData`: the pings send it back as
+    /// `X-Goog-Visitor-Id`. It identifies the visitor, so it is treated like a session value
+    /// (never logged). Only the music web client's answer (`play_tracking`) fills it.
+    pub visitor_data: Option<String>,
 }
 
 /// Shows whether a URL is there, never the URL: stream links carry access tokens, and these
@@ -75,6 +79,7 @@ impl fmt::Debug for Tracking {
         f.debug_struct("Tracking")
             .field("playback_url", &redacted(&self.playback_url))
             .field("watchtime_url", &redacted(&self.watchtime_url))
+            .field("visitor_data", &redacted(&self.visitor_data))
             .finish()
     }
 }
@@ -103,6 +108,97 @@ impl Innertube {
         }
         Ok(parsed)
     }
+}
+
+impl Innertube {
+    /// The song's play-history links, from the music web client's `player` answer (sent to
+    /// music.youtube.com), and the visitor id the pings must carry.
+    ///
+    /// Why a second `player` request: the TV answer's links answer 204 but never reach the
+    /// YouTube Music history; this one, with exactly this body and the pings' headers in
+    /// `Innertube::ping`, appeared in the history within 10 s in the step-2 spike (ledger,
+    /// "T7 spike result", variant 2). `sts` is the current player script's timestamp, as for
+    /// the TV request; the spike's working variant sent it and the one without it did not
+    /// count, so it stays.
+    ///
+    /// Errors: as `player`; `Unavailable` when the answer has no playback link (or only links
+    /// off the allowlist).
+    pub async fn play_tracking(&self, video_id: &str, sts: u32) -> Result<Tracking, Error> {
+        let client = &clients::WEB_REMIX;
+        let body = tracking_body(client, video_id, sts);
+        let answer = self.post(client, "player", &body).await?;
+        parse_tracking(&answer, |u| self.target_allows(u))
+    }
+}
+
+/// The spike's variant 2: the client, the song and the signature timestamp, nothing else.
+fn tracking_body(client: &clients::ClientInfo, video_id: &str, sts: u32) -> serde_json::Value {
+    json!({
+        "context": {
+            "client": {
+                "clientName": client.name,
+                "clientVersion": client.version,
+                "hl": "en",
+            }
+        },
+        "videoId": video_id,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "signatureTimestamp": sts,
+            }
+        },
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTrackingAnswer {
+    playback_tracking: Option<RawTracking>,
+    response_context: Option<RawResponseContext>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawResponseContext {
+    visitor_data: Option<String>,
+}
+
+/// The longest visitor id kept. Real ones are about 30-80 characters; the cap only stops an
+/// odd answer from putting a huge value into every ping's headers.
+const MAX_VISITOR_DATA: usize = 512;
+
+/// The tracking links of a music web `player` answer. `allowed` checks every link (ruling
+/// R7): the allowlist in production, the test server in tests.
+fn parse_tracking(answer: &[u8], allowed: impl Fn(&Url) -> bool) -> Result<Tracking, Error> {
+    // Fixed text: serde_json's message can quote part of the answer.
+    let raw: RawTrackingAnswer = serde_json::from_slice(answer)
+        .map_err(|_| Error::Internal("the player answer could not be read".into()))?;
+    let ok = |b: Option<RawBaseUrl>| {
+        b.and_then(|b| b.base_url)
+            .filter(|u| Url::parse(u).is_ok_and(|u| allowed(&u)))
+    };
+    let (playback_url, watchtime_url) = match raw.playback_tracking {
+        Some(t) => (
+            ok(t.videostats_playback_url),
+            ok(t.videostats_watchtime_url),
+        ),
+        None => (None, None),
+    };
+    if playback_url.is_none() {
+        return Err(Error::Unavailable("no play-history link".into()));
+    }
+    // Only what can go into a header as it is: visible ASCII (it is base64 and %-escapes).
+    let visitor_data = raw
+        .response_context
+        .and_then(|c| c.visitor_data)
+        .filter(|v| {
+            !v.is_empty() && v.len() <= MAX_VISITOR_DATA && v.bytes().all(|b| b.is_ascii_graphic())
+        });
+    Ok(Tracking {
+        playback_url,
+        watchtime_url,
+        visitor_data,
+    })
 }
 
 /// The request body, as yt-dlp 2026.08.19 sends it for this client.
@@ -345,6 +441,7 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
         .map(|t| Tracking {
             playback_url: t.videostats_playback_url.and_then(allowed_base_url),
             watchtime_url: t.videostats_watchtime_url.and_then(allowed_base_url),
+            visitor_data: None,
         })
         .unwrap_or_default();
 
@@ -571,6 +668,74 @@ mod tests {
         assert_eq!(
             t.watchtime_url.as_deref(),
             Some("https://s.youtube.com/api/stats/watchtime")
+        );
+    }
+
+    #[test]
+    fn tracking_answer_links_are_checked() {
+        let a = answer(json!({
+            "responseContext": {"visitorData": "CgtWaXNpdG9y%3D%3D"},
+            "playbackTracking": {
+                "videostatsPlaybackUrl": {"baseUrl": "https://s.youtube.com/api/stats/playback?docid=x"},
+                "videostatsWatchtimeUrl": {"baseUrl": "https://evil.example/api/stats/watchtime"}
+            }
+        }));
+        let t = parse_tracking(&a, net::allowed_host).unwrap();
+        assert_eq!(
+            t.playback_url.as_deref(),
+            Some("https://s.youtube.com/api/stats/playback?docid=x")
+        );
+        assert_eq!(t.watchtime_url, None);
+        assert_eq!(t.visitor_data.as_deref(), Some("CgtWaXNpdG9y%3D%3D"));
+        // The visitor id never shows in Debug output.
+        assert!(!format!("{t:?}").contains("CgtW"));
+    }
+
+    #[test]
+    fn no_playback_link_is_unavailable() {
+        let a = answer(json!({"playbackTracking": {
+            "videostatsPlaybackUrl": {"baseUrl": "http://s.youtube.com/api/stats/playback"}
+        }}));
+        assert_eq!(
+            parse_tracking(&a, net::allowed_host),
+            Err(Error::Unavailable("no play-history link".into()))
+        );
+        let a = answer(json!({"playabilityStatus": {"status": "OK"}}));
+        assert!(parse_tracking(&a, net::allowed_host).is_err());
+    }
+
+    #[test]
+    fn odd_visitor_ids_are_dropped() {
+        for bad in [
+            "",
+            "has space",
+            "line\nbreak",
+            &"x".repeat(MAX_VISITOR_DATA + 1),
+        ] {
+            let a = answer(json!({
+                "responseContext": {"visitorData": bad},
+                "playbackTracking": {"videostatsPlaybackUrl":
+                    {"baseUrl": "https://s.youtube.com/api/stats/playback"}}
+            }));
+            assert_eq!(
+                parse_tracking(&a, net::allowed_host).unwrap().visitor_data,
+                None,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracking_body_is_the_spike_recipe() {
+        let b = tracking_body(&clients::WEB_REMIX, "abc", 20725);
+        assert_eq!(
+            b,
+            json!({
+                "context": {"client": {"clientName": "WEB_REMIX",
+                    "clientVersion": clients::WEB_REMIX.version, "hl": "en"}},
+                "videoId": "abc",
+                "playbackContext": {"contentPlaybackContext": {"signatureTimestamp": 20725}}
+            })
         );
     }
 }

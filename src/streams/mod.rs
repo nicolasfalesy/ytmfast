@@ -28,6 +28,7 @@ use crate::auth::Session;
 use crate::error::Error;
 use crate::innertube::{AudioFormat, Innertube, PlayerResponse, Tracking, clients};
 use crate::net;
+use crate::report::ReportApi;
 use crate::solver::{ChallengeKind, ChallengeSolver, player_js};
 use crate::trace;
 use ytdlp::YtDlp;
@@ -341,6 +342,31 @@ impl Streams {
         Ok((id, sts, Some(code)))
     }
 
+    /// The current signature timestamp, for the play reports: the one the last resolve used
+    /// while it is fresh (no request at all, the usual case: the song was resolved moments
+    /// ago), else read from the current player script, which comes from the disk cache when
+    /// a resolve already fetched it, so `base.js` is never downloaded twice. Unlike
+    /// `current_player`, a version the solver failed on is fine here (only its timestamp is
+    /// needed), and nothing is remembered: after a failure `fetch` cleared the memo on
+    /// purpose, so the next resolve asks for the current version.
+    async fn current_sts(&self) -> Result<u32, Error> {
+        let memo = self
+            .player
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((_, sts, at)) = memo
+            && at.elapsed() < PLAYER_ID_TTL
+        {
+            return Ok(sts);
+        }
+        let id = player_js::current_player_id_at(&self.http, &self.web_base).await?;
+        let code = self.player_code(&id).await?;
+        player_js::sts(&code).ok_or_else(|| {
+            Error::StreamFailed("the player script has no signature timestamp".into())
+        })
+    }
+
     /// `StreamFailed` when the solver failed on player `id` less than `FAILED_PLAYER_RETRY`
     /// ago, in this process or (from the marker file) an earlier one.
     fn check_player_not_failed(&self, id: &str) -> Result<(), Error> {
@@ -460,6 +486,22 @@ impl Resolver for Streams {
         let stream = self.fetch(video_id, true).await?;
         self.remember(&stream);
         Ok(stream)
+    }
+}
+
+/// The play reports go through the resolver because it holds the current player script's
+/// signature timestamp (the music web `player` request needs it, ledger "T7 spike result")
+/// and the session's `Innertube`.
+#[async_trait]
+impl ReportApi for Streams {
+    async fn tracking(&self, video_id: &str) -> Result<Tracking, Error> {
+        check_video_id(video_id)?;
+        let sts = self.current_sts().await?;
+        self.api.play_tracking(video_id, sts).await
+    }
+
+    async fn ping(&self, url: Url, visitor_data: Option<String>) -> Result<(), Error> {
+        self.api.ping(&url, visitor_data.as_deref()).await
     }
 }
 

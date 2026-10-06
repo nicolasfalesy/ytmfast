@@ -13,11 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use url::Url;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ytmfast::auth::{Cookie, MemoryStore, Session};
 use ytmfast::error::Error;
 use ytmfast::innertube::{AudioFormat, Innertube};
+use ytmfast::report::ReportApi;
 use ytmfast::solver::{Answers, ChallengeKind, ChallengeSolver};
 use ytmfast::streams::ytdlp::{YtDlp, YtDlpCommand};
 use ytmfast::streams::{Resolver, Streams, pick_format};
@@ -468,6 +469,88 @@ async fn sts_reaches_the_player_request() {
         body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"],
         20725
     );
+}
+
+/// The music web client's `player` answer (the play reports' links), on the test server.
+async fn mount_tracking(server: &MockServer) {
+    let answer = json!({
+        "responseContext": {"visitorData": "CgtGYWtl"},
+        "playbackTracking": {"videostatsPlaybackUrl":
+            {"baseUrl": format!("{}/api/stats/playback?docid={VIDEO}", server.uri())}}
+    });
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/player"))
+        .and(header("x-youtube-client-name", "67"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        // Before the TV answer, which matches any `player` request.
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+fn script_fetches(requests: &[wiremock::Request]) -> (usize, usize) {
+    let count = |p: &str| {
+        requests
+            .iter()
+            .filter(|q| q.url.path().ends_with(p))
+            .count()
+    };
+    (count("/iframe_api"), count("/base.js"))
+}
+
+#[tokio::test]
+async fn tracking_reuses_the_resolves_player_script() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    mount_tracking(&r.server).await;
+    r.streams.resolve(VIDEO).await.unwrap();
+    let t = r.streams.tracking(VIDEO).await.unwrap();
+    assert_eq!(t.visitor_data.as_deref(), Some("CgtGYWtl"));
+    let requests = r.server.received_requests().await.unwrap();
+    // The player version and script were fetched once, by the resolve: the report reused
+    // its timestamp.
+    assert_eq!(script_fetches(&requests), (1, 1));
+    let music = requests
+        .iter()
+        .filter(|q| {
+            q.headers
+                .get("x-youtube-client-name")
+                .is_some_and(|v| v == "67")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(music.len(), 1);
+    let body: Value = serde_json::from_slice(&music[0].body).unwrap();
+    assert_eq!(body["context"]["client"]["clientName"], "WEB_REMIX");
+    assert_eq!(
+        body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"],
+        20725
+    );
+}
+
+#[tokio::test]
+async fn tracking_without_a_resolve_reads_the_cached_script() {
+    // A restarted engine (no remembered version): the script comes from the disk cache that
+    // an earlier resolve filled, so only the small version check goes out.
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    mount_tracking(&r.server).await;
+    r.streams.resolve(VIDEO).await.unwrap();
+    let restarted = r.restart();
+    restarted.tracking(VIDEO).await.unwrap();
+    let requests = r.server.received_requests().await.unwrap();
+    assert_eq!(script_fetches(&requests), (2, 1));
+    // A bad id is refused before any request.
+    assert!(restarted.tracking("../x").await.is_err());
 }
 
 #[tokio::test]

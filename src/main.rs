@@ -20,6 +20,7 @@ use ytmfast::engine::Engine;
 use ytmfast::error::Error;
 use ytmfast::innertube::{Innertube, clients};
 use ytmfast::paths;
+use ytmfast::report::Reporter;
 use ytmfast::solver::Solver;
 use ytmfast::state;
 use ytmfast::streams::lazy::{self, LazySession};
@@ -280,10 +281,11 @@ fn backend() -> Result<Arc<LazySession>, String> {
             Arc::new(YtDlpCommand::new(runtime_dir.clone())),
             cache.clone(),
         ));
-        // One `Innertube` (so one session) for links and queues.
+        // One `Innertube` (so one session) for links, queues and play reports.
         lazy::Loaded {
-            resolver,
+            resolver: resolver.clone(),
             queue: api,
+            reports: resolver,
         }
     });
     Ok(Arc::new(LazySession::new(store, build)))
@@ -371,7 +373,10 @@ async fn serve(
         Box::new(PipeWireSink::new())
     };
     let player = AudioPlayer::spawn(sink);
-    let (mut engine, cmds, events) = Engine::new(backend.clone(), backend, player);
+    let (mut engine, cmds, events) = Engine::new(backend.clone(), backend.clone(), player);
+    // Every song heard counts in the account's YouTube Music history, as with the official
+    // player (its pings go through the same lazily loaded session).
+    engine.report_with(Reporter::new(backend));
     // The queue, song and second from before the restart (paused: resume never plays by
     // itself), and saving from now on. Without a state folder the engine still plays; it
     // just starts fresh each time.

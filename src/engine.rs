@@ -30,6 +30,10 @@
 //!
 //! The state follows the commands (pause is paused at once), except that a song only turns
 //! `Playing` when the audio thread says it started: until then it is `Buffering`.
+//!
+//! Play reports (`crate::report`): every play of a song that is heard (its `Started`, or its
+//! `Advanced` for a gapless handover) gets its own report, told about the position ticks,
+//! pauses, resumes and seeks, and ended wherever the song stops being the one playing.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -47,8 +51,10 @@ use crate::audio::player::{AudioEvent, AudioPlayer};
 use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
+use crate::report::{self, PlayReport, Reporter};
 use crate::state::{self, Saved, SourceKind, Writer};
 use crate::streams::{Resolver, Stream, TrackMeta};
+use url::Url;
 
 /// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
 /// production; a trait so the engine's tests can answer with their own pages. Used as
@@ -370,6 +376,10 @@ pub struct Engine {
     /// refills the same way).
     source_playlist: Option<String>,
     source_kind: SourceKind,
+    /// Starts play reports; `None` when nothing is reported (most tests).
+    reporter: Option<Reporter>,
+    /// The report of the song playing now: from when it was first heard until it stops.
+    report: Option<PlayReport>,
 }
 
 impl Engine {
@@ -456,6 +466,8 @@ impl Engine {
             seeked_to: None,
             source_playlist: None,
             source_kind: SourceKind::List,
+            reporter: None,
+            report: None,
         };
         (engine, cmd_tx, events)
     }
@@ -508,6 +520,22 @@ impl Engine {
         self.writer = Some(writer);
     }
 
+    /// Reports every song heard from now on to the account's history.
+    pub fn report_with(&mut self, reporter: Reporter) {
+        self.reporter = Some(reporter);
+    }
+
+    /// Downloads tracks with links on `base`'s origin (a local http test server) allowed as
+    /// well as the allowlist. For tests only, like `TrackBuffer::start_with_test_base`: it is
+    /// the one way past the https allowlist for an engine's downloads (ruling R7).
+    pub fn download_from_test_base(&mut self, base: Url) {
+        // No timeouts, as in the engine's own tests: a paused test clock would fire them.
+        let client = reqwest::Client::new();
+        self.start_buffer = Box::new(move |stream, relink| {
+            TrackBuffer::start_with_test_base(stream, relink, base.clone(), client.clone())
+        });
+    }
+
     /// Runs until `Quit`, or until every command sender is gone. Stops the audio thread on
     /// the way out.
     pub async fn run(mut self) {
@@ -530,6 +558,10 @@ impl Engine {
         }
         // Every way out (the socket's quit, idle, a signal) ends here: one last save, while
         // the player still knows the position. Bounded, so a hung disk can't hold up a stop.
+        // The song playing now gets its last report (best-effort: the runtime may stop
+        // before it is sent).
+        let at = self.snapshot().position;
+        self.end_report(at);
         if let Some(writer) = self.writer.take() {
             let last = self.saved();
             if !writer.finish(last, LAST_SAVE_WAIT).await {
@@ -961,6 +993,7 @@ impl Engine {
         if self.loaded && self.started {
             self.status.position = self.player.position();
         }
+        self.end_report(self.status.position);
         self.generation += 1;
         if let Some(task) = self.resolving.take() {
             task.abort();
@@ -1102,6 +1135,13 @@ impl Engine {
 
     /// Drops the old song at once, and shows the new one buffering.
     fn begin(&mut self, video_id: &str, start: f64) {
+        // The old song's report ends where it stopped playing.
+        let was_at = if self.loaded && self.started {
+            self.player.position()
+        } else {
+            self.status.position
+        };
+        self.end_report(was_at);
         self.generation += 1;
         if let Some(task) = self.resolving.take() {
             task.abort();
@@ -1256,6 +1296,9 @@ impl Engine {
             PlayState::Playing => {
                 self.player.pause();
                 self.status.position = self.player.position();
+                if let Some(r) = &self.report {
+                    r.pause(self.status.position);
+                }
             }
             PlayState::Buffering => {
                 // Still resolving: `on_resolved` sees the state and loads without playing.
@@ -1288,6 +1331,9 @@ impl Engine {
         // A song that never started waits for the audio thread's `Started`.
         if self.loaded && self.started {
             self.set_playing();
+            if let Some(r) = &self.report {
+                r.resume(self.player.position());
+            }
         } else {
             self.status.state = PlayState::Buffering;
         }
@@ -1309,6 +1355,13 @@ impl Engine {
             // The decoder lands at most 1 s before the end (so a seek never lands on
             // silence); the reported position must match where the audio really goes.
             at = at.min((f64::from(len) - 1.0).max(0.0));
+        }
+        if self.loaded
+            && self.started
+            && let Some(r) = &self.report
+        {
+            // Read before the seek goes to the audio thread: where the played range ended.
+            r.seek(self.player.position(), at);
         }
         if self.loaded {
             self.player.seek(at);
@@ -1353,6 +1406,15 @@ impl Engine {
         match event {
             AudioEvent::Started => {
                 self.started = true;
+                // Heard: the play is reported from here (unless it is the same play going
+                // on after an output restart, which kept its report).
+                let at = self.player.position();
+                match &self.report {
+                    // The kept report: it may have been told of a pause before the output
+                    // went, and the song plays again from `at`.
+                    Some(r) => r.resume(at),
+                    None => self.start_report(at),
+                }
                 // A song played: the skipping run (if any) is over.
                 self.skip_streak = 0;
                 if self.status.state == PlayState::Buffering {
@@ -1360,7 +1422,6 @@ impl Engine {
                     self.emit_state();
                 }
                 // A song started with under 10 s left preloads the next at once.
-                let at = self.player.position();
                 self.maybe_preload(at);
             }
             AudioEvent::Advanced(ticket) => self.on_advanced(ticket),
@@ -1368,6 +1429,7 @@ impl Engine {
             AudioEvent::Paused | AudioEvent::Resumed | AudioEvent::Loading => {}
             AudioEvent::Ended => {
                 self.status.position = self.player.position();
+                self.end_report(self.status.position);
                 self.loaded = false;
                 self.started = false;
                 self.ticker = None;
@@ -1387,13 +1449,19 @@ impl Engine {
             AudioEvent::Error(e) => {
                 self.status.position = self.player.position();
                 let was_paused = self.status.state == PlayState::Paused;
+                let replay =
+                    e == Error::OutputRestarted && !self.replayed && self.queue.current().is_some();
+                // The replay below is the same play going on, not a second one: it keeps its
+                // report (and its cpn), so the song isn't counted twice in the history.
+                let kept = if replay { self.report.take() } else { None };
                 self.fail(&e);
                 // The sound server restarted under the song (often a `systemctl restart` or
                 // an update): after reporting it, play the song again from where it was, on
                 // a new stream. The link is usually still cached, so this is quick.
-                if e == Error::OutputRestarted && !self.replayed && self.queue.current().is_some() {
+                if replay {
                     let at = self.status.position;
                     self.start_current(at);
+                    self.report = kept;
                     self.replayed = true;
                     // A paused song comes back paused: it loads at its place and waits for a
                     // play, rather than starting by itself after a restart.
@@ -1408,6 +1476,7 @@ impl Engine {
     /// The current song failed: report it, and stop, keeping the song and where it stopped
     /// in the status, so a play goes on from there.
     fn fail(&mut self, e: &Error) {
+        self.end_report(self.status.position);
         self.drop_preload();
         self.current = None;
         self.loaded = false;
@@ -1439,6 +1508,9 @@ impl Engine {
         }
         let seconds = self.player.position();
         self.status.position = seconds;
+        if let Some(r) = &self.report {
+            r.tick(seconds);
+        }
         self.emit(EngineEvent::Position {
             seconds,
             seeked: false,
@@ -1450,6 +1522,16 @@ impl Engine {
     /// The audio thread moved on to the preload with this id: its song is current now, as if
     /// it had been loaded (but with no load, and no `Buffering`: it is already playing).
     fn on_advanced(&mut self, ticket: u64) {
+        // The old song played to its end, whichever item comes next: its report ends there
+        // (the player's position is already the new track's, so its length stands in).
+        let old_end = self
+            .status
+            .meta
+            .as_ref()
+            .map(|m| f64::from(m.length_seconds))
+            .filter(|l| *l > 0.0)
+            .unwrap_or(self.status.position);
+        self.end_report(old_end);
         let next = self.queue.peek_next(true).map(|i| i.id);
         let source = match self.preload.take() {
             Some(Preload {
@@ -1493,11 +1575,34 @@ impl Engine {
             // Ticks a whole second into the new song, not on the old one's beat.
             t.reset();
         }
+        // Heard from its first frame: a new play, with its own report (and cpn).
+        self.start_report(at);
         self.emit_queue();
         self.emit_state();
         self.maybe_refill();
         // A short song: the one after it is due at once.
         self.maybe_preload(at);
+    }
+
+    /// Starts the report of the song now heard, at `at`.
+    fn start_report(&mut self, at: f64) {
+        self.end_report(at);
+        let (Some(reporter), Some(video_id)) = (&self.reporter, &self.status.video_id) else {
+            return;
+        };
+        let length = self
+            .status
+            .meta
+            .as_ref()
+            .map_or(0.0, |m| f64::from(m.length_seconds));
+        self.report = Some(reporter.start(video_id, report::cpn(), at, length));
+    }
+
+    /// Ends the current song's report (if it has one) at `at`.
+    fn end_report(&mut self, at: f64) {
+        if let Some(r) = self.report.take() {
+            r.end(at);
+        }
     }
 
     /// From 10 s before the current song's end (`PRELOAD_LEAD_SECS`), makes the next item
@@ -2008,6 +2113,8 @@ mod tests {
         saved: Option<Saved>,
         /// Where it saves.
         writer: Option<Writer>,
+        /// Reports plays to a recording fake.
+        reports: bool,
     }
 
     struct Rig {
@@ -2020,6 +2127,58 @@ mod tests {
         source: Arc<FakeSource>,
         server: Server,
         task: JoinHandle<()>,
+        reports: Arc<FakeReports>,
+    }
+
+    /// Hands out made-up history links and records what the reports ask and send. Nothing
+    /// leaves the process.
+    #[derive(Default)]
+    struct FakeReports {
+        tracked: Mutex<Vec<String>>,
+        pings: Mutex<Vec<Url>>,
+    }
+
+    #[async_trait]
+    impl crate::report::ReportApi for FakeReports {
+        async fn tracking(&self, video_id: &str) -> Result<Tracking, Error> {
+            self.tracked.lock().unwrap().push(video_id.into());
+            let link = |kind: &str| {
+                Some(format!(
+                    "https://s.youtube.com/api/stats/{kind}?docid={video_id}"
+                ))
+            };
+            Ok(Tracking {
+                playback_url: link("playback"),
+                watchtime_url: link("watchtime"),
+                visitor_data: None,
+            })
+        }
+        async fn ping(&self, url: Url, _: Option<String>) -> Result<(), Error> {
+            self.pings.lock().unwrap().push(url);
+            Ok(())
+        }
+    }
+
+    impl FakeReports {
+        /// The `cpn` of every ping of `kind`, in order.
+        fn cpns(&self, kind: &str) -> Vec<String> {
+            self.pings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|u| u.path().ends_with(kind))
+                .filter_map(|u| u.query_pairs().find(|(k, _)| k == "cpn"))
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        }
+        fn finals(&self) -> usize {
+            self.pings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|u| u.query_pairs().any(|(k, v)| k == "final" && v == "1"))
+                .count()
+        }
     }
 
     fn sink(fast: bool) -> (Box<NullSink>, Arc<NullStats>) {
@@ -2133,6 +2292,10 @@ mod tests {
         if let Some(writer) = setup.writer {
             engine.save_with(writer);
         }
+        let reports = Arc::new(FakeReports::default());
+        if setup.reports {
+            engine.report_with(Reporter::new(reports.clone()));
+        }
         let events = events.subscribe();
         let task = tokio::spawn(engine.run());
         Rig {
@@ -2144,6 +2307,7 @@ mod tests {
             source,
             server,
             task,
+            reports,
         }
     }
 
@@ -2397,6 +2561,63 @@ mod tests {
         r.until(PlayState::Stopped).await;
         r.until(PlayState::Playing).await;
         assert_eq!(r.started().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_output_restart_keeps_the_plays_report_and_a_replay_gets_a_new_one() {
+        let mut r = rig(Setup {
+            reports: true,
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Playing).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        r.stats.lose_output();
+        r.until(PlayState::Stopped).await;
+        r.until(PlayState::Playing).await;
+        // Played to its end after the restart: one play, one report.
+        r.until(PlayState::Stopped).await;
+        eventually("the end ping", || r.reports.finals() == 1).await;
+        assert_eq!(*r.reports.tracked.lock().unwrap(), ["AAAAAAAAAAA"]);
+        let first = r.reports.cpns("playback");
+        assert_eq!(first.len(), 1);
+        assert!(r.reports.cpns("watchtime").iter().all(|c| *c == first[0]));
+
+        // Played again after its end: a new play, with a new cpn.
+        r.send(EngineCmd::Play {
+            video_id: None,
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        })
+        .await;
+        r.until(PlayState::Playing).await;
+        eventually("the second playback ping", || {
+            r.reports.cpns("playback").len() == 2
+        })
+        .await;
+        let both = r.reports.cpns("playback");
+        assert_ne!(both[0], both[1]);
+    }
+
+    #[tokio::test]
+    async fn a_song_skipped_while_buffering_is_never_reported() {
+        let mut r = rig(Setup {
+            reports: true,
+            delays: vec![("AAAAAAAAAAA", 300)],
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Buffering).await;
+        r.play("BBBBBBBBBBB").await;
+        r.until_song("BBBBBBBBBBB", PlayState::Playing).await;
+        eventually("B's playback ping", || {
+            r.reports.cpns("playback").len() == 1
+        })
+        .await;
+        assert_eq!(*r.reports.tracked.lock().unwrap(), ["BBBBBBBBBBB"]);
     }
 
     #[tokio::test]

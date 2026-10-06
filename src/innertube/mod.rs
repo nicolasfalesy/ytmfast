@@ -27,6 +27,9 @@ use clients::ClientInfo;
 /// session's cookies, so anything they send is ignored.
 const COOKIE_DOMAINS: &[&str] = &["youtube.com", "google.com"];
 
+/// The `Referer` of the music web app's own requests: its page.
+const MUSIC_REFERER: &str = "https://music.youtube.com/";
+
 /// Where requests go.
 enum Target {
     /// Production: each client to `https://{api_host}` from its own `ClientInfo`, so `player`
@@ -92,6 +95,84 @@ impl Innertube {
         // its size.
         url.set_query(Some("prettyPrint=false"));
         url
+    }
+
+    /// Whether a link that came in an answer may be requested: on the allowlist in
+    /// production; in tests, only on the injected test server, so a test can never reach a
+    /// real YouTube host (ruling R7).
+    pub(crate) fn target_allows(&self, url: &Url) -> bool {
+        match &self.target {
+            Target::ApiHost => net::allowed_host(url),
+            Target::Fixed(base) => url.origin() == base.origin(),
+        }
+    }
+
+    /// One play-history ping: a GET of `url` (a `playbackTracking` link with the report's
+    /// parameters added) as the music web client, with the session.
+    ///
+    /// The headers are the ones that made a play reach the YouTube Music history in the
+    /// step-2 spike (ledger, variant 2): the music web user agent, `Origin` and `X-Origin`
+    /// music.youtube.com, `Referer` music.youtube.com/, the SAPISIDHASH for that origin,
+    /// `X-Goog-AuthUser: 0`, `X-Goog-Visitor-Id` from the same song's answer, and the
+    /// cookies. The answer's body (empty, a 204) is not read; its `Set-Cookie`s are kept.
+    ///
+    /// Errors (fixed text, never the link, ruling R6): `Internal` for a link off the
+    /// allowlist (nothing is sent), `SignedOut` for no session or a 401, `Network` otherwise.
+    pub async fn ping(&self, url: &Url, visitor_data: Option<&str>) -> Result<(), Error> {
+        if !self.target_allows(url) {
+            return Err(Error::Internal(
+                "a play-history link is not on an allowed host".into(),
+            ));
+        }
+        let client = &clients::WEB_REMIX;
+        let (cookie, auth) = {
+            let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                session.cookie_header(url),
+                sidhash::authorization(&session, client.origin, now_unix()),
+            )
+        };
+        let Some(auth) = auth else {
+            return Err(Error::SignedOut);
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(client.user_agent),
+        );
+        headers.insert(header::ORIGIN, HeaderValue::from_static(client.origin));
+        headers.insert(
+            HeaderName::from_static("x-origin"),
+            HeaderValue::from_static(client.origin),
+        );
+        headers.insert(header::REFERER, HeaderValue::from_static(MUSIC_REFERER));
+        headers.insert(
+            HeaderName::from_static("x-goog-authuser"),
+            HeaderValue::from_static("0"),
+        );
+        if let Some(v) = visitor_data {
+            headers.insert(
+                HeaderName::from_static("x-goog-visitor-id"),
+                secret_header(v)?,
+            );
+        }
+        headers.insert(header::AUTHORIZATION, secret_header(&auth)?);
+        if !cookie.is_empty() {
+            headers.insert(header::COOKIE, secret_header(&cookie)?);
+        }
+        let resp = self.http.get(url.clone()).headers(headers).send().await?;
+        self.absorb_set_cookies(&resp);
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::SignedOut);
+        }
+        if !status.is_success() {
+            return Err(Error::Network(format!(
+                "YouTube answered HTTP {}",
+                status.as_u16()
+            )));
+        }
+        Ok(())
     }
 
     /// POSTs `body` as `client` to `endpoint` and returns the answer's bytes (at most

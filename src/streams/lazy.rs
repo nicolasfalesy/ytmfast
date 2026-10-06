@@ -18,18 +18,21 @@ use async_trait::async_trait;
 use crate::auth::{Session, SessionStore};
 use crate::engine::QueueSource;
 use crate::error::Error;
-use crate::innertube::{NextPage, NextRequest};
+use crate::innertube::{NextPage, NextRequest, Tracking};
+use crate::report::ReportApi;
 use crate::streams::{Resolver, Stream};
+use url::Url;
 
 /// How long one session load may take: long enough to type a keyring password into the
 /// unlock prompt, short enough that a play doesn't hang on a prompt nobody sees.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What one session load builds: the real resolver and the real queue source.
+/// What one session load builds: the real resolver, queue source and play-report requests.
 #[derive(Clone)]
 pub struct Loaded {
     pub resolver: Arc<dyn Resolver>,
     pub queue: Arc<dyn QueueSource>,
+    pub reports: Arc<dyn ReportApi>,
 }
 
 /// Builds the real resolver and queue source once the session is loaded.
@@ -104,6 +107,19 @@ impl QueueSource for LazySession {
     }
 }
 
+/// A song is only reported after it was heard, so after a resolve loaded the session: this
+/// never prompts for the keyring by itself in practice.
+#[async_trait]
+impl ReportApi for LazySession {
+    async fn tracking(&self, video_id: &str) -> Result<Tracking, Error> {
+        self.get().await?.reports.tracking(video_id).await
+    }
+
+    async fn ping(&self, url: Url, visitor_data: Option<String>) -> Result<(), Error> {
+        self.get().await?.reports.ping(url, visitor_data).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,13 +186,31 @@ mod tests {
         }
     }
 
+    /// Answers every tracking request with the session's first cookie value as the visitor
+    /// id, like `Echo`.
+    struct EchoReports(String);
+
+    #[async_trait]
+    impl ReportApi for EchoReports {
+        async fn tracking(&self, _: &str) -> Result<Tracking, Error> {
+            Ok(Tracking {
+                visitor_data: Some(self.0.clone()),
+                ..Tracking::default()
+            })
+        }
+        async fn ping(&self, _: Url, _: Option<String>) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
     fn counting_build(builds: Arc<AtomicUsize>) -> Build {
         Box::new(move |s: Session| {
             builds.fetch_add(1, Ordering::SeqCst);
             let value = s.cookies[0].value.clone();
             Loaded {
                 resolver: Arc::new(Echo(value.clone())),
-                queue: Arc::new(EchoQueue(value)),
+                queue: Arc::new(EchoQueue(value.clone())),
+                reports: Arc::new(EchoReports(value)),
             }
         })
     }
@@ -204,6 +238,9 @@ mod tests {
         // The queue source comes from the same load, over the same session.
         let page = lazy.next(NextRequest::default()).await.unwrap();
         assert_eq!(page.items[0].title, "first");
+        // So do the play reports.
+        let t = lazy.tracking("testvideo01").await.unwrap();
+        assert_eq!(t.visitor_data.as_deref(), Some("first"));
         // Built once, then kept: the store isn't read on every song.
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
