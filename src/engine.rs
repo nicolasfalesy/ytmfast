@@ -81,7 +81,10 @@ pub enum EngineCmd {
     ///   `video_id` if given (it plays at once, before the list arrives), else at `index`.
     /// - `video_id` alone: that song plays at once, and its radio fills the queue behind it.
     /// - Neither: resume what is loaded, or play the current song again once it has ended
-    ///   (from where it stopped, after a mid-song error); with nothing at all, Liked songs.
+    ///   (from where it stopped, after a mid-song error); songs queued with none current yet
+    ///   play from the first; with an empty queue, Liked songs.
+    ///
+    /// A list with no `video_id` or `index` starts at a random song while shuffle is on.
     ///
     /// `start_seconds` is where the first song starts.
     Play {
@@ -857,7 +860,11 @@ impl Engine {
         self.continuation = page.continuation;
         match plan.seed {
             None => {
-                self.queue.replace(page.items, plan.index.unwrap_or(0));
+                match plan.index {
+                    Some(i) => self.queue.replace(page.items, i),
+                    // Shuffled, a random song starts (`Queue::replace_unpicked`).
+                    None => self.queue.replace_unpicked(page.items),
+                };
                 self.emit_queue();
                 let paused = self.status.state == PlayState::Paused;
                 self.start_current(plan.start);
@@ -3878,6 +3885,40 @@ mod tests {
             r.source.requests()
         );
         assert_eq!(r.queue().await.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_shuffled_list_play_with_no_song_picked_starts_at_random() {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut built = engine_for(&server, fake, Arc::default(), true, false);
+        let engine = &mut built.engine;
+        engine.queue = Queue::with_seed(3);
+        engine.handle(EngineCmd::Shuffle(true));
+        let mut play = |index: Option<usize>| {
+            engine.handle(EngineCmd::Play {
+                video_id: None,
+                playlist_id: Some("PLlist".into()),
+                index,
+                start_seconds: 0.0,
+            });
+            engine.on_load(Ok(page("ABCDEFGH", None)));
+            engine.queue.current().unwrap().song.video_id.clone()
+        };
+        let mut starts = std::collections::HashSet::new();
+        for _ in 0..30 {
+            starts.insert(play(None));
+        }
+        assert!(starts.len() >= 4, "random starts: {starts:?}");
+        // A song the play picks still starts there.
+        for _ in 0..5 {
+            assert_eq!(play(Some(2)), vid('C'));
+        }
     }
 
     #[tokio::test]

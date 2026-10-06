@@ -180,6 +180,19 @@ impl Queue {
         self.current()
     }
 
+    /// `replace` for a list played with no song picked (no index, no video id): with shuffle
+    /// on, a random song of the whole list starts (the user's pick, 2026-10-06), so a
+    /// shuffled album or playlist doesn't open on its first track every time; with shuffle
+    /// off, the first song.
+    pub fn replace_unpicked(&mut self, songs: Vec<SongItem>) -> Option<&QueueItem> {
+        let start = if self.original.is_some() && !songs.is_empty() {
+            self.rng.below(songs.len())
+        } else {
+            0
+        };
+        self.replace(songs, start)
+    }
+
     /// A queue from a saved state (`crate::state`): `songs` in play order with new ids,
     /// `current` an index into them, and while shuffled `original` the order from before
     /// shuffling as indexes into `songs`. An index past the end means no current song yet;
@@ -927,6 +940,45 @@ mod tests {
         assert!(q.remove(id_of(&q, "s0")));
         assert_eq!(cur(&q).as_deref(), Some("s2"));
         assert_eq!(q.current_index(), Some(1));
+    }
+
+    #[test]
+    fn a_list_with_no_song_picked_starts_at_random_when_shuffled() {
+        // Shuffle off: the first song, whatever the seed.
+        let mut q = Queue::with_seed(5);
+        assert_eq!(
+            q.replace_unpicked(songs(8))
+                .map(|i| i.song.video_id.clone()),
+            Some("s0".into())
+        );
+        assert_eq!(q.current_index(), Some(0));
+        // Shuffle on (the user's pick, 2026-10-06): a random song of the list starts, and it
+        // is first in the shuffled order like any start song.
+        q.set_shuffle(true);
+        let mut starts = HashSet::new();
+        for _ in 0..40 {
+            let first = q.replace_unpicked(songs(8)).unwrap().song.video_id.clone();
+            assert_eq!(q.current_index(), Some(0));
+            assert_eq!(q.len(), 8);
+            starts.insert(first);
+        }
+        assert!(starts.len() >= 4, "random starts: {starts:?}");
+        // Repeatable for a seed.
+        let pick = |seed| {
+            let mut q = Queue::with_seed(seed);
+            q.set_shuffle(true);
+            q.replace_unpicked(songs(8)).unwrap().song.video_id.clone()
+        };
+        assert_eq!(pick(11), pick(11));
+        // Turning shuffle off goes back to the list's own order, at the song that started.
+        let mut q = Queue::with_seed(11);
+        q.set_shuffle(true);
+        let first = q.replace_unpicked(songs(8)).unwrap().song.video_id.clone();
+        q.set_shuffle(false);
+        assert_eq!(vids(&q), vids(&queue(8, 0)));
+        assert_eq!(cur(&q), Some(first));
+        // An empty list: nothing current.
+        assert!(q.replace_unpicked(Vec::new()).is_none());
     }
 
     #[test]

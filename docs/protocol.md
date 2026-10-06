@@ -59,13 +59,15 @@ A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId`
 
 - With `playlistId` (an album or a playlist, such as `LM` for Liked songs): its songs
   become the queue. It starts at `videoId` when given (that song plays at once, before the
-  list arrives), else at `index` (from 0; past the end starts at the first song). `index`
-  is only taken with a `playlistId`.
+  list arrives), else at `index` (from 0; past the end starts at the first song). With
+  neither and shuffle on, a random song of the list starts; with shuffle off, the first.
+  `index` is only taken with a `playlistId`.
 - With `videoId` alone: that song plays at once, and its radio fills the queue behind it.
 - With neither: it resumes a paused song, or plays the last song again once it has ended.
   With only `startSeconds` (above 0) it seeks the current song there, and resumes it if it
-  was paused; once the song has ended, it plays it again from there. With nothing at all
-  loaded or saved, it plays Liked songs.
+  was paused; once the song has ended, it plays it again from there. With songs queued but
+  none playing yet (songs added to an empty queue), it plays the first of them. With an
+  empty queue and nothing saved, it plays Liked songs.
 - `startSeconds` (from 0) is where the first song starts.
 
 When the queue runs out, the engine carries on with radio songs. When that would take the
