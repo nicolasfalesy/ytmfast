@@ -18,10 +18,10 @@ use tokio::time::Instant;
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::control::{self, Exit, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
 use ytmfast::error::Error;
-use ytmfast::innertube::{NextPage, NextRequest};
-use ytmfast::queue::Repeat;
+use ytmfast::innertube::{NextPage, NextRequest, SongItem};
+use ytmfast::queue::{AddAt, QueueItem, Repeat};
 use ytmfast::streams::{Resolver, Stream};
 
 const SONG: &str = "dQw4w9WgXcQ";
@@ -99,8 +99,8 @@ fn daemon(on_ac: bool) -> Daemon {
     }
 }
 
-/// A fake engine side: answers `Status` with `status`, passes every other command to the
-/// test, and stops on `Quit`.
+/// A fake engine side: answers `Status` with `status` and `QueueGet` with `fake_queue()`,
+/// passes every other command to the test, and stops on `Quit`.
 struct FakeEngine {
     path: PathBuf,
     events: broadcast::Sender<EngineEvent>,
@@ -124,6 +124,9 @@ fn fake_engine(status: Status) -> FakeEngine {
                 EngineCmd::Status(reply) => {
                     let _ = reply.send(status.clone());
                 }
+                EngineCmd::QueueGet(reply) => {
+                    let _ = reply.send(fake_queue());
+                }
                 EngineCmd::Quit => return,
                 other => {
                     let _ = seen_tx.send(other);
@@ -143,6 +146,41 @@ fn fake_engine(status: Status) -> FakeEngine {
         serve,
         _dir: dir,
         _power: power,
+    }
+}
+
+fn full_song(id: &str) -> SongItem {
+    SongItem {
+        video_id: id.into(),
+        title: "Song".into(),
+        artists: vec!["A".into(), "B".into()],
+        album: Some("Album".into()),
+        thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
+        length_seconds: 213,
+        playlist_id: None,
+    }
+}
+
+/// What the fake engine answers `QueueGet` with.
+fn fake_queue() -> QueueView {
+    QueueView {
+        items: vec![
+            QueueItem {
+                id: 3,
+                song: full_song(SONG),
+            },
+            QueueItem {
+                id: 9,
+                song: SongItem {
+                    video_id: "AAAAAAAAAAA".into(),
+                    ..SongItem::default()
+                },
+            },
+        ]
+        .into(),
+        current_id: Some(3),
+        shuffle: true,
+        repeat: Repeat::One,
     }
 }
 
@@ -553,4 +591,295 @@ async fn engine_gone_while_playing_ends_the_daemon() {
         .expect("the hub never noticed the engine was gone")
         .unwrap();
     assert_eq!(exit, Exit::EngineGone);
+}
+
+/// Every queue command, in its wire form, reaches the engine as the matching command.
+#[tokio::test]
+async fn queue_commands_reach_the_engine() {
+    let mut f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    let lines = [
+        r#"{"id":1,"cmd":"next"}"#.to_string(),
+        r#"{"id":2,"cmd":"previous"}"#.into(),
+        format!(
+            r#"{{"id":3,"cmd":"queue.add","args":{{"at":"next","songs":[{{"videoId":"{SONG}",
+            "title":"Song","artists":["A","B"],"album":"Album",
+            "thumbnail":"https://i.ytimg.com/vi/x/hqdefault.jpg","lengthSeconds":213}}]}}}}"#
+        )
+        .replace('\n', ""),
+        r#"{"id":4,"cmd":"queue.add","args":{"videoIds":["AAAAAAAAAAA","BBBBBBBBBBB"],"at":"end"}}"#.into(),
+        r#"{"id":5,"cmd":"queue.remove","args":{"queueId":4}}"#.into(),
+        r#"{"id":6,"cmd":"queue.jump","args":{"queueId":18446744073709551615}}"#.into(),
+        r#"{"id":7,"cmd":"queue.move","args":{"queueId":2,"index":0}}"#.into(),
+        r#"{"id":8,"cmd":"shuffle","args":{"on":true}}"#.into(),
+        r#"{"id":9,"cmd":"repeat","args":{"mode":"all"}}"#.into(),
+        r#"{"id":10,"cmd":"play","args":{"playlistId":"OLAK5uy_x-Y","index":2}}"#.into(),
+        format!(
+            r#"{{"id":11,"cmd":"play","args":{{"videoId":"{SONG}","playlistId":"RDAMVM{SONG}"}}}}"#
+        ),
+    ];
+    for line in &lines {
+        c.send(line).await;
+    }
+    for id in 1..=lines.len() as u64 {
+        assert_eq!(
+            c.reply(id).await,
+            json!({"id": id, "ok": true, "data": {}}),
+            "{id}"
+        );
+    }
+    let mut got = Vec::new();
+    for _ in 0..lines.len() {
+        got.push(f.commands.try_recv().unwrap());
+    }
+    assert!(matches!(got[0], EngineCmd::Next));
+    assert!(matches!(got[1], EngineCmd::Previous));
+    match &got[2] {
+        EngineCmd::QueueAdd { songs, at } => {
+            assert_eq!(songs, &vec![full_song(SONG)]);
+            assert_eq!(*at, AddAt::Next);
+        }
+        other => panic!("{other:?}"),
+    }
+    match &got[3] {
+        EngineCmd::QueueAdd { songs, at } => {
+            let ids: Vec<&str> = songs.iter().map(|s| s.video_id.as_str()).collect();
+            assert_eq!(ids, ["AAAAAAAAAAA", "BBBBBBBBBBB"]);
+            assert!(
+                songs
+                    .iter()
+                    .all(|s| s.title.is_empty() && s.album.is_none())
+            );
+            assert_eq!(*at, AddAt::End);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(got[4], EngineCmd::QueueRemove(4)));
+    assert!(matches!(got[5], EngineCmd::QueueJump(u64::MAX)));
+    assert!(matches!(got[6], EngineCmd::QueueMove { id: 2, index: 0 }));
+    assert!(matches!(got[7], EngineCmd::Shuffle(true)));
+    assert!(matches!(got[8], EngineCmd::Repeat(Repeat::All)));
+    match &got[9] {
+        EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some(p),
+            index: Some(2),
+            start_seconds,
+        } => {
+            assert_eq!(p, "OLAK5uy_x-Y");
+            assert_eq!(*start_seconds, 0.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    match &got[10] {
+        EngineCmd::Play {
+            video_id: Some(v),
+            playlist_id: Some(p),
+            index: None,
+            ..
+        } => assert_eq!((v.as_str(), p.as_str()), (SONG, &*format!("RDAMVM{SONG}"))),
+        other => panic!("{other:?}"),
+    }
+    // Bad input never reaches the engine.
+    c.send(r#"{"id":20,"cmd":"queue.add","args":{"videoIds":["../etc/pass"]}}"#)
+        .await;
+    c.send(r#"{"id":21,"cmd":"repeat","args":{"mode":"Playlist"}}"#)
+        .await;
+    for id in [20, 21] {
+        assert_eq!(c.reply(id).await["error"]["code"], "bad_request");
+    }
+    assert!(f.commands.try_recv().is_err());
+    f.serve.abort();
+}
+
+#[tokio::test]
+async fn queue_get_replies_with_the_queue() {
+    let f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    c.send(r#"{"id":1,"cmd":"queue.get"}"#).await;
+    assert_eq!(
+        c.reply(1).await,
+        json!({"id": 1, "ok": true, "data": {
+            "currentId": 3, "shuffle": true, "repeat": "one",
+            "items": [
+                {"queueId": 3, "videoId": SONG, "title": "Song", "artists": ["A", "B"],
+                 "album": "Album", "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
+                 "lengthSeconds": 213},
+                {"queueId": 9, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
+                 "album": null, "thumbnail": null, "lengthSeconds": null}]}})
+    );
+    f.serve.abort();
+}
+
+/// A client that fell behind may have missed a queue change too: it gets a fresh queue
+/// along with the fresh state.
+#[tokio::test]
+async fn lagged_client_gets_a_fresh_queue() {
+    let f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    c.send(r#"{"id":1,"cmd":"status"}"#).await;
+    c.reply(1).await;
+    for i in 0..200 {
+        let _ = f.events.send(EngineEvent::Position {
+            seconds: f64::from(i),
+            seeked: false,
+        });
+    }
+    let q = c.event("queue").await;
+    assert_eq!(q["currentId"], 3);
+    assert_eq!(q["items"].as_array().unwrap().len(), 2);
+    f.serve.abort();
+}
+
+/// The queue end to end on the real engine (its songs never load: the resolver hangs, so a
+/// jumped-to song stays buffering): every queue command round trips, and both clients see
+/// every `queue` event.
+#[tokio::test]
+async fn queue_round_trips_and_events_reach_both_clients() {
+    let d = daemon(true);
+    let mut a = connect(&d.path).await;
+    let mut b = connect(&d.path).await;
+    for c in [&mut a, &mut b] {
+        c.send(r#"{"id":1,"cmd":"status"}"#).await;
+        c.reply(1).await;
+    }
+    let full = serde_json::to_string(&json!({"id": 2, "cmd": "queue.add", "args": {"songs": [
+        {"videoId": SONG, "title": "Song", "artists": ["A", "B"], "album": "Album",
+         "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg", "lengthSeconds": 213}]}}))
+    .unwrap();
+    a.send(&full).await;
+    a.send(r#"{"id":3,"cmd":"queue.add","args":{"videoIds":["AAAAAAAAAAA","BBBBBBBBBBB"]}}"#)
+        .await;
+    // The sender's replies and events interleave: keep the queue events while waiting.
+    let mut a_queues = Vec::new();
+    let mut replies = 0;
+    while replies < 2 || a_queues.len() < 2 {
+        let v = a.next().await.unwrap();
+        if v["event"] == "queue" {
+            a_queues.push(v);
+        } else if v.get("id").is_some() {
+            assert_eq!(v["ok"], true, "{v}");
+            replies += 1;
+        }
+    }
+
+    // Both clients get both queue events; the second has all three songs, in order.
+    let mut b_queues = Vec::new();
+    for _ in 0..2 {
+        b_queues.push(b.event("queue").await);
+    }
+    assert_eq!(a_queues, b_queues);
+    assert_eq!(a_queues[0]["items"].as_array().unwrap().len(), 1);
+    let mut last = Value::Null;
+    for q in [&a_queues[1], &b_queues[1]] {
+        last = q.clone();
+        let ids: Vec<&str> = last["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["videoId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [SONG, "AAAAAAAAAAA", "BBBBBBBBBBB"]);
+        assert_eq!(last["items"][0]["album"], "Album");
+        assert_eq!(last["items"][1]["title"], Value::Null);
+    }
+    let qid = |v: &Value, i: usize| v["items"][i]["queueId"].as_u64().unwrap();
+    let (first, second, third) = (qid(&last, 0), qid(&last, 1), qid(&last, 2));
+    assert!(first >= 1 && first < second && second < third, "{last}");
+
+    // queue.get answers the same queue.
+    a.send(r#"{"id":4,"cmd":"queue.get"}"#).await;
+    let got = a.reply(4).await;
+    assert_eq!(got["data"]["items"], last["items"]);
+
+    // Jump: the song shows at once from its queue item, album and queue id included.
+    a.send(&format!(
+        r#"{{"id":5,"cmd":"queue.jump","args":{{"queueId":{first}}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(5).await["ok"], true);
+    let s = loop {
+        let s = a.event("state").await;
+        if s["queueId"] == first {
+            break s;
+        }
+    };
+    assert_eq!(s["videoId"], SONG);
+    assert_eq!(s["title"], "Song");
+    assert_eq!(s["album"], "Album");
+    assert_eq!(s["artist"], "A, B");
+
+    // Move the last song to the front.
+    a.send(&format!(
+        r#"{{"id":6,"cmd":"queue.move","args":{{"queueId":{third},"index":0}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(6).await["ok"], true);
+    let q = b.event("queue").await;
+    let q = if q["items"][0]["queueId"] == third {
+        q
+    } else {
+        // b may still hold the jump's queue event.
+        b.event("queue").await
+    };
+    assert_eq!(qid(&q, 0), third, "{q}");
+
+    // Shuffle and repeat show in both the queue event and the state.
+    a.send(r#"{"id":7,"cmd":"shuffle","args":{"on":true}}"#)
+        .await;
+    assert_eq!(a.reply(7).await["ok"], true);
+    a.send(r#"{"id":8,"cmd":"repeat","args":{"mode":"all"}}"#)
+        .await;
+    assert_eq!(a.reply(8).await["ok"], true);
+    a.send(r#"{"id":9,"cmd":"status"}"#).await;
+    let s = a.reply(9).await;
+    assert_eq!(s["data"]["shuffle"], true);
+    assert_eq!(s["data"]["repeat"], "all");
+    a.send(r#"{"id":10,"cmd":"queue.get"}"#).await;
+    let q = a.reply(10).await;
+    assert_eq!(q["data"]["shuffle"], true);
+    assert_eq!(q["data"]["repeat"], "all");
+    assert_eq!(q["data"]["currentId"], first);
+
+    // Next moves off the current song; Previous (under 3 s in) comes back to it.
+    a.send(r#"{"id":11,"cmd":"next"}"#).await;
+    assert_eq!(a.reply(11).await["ok"], true);
+    let s = loop {
+        let s = a.event("state").await;
+        if s["queueId"] != first {
+            break s;
+        }
+    };
+    assert_ne!(s["queueId"], Value::Null);
+    a.send(r#"{"id":12,"cmd":"previous"}"#).await;
+    assert_eq!(a.reply(12).await["ok"], true);
+    loop {
+        if a.event("state").await["queueId"] == first {
+            break;
+        }
+    }
+
+    // Remove: gone from the queue.
+    a.send(&format!(
+        r#"{{"id":13,"cmd":"queue.remove","args":{{"queueId":{second}}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(13).await["ok"], true);
+    a.send(r#"{"id":14,"cmd":"queue.get"}"#).await;
+    let q = a.reply(14).await;
+    let ids: Vec<u64> = q["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["queueId"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&second));
+
+    // An id that isn't in the queue: taken, and the engine says why it did nothing.
+    a.send(r#"{"id":15,"cmd":"queue.jump","args":{"queueId":999999}}"#)
+        .await;
+    assert_eq!(a.reply(15).await["ok"], true);
+    let e = a.event("error").await;
+    assert!(!e["message"].as_str().unwrap().is_empty());
 }

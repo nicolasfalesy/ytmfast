@@ -55,10 +55,11 @@ const MAX_CONTINUATION: usize = 16 * 1024;
 
 /// A loaded song's text fields (title, album, each artist, its playlist id): real ones are
 /// tens of bytes. Each is sent to every widget on every queue change, so a hand-edited file
-/// must not be able to make them huge.
-const MAX_TEXT: usize = 4 * 1024;
+/// must not be able to make them huge. The socket's `queue.add` takes the same caps, so a
+/// song it took is never dropped when the state is loaded again.
+pub const MAX_TEXT: usize = 4 * 1024;
 /// A loaded song's artists: real bylines name a handful.
-const MAX_ARTISTS: usize = 20;
+pub const MAX_ARTISTS: usize = 20;
 
 /// A second to resume at, for a song whose length isn't known: a day is past any song.
 const MAX_POSITION_UNKNOWN_LENGTH: f64 = 24.0 * 60.0 * 60.0;
@@ -301,9 +302,7 @@ fn sanitize(mut s: Saved) -> Saved {
     } else {
         1.0
     };
-    s.source_playlist = s
-        .source_playlist
-        .filter(|p| token_ok(p, MAX_PLAYLIST_ID, b""));
+    s.source_playlist = s.source_playlist.filter(|p| is_playlist_id(p));
     // Continuations are base64 (with `-_` or `+/`), sometimes URL-escaped (`%3D`).
     s.continuation = s
         .continuation
@@ -356,6 +355,12 @@ fn is_permutation(order: &[usize], len: usize) -> bool {
     order
         .iter()
         .all(|&p| p < len && !std::mem::replace(&mut seen[p], true))
+}
+
+/// A playlist id as the engine takes it (from the socket or a saved state): not empty, at
+/// most 256 bytes of ASCII letters, digits, `-` and `_`.
+pub fn is_playlist_id(p: &str) -> bool {
+    token_ok(p, MAX_PLAYLIST_ID, b"")
 }
 
 /// Not empty, at most `max` bytes, ASCII letters, digits, `-`, `_` and `extra`.

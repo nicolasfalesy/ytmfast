@@ -32,7 +32,7 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 
-use crate::engine::{Engine, EngineCmd, EngineEvent, Status};
+use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
 use crate::mpris;
 use idle::IdlePolicy;
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
@@ -261,7 +261,7 @@ async fn serve_with(
                 let now_playing = match event {
                     Ok(EngineEvent::State(s)) => idle::is_playing(s.state),
                     Ok(_) => continue,
-                    // Missed some states: ask for the current one (Task 8 carry).
+                    // Missed some states: ask for the current one.
                     Err(RecvError::Lagged(_)) => match query_status(&shared.cmds).await {
                         Some(s) => idle::is_playing(s.state),
                         None => return Exit::EngineGone,
@@ -317,6 +317,28 @@ async fn query_status(cmds: &mpsc::Sender<EngineCmd>) -> Option<Status> {
     rx.await.ok()
 }
 
+async fn query_queue(cmds: &mpsc::Sender<EngineCmd>) -> Option<QueueView> {
+    let (tx, rx) = oneshot::channel();
+    cmds.send(EngineCmd::QueueGet(tx)).await.ok()?;
+    rx.await.ok()
+}
+
+/// What a client that fell behind may have missed: the state, and the queue (a missed
+/// queue event would leave a widget's list wrong until the next change). One line each.
+async fn catch_up(cmds: &mpsc::Sender<EngineCmd>) -> Option<[String; 2]> {
+    let status = query_status(cmds).await?;
+    let queue = query_queue(cmds).await?;
+    Some([
+        protocol::event_line(&EngineEvent::State(status)),
+        protocol::event_line(&EngineEvent::Queue {
+            items: queue.items,
+            current_id: queue.current_id,
+            shuffle: queue.shuffle,
+            repeat: queue.repeat,
+        }),
+    ])
+}
+
 /// How a client's connection ends.
 enum Close {
     /// Let the writer send what is queued first (up to `FLUSH_WAIT`).
@@ -359,20 +381,20 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                 Err(_) => break Close::Now,
             },
             event = events.recv() => {
-                let line = match event {
-                    // The socket's `queue` event arrives with Task 8.
-                    Ok(EngineEvent::Queue { .. }) => continue,
-                    Ok(e) => protocol::event_line(&e),
-                    // It missed some events: a fresh state covers them (Task 8 carry).
-                    Err(RecvError::Lagged(_)) => match query_status(&shared.cmds).await {
-                        Some(s) => protocol::event_line(&EngineEvent::State(s)),
+                // A big queue goes through the same bounded queue as everything else: a
+                // client that stopped reading is still dropped, never waited on.
+                let pushed = match event {
+                    Ok(e) => push(&out, protocol::event_line(&e)),
+                    // It missed some events: a fresh state and queue cover them.
+                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds).await {
+                        Some(lines) => lines.into_iter().all(|l| push(&out, l)),
                         None => break Close::Flush,
                     },
                     // Can't happen while the hub's `shared.events` sender lives; kept so a
                     // closed channel ends the client rather than spinning.
                     Err(RecvError::Closed) => break Close::Flush,
                 };
-                if !push(&out, line) {
+                if !pushed {
                     break Close::Now;
                 }
             }
@@ -422,21 +444,37 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
             };
             return (reply, false);
         }
+        Request::QueueGet => {
+            let reply = match query_queue(&shared.cmds).await {
+                Some(q) => protocol::ok_reply(id, protocol::queue_data(&q)),
+                None => gone(),
+            };
+            return (reply, false);
+        }
         Request::Quit => return (protocol::ok_reply(id, json!({})), true),
         Request::Play {
             video_id,
+            playlist_id,
+            index,
             start_seconds,
         } => EngineCmd::Play {
             video_id,
-            // The socket's queue arguments arrive with Task 8.
-            playlist_id: None,
-            index: None,
+            playlist_id,
+            index,
             start_seconds,
         },
         Request::Pause => EngineCmd::Pause,
         Request::Toggle => EngineCmd::Toggle,
         Request::Seek { seconds } => EngineCmd::Seek(seconds),
         Request::Volume { percent } => EngineCmd::Volume(protocol::percent_to_volume(percent)),
+        Request::Next => EngineCmd::Next,
+        Request::Previous => EngineCmd::Previous,
+        Request::QueueAdd { songs, at } => EngineCmd::QueueAdd { songs, at },
+        Request::QueueRemove { id } => EngineCmd::QueueRemove(id),
+        Request::QueueJump { id } => EngineCmd::QueueJump(id),
+        Request::QueueMove { id, index } => EngineCmd::QueueMove { id, index },
+        Request::Shuffle { on } => EngineCmd::Shuffle(on),
+        Request::Repeat { mode } => EngineCmd::Repeat(mode),
     };
     // "ok" means the engine took the command; what came of it arrives as events.
     match shared.cmds.send(cmd).await {
