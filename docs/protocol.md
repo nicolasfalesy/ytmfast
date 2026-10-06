@@ -138,6 +138,9 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 - `queueId` is the current song's id in the queue; `null` when there is none.
 - `position` is in seconds; `volume` is a percent. `shuffle` and `repeat` are as in the
   queue.
+- `volume` follows the stream's volume wherever it is changed: a change in a mixer or a
+  desktop volume popup sends a new `state` with it, and the engine keeps it (a later song,
+  or a restart, plays at it).
 
 The position, once a second while playing and after every seek:
 

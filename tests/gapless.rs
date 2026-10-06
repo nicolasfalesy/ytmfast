@@ -322,6 +322,11 @@ fn volume_not_reapplied_on_pause() {
     // The user turns it down in a mixer.
     common::set_volume(&dir, node, 0.3);
     common::wait_for_volume(&dir, node, 0.3);
+    // The player reports the mixer's change (as the slider value, the cube root).
+    match next_event(&events) {
+        AudioEvent::VolumeChanged(v) => assert!((v - 0.3f32.cbrt()).abs() < 1e-3, "{v}"),
+        other => panic!("expected the mixer's volume, got {other:?}"),
+    }
     player.pause();
     assert_eq!(next_event(&events), AudioEvent::Paused);
     std::thread::sleep(Duration::from_millis(200));

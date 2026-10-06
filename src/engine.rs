@@ -1407,6 +1407,21 @@ impl Engine {
         self.dirty = true;
     }
 
+    /// The output's volume was changed in a mixer: the status shows it and it is saved, but
+    /// it is not sent back to the output, which already has it (and would echo it back).
+    fn mixer_volume(&mut self, v: f32) {
+        if !v.is_finite() {
+            return;
+        }
+        let v = v.clamp(0.0, 1.0);
+        if v == self.status.volume {
+            return;
+        }
+        self.status.volume = v;
+        self.dirty = true;
+        self.emit_state();
+    }
+
     fn volume(&mut self, v: f32) {
         if v.is_nan() {
             return;
@@ -1422,6 +1437,10 @@ impl Engine {
         if event == AudioEvent::Loading {
             self.loads_seen += 1;
             return;
+        }
+        // About the output, not a track: taken whatever is loaded.
+        if let AudioEvent::VolumeChanged(v) = event {
+            return self.mixer_volume(v);
         }
         // Not about the current song: an earlier track's news, sent before the audio thread
         // took the newest load (or while the new song is still resolving).
@@ -1452,7 +1471,11 @@ impl Engine {
             }
             AudioEvent::Advanced(ticket) => self.on_advanced(ticket),
             // The engine set these states when it sent the command.
-            AudioEvent::Paused | AudioEvent::Resumed | AudioEvent::Loading => {}
+            // Loading and VolumeChanged were taken above.
+            AudioEvent::Paused
+            | AudioEvent::Resumed
+            | AudioEvent::Loading
+            | AudioEvent::VolumeChanged(_) => {}
             AudioEvent::Ended => {
                 self.status.position = self.player.position();
                 self.end_report(self.status.position);
@@ -3023,6 +3046,26 @@ mod tests {
         assert_eq!(s[0].state, PlayState::Buffering);
         assert_eq!(s[0].video_id.as_deref(), Some("AAAAAAAAAAA"));
         assert_eq!(r.started(), ["AAAAAAAAAAA", "AAAAAAAAAAA"]);
+    }
+
+    #[tokio::test]
+    async fn a_mixer_volume_change_reaches_the_status() {
+        let mut r = rig(Setup::default()).await;
+        r.send(EngineCmd::Volume(0.5)).await;
+        eventually("the output volume", || r.stats.volume() == 0.5).await;
+        // The user turns the stream down in a mixer: the status (and so MPRIS and the
+        // widgets) follow, and it is saved like a change of ours.
+        r.stats.mixer_volume(0.3);
+        loop {
+            if let EngineEvent::State(s) = r.next().await
+                && s.volume == 0.3
+            {
+                break;
+            }
+        }
+        assert_eq!(r.status().await.volume, 0.3);
+        // Not sent back to the output: the output already has it (no loop).
+        assert_eq!(r.stats.volume_sets(), 1);
     }
 
     #[tokio::test]

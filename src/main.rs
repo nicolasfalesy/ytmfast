@@ -480,7 +480,8 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
             | AudioEvent::Advanced(_)
             | AudioEvent::Started
             | AudioEvent::Paused
-            | AudioEvent::Resumed => {}
+            | AudioEvent::Resumed
+            | AudioEvent::VolumeChanged(_) => {}
         }
     }
 }

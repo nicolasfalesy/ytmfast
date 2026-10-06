@@ -50,6 +50,9 @@ pub enum AudioEvent {
     /// The track failed; the player is idle. The error itself, so its `code()` reaches the
     /// user (its `Display` is URL-free, ruling R6).
     Error(Error),
+    /// The output's volume was changed outside the app (a mixer): the new slider value, 0.0
+    /// to 1.0. Not about any track, and never sent for `set_volume`.
+    VolumeChanged(f32),
 }
 
 enum Command {
@@ -75,6 +78,8 @@ enum Command {
     Stop,
     /// The sink says its output was lost (`Sink::watch_lost`).
     OutputLost,
+    /// The sink says a mixer set its volume to this (`Sink::watch_volume`).
+    MixerVolume(f32),
     Quit,
 }
 
@@ -104,6 +109,10 @@ const NO_GAP: u64 = u64::MAX;
 struct Readers {
     current: Option<ReaderCancel>,
     next: Option<(u64, ReaderCancel)>,
+    /// Every preload id up to this one was cancelled. Kept apart from `next`: in the
+    /// handover window the preload is already `current`, so a cancel finds no `next` to drop,
+    /// and a seek's roll-back must still know not to bring it back.
+    cancelled_through: u64,
 }
 
 impl Readers {
@@ -156,6 +165,14 @@ impl AudioPlayer {
         let wake = commands.clone();
         sink.watch_lost(Arc::new(move || {
             let _ = wake.send(Command::OutputLost);
+        }));
+        // A mixer's change comes in the same way and goes out as an event. Not straight
+        // into the event channel: a sender held by the sink's watcher (or a PipeWire thread
+        // left behind) would keep that channel open after the audio thread ends, and the
+        // engine's event forwarder waits for it to close when it quits.
+        let mixer = commands.clone();
+        sink.watch_volume(Arc::new(move |v| {
+            let _ = mixer.send(Command::MixerVolume(v));
         }));
         let (events_tx, events) = crossbeam_channel::unbounded();
         let position = Arc::new(AtomicU64::new(0f64.to_bits()));
@@ -233,9 +250,11 @@ impl AudioPlayer {
         gain: f32,
         length_hint: Option<f64>,
     ) -> u64 {
-        let id = self.preloads.fetch_add(1, Ordering::Relaxed) + 1;
+        let id;
         {
             let mut readers = lock(&self.readers);
+            // Under the lock, so a cancel never sees an id that isn't registered yet.
+            id = self.preloads.fetch_add(1, Ordering::Relaxed) + 1;
             readers.cancel_next();
             readers.next = Some((id, reader.canceller()));
         }
@@ -249,9 +268,14 @@ impl AudioPlayer {
         id
     }
 
-    /// Drops the preloaded track, if it hasn't become the current one yet.
+    /// Drops the preloaded track, if it hasn't become the current one yet. Once it is heard
+    /// it plays on; until then (the handover window) a seek of the old track no longer
+    /// brings it back as the preload.
     pub fn cancel_preload(&self) {
-        lock(&self.readers).cancel_next();
+        let mut readers = lock(&self.readers);
+        readers.cancel_next();
+        readers.cancelled_through = self.preloads.load(Ordering::Relaxed);
+        drop(readers);
         self.send(Command::CancelPreload);
     }
 
@@ -530,6 +554,7 @@ impl Worker {
                 }
             }
             Command::Stop => self.unload(),
+            Command::MixerVolume(v) => self.emit(AudioEvent::VolumeChanged(v)),
             Command::OutputLost => {
                 // Only about the current output (a replaced one doesn't matter), and only when
                 // a song is loaded: a playing song's write may have reported it already.
@@ -876,16 +901,19 @@ impl Worker {
         let Some(mut new) = self.track.take() else {
             return;
         };
+        // Before the lock: a seek may read, and the engine's `preload` and `cancel_preload`
+        // wait on that lock.
+        let rewound = new.decoder.seek(0.0).is_ok();
         let keep = {
             let mut readers = lock(&self.readers);
             readers.current = Some(old.track.cancel.clone());
-            // A newer preload (or a cancel) since: drop this one for it.
-            if readers.next.is_none() && new.decoder.seek(0.0).is_ok() {
+            // A newer preload, or a cancel (even one sent in the window, when this track was
+            // already current): drop this one.
+            let wanted = rewound && readers.next.is_none() && old.id > readers.cancelled_through;
+            if wanted {
                 readers.next = Some((old.id, new.cancel.clone()));
-                true
-            } else {
-                false
             }
+            wanted
         };
         if keep {
             self.next = Some(Next {
@@ -1371,6 +1399,26 @@ mod tests {
             "Advanced {after} s after the seek"
         );
         assert!(p.position() < 0.05, "{}", p.position());
+        p.stop();
+    }
+
+    #[test]
+    fn a_preload_cancelled_mid_handover_stays_cancelled_after_a_seek() {
+        // In the handover window the new track is already current to the audio thread, so a
+        // cancel finds no preload to drop. A seek then rolls the handover back: the new track
+        // must not come back as the preload the engine dropped (it would play after the old
+        // one, out of the queue's order).
+        let (p, events, _) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 1.0, None);
+        p.preload(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(850));
+        assert!(events.try_recv().is_err(), "not heard yet");
+        p.cancel_preload();
+        p.seek(0.5);
+        // The old track plays to its end, and nothing follows it.
+        assert_eq!(next_event(&events), AudioEvent::Ended);
         p.stop();
     }
 
