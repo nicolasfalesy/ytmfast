@@ -50,6 +50,8 @@ failing) arrives as events.
 | `queue.move`   | `queueId`, `index`                                      | `{}`                        |
 | `shuffle`      | `on`: `true` or `false`                                 | `{}`                        |
 | `repeat`       | `mode`: `"off"`, `"all"` or `"one"`                     | `{}`                        |
+| `like`         | `status`: `"like"`, `"dislike"` or `"none"`; `videoId` (optional) | `{}`, once YouTube took it |
+| `mute`         | `on`: `true` or `false`                                 | `{}`                        |
 | `quit`         | none                                                    | `{}`, then the engine stops |
 | `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
@@ -126,6 +128,26 @@ it goes back to the original order, at the same song. Songs that join later whil
 (a list's next page, radio songs) are shuffled into the songs still to come, never before
 the current one. `repeat` is `"off"`, `"all"` (the whole queue again after the last
 song) or `"one"` (the current song again when it ends; `next` and `previous` still move).
+
+### like and mute
+
+`like` sets a song's like status on the account: `"like"`, `"dislike"`, or `"none"` to take
+either back. With `videoId` it is that song (a row in a list, whatever is playing); without,
+it is the song the state shows. With no `videoId` and no song shown, it is `bad_request`
+(`bad request: nothing is playing: say which song (videoId)`).
+
+Unlike the playback commands, the reply waits for YouTube: `{}` means YouTube took it, and
+by then the state's `liked` already shows it when it is the song shown. A like runs
+alongside the client's other requests, like a browse, and counts toward the same limit of 4
+waiting at once (see Browsing). A refused like is answered with the error, to that client
+only, never as an `error` event, with the codes of browsing's errors (see Browsing);
+`signed_out` also covers YouTube refusing the account action.
+
+`mute` with `on: true` silences the stream and keeps the volume; `on: false` puts that volume
+back. Muting while muted does nothing. Setting the volume while muted unmutes, at the new
+volume: `volume` from a client, MPRIS's `Volume`, or a mixer or desktop volume popup turning
+the stream up (the user touched the volume, so they want to hear it). Mute is kept across a
+restart, as the volume is.
 
 ## Browsing
 
@@ -268,7 +290,8 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 ```json
 {"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ", "title": "...",
  "artist": "...", "lengthSeconds": 213, "thumbnail": "https://...", "position": 12.5,
- "volume": 80, "album": "...", "queueId": 7, "shuffle": false, "repeat": "off"}
+ "volume": 80, "muted": false, "album": "...", "queueId": 7, "shuffle": false,
+ "repeat": "off", "liked": "like"}
 ```
 
 - `state` is `playing`, `paused`, `buffering` or `stopped`.
@@ -283,6 +306,13 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 - `volume` follows the stream's volume wherever it is changed: a change in a mixer or a
   desktop volume popup sends a new `state` with it, and the engine keeps it (a later song,
   or a restart, plays at it).
+- `muted` is `true` while the stream is silenced by `mute`. `volume` then still shows the
+  volume unmuting goes back to, so a slider keeps its place.
+- `liked` is the shown song's like status on the account: `"like"`, `"dislike"` or `"none"`;
+  `null` until known. It is known from the song's queue answer when the queue was asked for
+  with that song (a song played by id), else from one small request when the song starts,
+  and at once after a `like` of it. A song whose status could not be read stays `null` until
+  it starts again.
 
 The position, once a second while playing and after every seek:
 
@@ -349,6 +379,8 @@ the same engine as the socket, so a change from either side shows on both.
   `repeat`: `"None"` is `off`, `"Track"` is `one` and `"Playlist"` is `all`.
 - `Metadata` holds the title, the artist, the length, `xesam:album` and `mpris:artUrl`
   (from the song's queue item when it has them).
+- `Volume` is the socket's `volume`. MPRIS has no mute: while muted, `Volume` shows the kept
+  volume, and setting it unmutes, as the socket's `volume` does.
 - `Seeked` comes once for every seek, from any client, with where the song landed.
 - `SetPosition` at or past the song's end is ignored, as the spec says.
 - There is no track list (`HasTrackList` is false): the socket's `queue.get` has the queue.
