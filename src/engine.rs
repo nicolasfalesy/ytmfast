@@ -1503,6 +1503,13 @@ impl Engine {
                 // The replay below is the same play going on, not a second one: it keeps its
                 // report (and its cpn), so the song isn't counted twice in the history.
                 let kept = if replay { self.report.take() } else { None };
+                // Its open watch range ends where the output went (as a pause there), so the
+                // play up to the failure counts; the replay's `Started` resumes it from where
+                // the song plays again. Without this the resume would restart the range and
+                // drop the seconds since the last ping.
+                if let Some(r) = &kept {
+                    r.pause(self.status.position);
+                }
                 self.fail(&e);
                 // The sound server restarted under the song (often a `systemctl restart` or
                 // an update): after reporting it, play the song again from where it was, on
@@ -2221,6 +2228,28 @@ mod tests {
                 .map(|(_, v)| v.into_owned())
                 .collect()
         }
+        /// Every watch-time ping's `st`, `et` and `state`, in order.
+        fn watch_ranges(&self) -> Vec<(f64, f64, String)> {
+            self.pings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|u| u.path().ends_with("watchtime"))
+                .map(|u| {
+                    let get = |key: &str| {
+                        u.query_pairs()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.into_owned())
+                            .unwrap_or_default()
+                    };
+                    (
+                        get("st").parse().unwrap(),
+                        get("et").parse().unwrap(),
+                        get("state"),
+                    )
+                })
+                .collect()
+        }
         fn finals(&self) -> usize {
             self.pings
                 .lock()
@@ -2633,6 +2662,21 @@ mod tests {
         let first = r.reports.cpns("playback");
         assert_eq!(first.len(), 1);
         assert!(r.reports.cpns("watchtime").iter().all(|c| *c == first[0]));
+        // The watch ranges join up across the restart: the range open when the output went
+        // was closed there (as a pause), and the replay's range starts where it left off, so
+        // no play time is lost.
+        let ranges = r.reports.watch_ranges();
+        assert!(
+            ranges
+                .iter()
+                .any(|(st, et, state)| state == "paused" && *et > *st),
+            "{ranges:?}"
+        );
+        for pair in ranges.windows(2) {
+            assert!((pair[1].0 - pair[0].1).abs() < 0.1, "{ranges:?}");
+        }
+        let played: f64 = ranges.iter().map(|(st, et, _)| et - st).sum();
+        assert!(played > 1.8, "{played} s of a 2 s song: {ranges:?}");
 
         // Played again after its end: a new play, with a new cpn.
         r.send(EngineCmd::Play {

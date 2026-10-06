@@ -272,9 +272,18 @@ impl Client {
         }
     }
 
-    /// Reads until the server closes the connection.
+    /// Reads until the server closes the connection. Lines are not parsed: a client dropped
+    /// mid-write gets a cut-off last line.
     async fn until_closed(&mut self) {
-        while self.next().await.is_some() {}
+        loop {
+            let _hold = hold_clock();
+            let line = tokio::time::timeout(WAIT, self.lines.next_line())
+                .await
+                .expect("no line in time");
+            if !matches!(line, Ok(Some(_))) {
+                return;
+            }
+        }
     }
 }
 
@@ -563,6 +572,42 @@ async fn client_that_stops_reading_is_dropped() {
     // The stuck one: its kernel buffer and queue filled, so the server hung up. Reading now
     // drains what was sent and then ends.
     tokio::time::timeout(Duration::from_secs(30), stuck.until_closed())
+        .await
+        .expect("the stuck client was never dropped");
+    f.serve.abort();
+}
+
+/// A client that stops reading is dropped once 4 MiB of lines wait for it, long before 256
+/// lines when they are big: 256 full queue events would be close to 100 MB held for one
+/// stuck client.
+#[tokio::test]
+async fn client_that_stops_reading_big_lines_is_dropped_by_bytes() {
+    let f = fake_engine(paused_status(SONG));
+    let mut stuck = connect(&f.path).await;
+    stuck.send(r#"{"id":1,"cmd":"status"}"#).await;
+    stuck.reply(1).await;
+    // A full queue with long titles: each event line is about 375 KB.
+    let items: Arc<[QueueItem]> = (0..1000)
+        .map(|i| QueueItem {
+            id: i + 1,
+            song: SongItem {
+                video_id: SONG.into(),
+                title: "t".repeat(250),
+                ..SongItem::default()
+            },
+        })
+        .collect();
+    // 30 of them, about 11 MB: well under 256 lines, well over 4 MiB.
+    for _ in 0..30 {
+        let _ = f.events.send(EngineEvent::Queue {
+            items: items.clone(),
+            current_id: Some(1),
+            shuffle: false,
+            repeat: Repeat::Off,
+        });
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(10), stuck.until_closed())
         .await
         .expect("the stuck client was never dropped");
     f.serve.abort();

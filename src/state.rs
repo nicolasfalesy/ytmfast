@@ -180,7 +180,7 @@ pub fn save(dir: &Path, saved: &Saved) -> io::Result<()> {
 
 /// Reads `dir/state.json`. `None` when there is none, or when it can't be used (then it is
 /// renamed to `state.json.bad`, with one log line). Every song is checked again as if it had
-/// come from YouTube: a bad video id or a thumbnail off the allowed hosts drops the song.
+/// come from YouTube: a bad video id drops the song, a bad thumbnail only its thumbnail.
 pub fn load(dir: &Path) -> Option<Saved> {
     let path = dir.join(FILE_NAME);
     let bytes = match read_capped(&path) {
@@ -239,6 +239,12 @@ fn set_aside(dir: &Path, why: &str) {
 /// Makes a loaded file safe to use: songs checked like fresh ones from YouTube (dropped
 /// otherwise, with the indexes moved to match), tokens checked, numbers clamped.
 fn sanitize(mut s: Saved) -> Saved {
+    // A bad thumbnail costs the song its picture only: the song itself is still fine.
+    for song in &mut s.queue {
+        if song.thumbnail.as_deref().is_some_and(|t| !thumbnail_ok(t)) {
+            song.thumbnail = None;
+        }
+    }
     let keep: Vec<bool> = s.queue.iter().map(song_ok).collect();
     // Old index -> new index, for the songs kept.
     let mut new_index = Vec::with_capacity(keep.len());
@@ -327,23 +333,30 @@ fn sanitize(mut s: Saved) -> Saved {
     s
 }
 
-/// A song as `next` would have let it through: a real video id, and a thumbnail (if any) on
-/// an allowed https host. The id goes into links and yt-dlp arguments, the thumbnail to the
-/// bar widgets, which load it. Text fields over `MAX_TEXT` (or over `MAX_ARTISTS` artists)
-/// drop the whole song, like a bad id: only a hand-edited file has them, and a song with a
-/// trimmed title would be a different song.
+fn text_ok(t: &str) -> bool {
+    t.len() <= MAX_TEXT
+}
+
+/// A thumbnail as `next` would have let it through: on an allowed https host, and no longer
+/// than any other text. It goes to the bar widgets, which load it. One that fails is cleared
+/// on load (`sanitize`), not a reason to drop its song.
+fn thumbnail_ok(t: &str) -> bool {
+    text_ok(t) && Url::parse(t).is_ok_and(|u| net::allowed_host(&u))
+}
+
+/// A song as `next` would have let it through: a real video id, and its text within the caps
+/// (the thumbnail is checked apart, in `sanitize`). The id goes into links and yt-dlp
+/// arguments. Text fields over `MAX_TEXT` (or over `MAX_ARTISTS` artists) drop the whole
+/// song, like a bad id: only a hand-edited file has them, and a song with a trimmed title
+/// would be a different song.
 fn song_ok(song: &SongItem) -> bool {
-    let text_ok = |t: &str| t.len() <= MAX_TEXT;
     is_video_id(&song.video_id)
         && text_ok(&song.title)
         && song.album.as_deref().is_none_or(text_ok)
         && song.playlist_id.as_deref().is_none_or(text_ok)
         && song.artists.len() <= MAX_ARTISTS
         && song.artists.iter().all(|a| text_ok(a))
-        && song
-            .thumbnail
-            .as_deref()
-            .is_none_or(|t| Url::parse(t).is_ok_and(|u| net::allowed_host(&u)))
+        && song.thumbnail.as_deref().is_none_or(thumbnail_ok)
 }
 
 /// Every index in `0..len` exactly once.
@@ -595,12 +608,15 @@ mod tests {
     #[test]
     fn loaded_items_are_revalidated() {
         let dir = tempfile::tempdir().unwrap();
-        // Songs A..F; B has an id that isn't one, D a thumbnail off the allowed hosts, F a
-        // thumbnail over plain http. The current song is E (index 4).
+        // Songs A..F; B and D have ids that aren't ones. C has a thumbnail off the allowed
+        // hosts, E one over plain http, F one over the text cap. The current song is E
+        // (index 4).
         let mut s = saved_of("ABCDEF", 4);
         s.queue[1].video_id = "B&list=x/../".into();
-        s.queue[3].thumbnail = Some("https://evil.example/t.jpg".into());
-        s.queue[5].thumbnail = Some("http://i.ytimg.com/t.jpg".into());
+        s.queue[3].video_id = "short".into();
+        s.queue[2].thumbnail = Some("https://evil.example/t.jpg".into());
+        s.queue[4].thumbnail = Some("http://i.ytimg.com/t.jpg".into());
+        s.queue[5].thumbnail = Some(format!("https://i.ytimg.com/{}", "x".repeat(MAX_TEXT)));
         s.shuffle = true;
         // The order before shuffling: F, E, D, C, B, A.
         s.original_order = Some(vec![5, 4, 3, 2, 1, 0]);
@@ -608,11 +624,15 @@ mod tests {
 
         let got = load(dir.path()).unwrap();
         let ids: Vec<String> = got.queue.iter().map(|i| i.video_id.clone()).collect();
-        assert_eq!(ids, [vid('A'), vid('C'), vid('E')]);
+        assert_eq!(ids, [vid('A'), vid('C'), vid('E'), vid('F')]);
+        // A bad thumbnail only loses the picture, not the song.
+        let thumbs: Vec<Option<&str>> = got.queue.iter().map(|i| i.thumbnail.as_deref()).collect();
+        let a_thumb = format!("https://i.ytimg.com/vi/{}/hq.jpg", vid('A'));
+        assert_eq!(thumbs, [Some(a_thumb.as_str()), None, None, None]);
         assert_eq!(got.current_index, 2, "E is still current");
         assert_eq!(got.position, 42.5, "and keeps its second");
-        // E, C, A in the old original order, as positions in the new queue.
-        assert_eq!(got.original_order, Some(vec![2, 1, 0]));
+        // F, E, C, A in the old original order, as positions in the new queue.
+        assert_eq!(got.original_order, Some(vec![3, 2, 1, 0]));
         // Over-long text, or too many artists, drops the song; long but sane is kept.
         let mut s = saved_of("ABCD", 0);
         s.queue[1].title = "t".repeat(MAX_TEXT + 1);

@@ -187,8 +187,9 @@ second restart in the same song leaves it stopped.
 
 - A client that falls behind on events gets a fresh `state` event and a fresh `queue`
   event in place of the ones it missed.
-- A client that stops reading altogether is disconnected once its outgoing queue fills, so
-  it can never hold up the engine or other clients.
+- A client that stops reading altogether is disconnected once its outgoing queue fills
+  (256 lines or 4 MiB, whichever comes first), so it can never hold up the engine or other
+  clients, nor much memory.
 - A client that closes its sending side still gets the replies to what it sent; then the
   connection closes.
 

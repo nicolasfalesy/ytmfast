@@ -299,6 +299,9 @@ impl Play {
             Ok(t) => t,
             Err(e) => return self.log(&e),
         };
+        if let Some(note) = missing_visitor_note(&tracking) {
+            eprintln!("ytmfast: {note}");
+        }
         if let Some(url) = with_params(tracking.playback_url.as_deref(), &self.playback_params()) {
             self.send(url, &tracking).await;
         }
@@ -376,6 +379,16 @@ impl Play {
     }
 }
 
+/// A fixed line to log, once per play (this runs once per play's task), when the links came
+/// without a visitor id. The pings are then sent without `X-Goog-Visitor-Id`, which the spike
+/// found the history may need (ledger, "T7 spike result"), so a play missing from the history
+/// can be traced to it. Fixed text: the answer's values are never logged.
+fn missing_visitor_note(tracking: &Tracking) -> Option<&'static str> {
+    tracking.visitor_data.is_none().then_some(
+        "the play-history links came without a visitor id; this play may not reach the history",
+    )
+}
+
 /// `base` with `params` appended to its query, or `None` when there is no link (or it is not
 /// one). The base's own parameters stay exactly as YouTube sent them.
 fn with_params(base: Option<&str>, params: &[(&str, String)]) -> Option<Url> {
@@ -405,6 +418,17 @@ mod tests {
             .filter_map(|m| w.apply(*m))
             .map(|p| (p.st, p.et, p.paused, p.last))
             .collect()
+    }
+
+    #[test]
+    fn a_missing_visitor_id_is_noted() {
+        let mut t = Tracking {
+            playback_url: Some("https://s.youtube.com/api/stats/playback".into()),
+            ..Tracking::default()
+        };
+        assert!(missing_visitor_note(&t).is_some());
+        t.visitor_data = Some("CgtWaXNpdG9y".into());
+        assert_eq!(missing_visitor_note(&t), None);
     }
 
     #[test]

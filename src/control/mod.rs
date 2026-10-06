@@ -22,6 +22,7 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -45,6 +46,12 @@ pub const SOCKET_NAME: &str = "socket";
 /// above the engine's 64-event buffer: a lagged client gets those 64 plus a fresh state in
 /// one go, before its writer has had a turn, and that must not count as stuck.
 const OUT_QUEUE: usize = 256;
+
+/// Bytes of lines that may wait for one client (queued, or in the write under way), as well
+/// as `OUT_QUEUE` lines. A queue event can be about 375 KB (1,000 songs), so 256 of them
+/// would hold close to 100 MB for one client that stopped reading; 4 MiB is still about ten
+/// full queue events of slack for a slow but live one.
+const OUT_BYTES: usize = 4 << 20;
 
 /// How long a closing client gets to take what is already queued for it (a reply sent just
 /// before the client half-closed, or the `quit` reply).
@@ -350,8 +357,12 @@ enum Close {
 /// One client: reads its requests and forwards engine events into its writer's queue.
 async fn client(stream: UnixStream, shared: Arc<Shared>) {
     let (read_half, write_half) = stream.into_split();
-    let (out, out_rx) = mpsc::channel::<String>(OUT_QUEUE);
-    let mut writer = tokio::spawn(write_lines(write_half, out_rx));
+    let (tx, out_rx) = mpsc::channel::<String>(OUT_QUEUE);
+    let out = Outbox {
+        tx,
+        bytes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut writer = tokio::spawn(write_lines(write_half, out_rx, out.bytes.clone()));
     let mut events = shared.events.subscribe();
     let mut lines = LineReader::new(read_half);
     let mut quit = false;
@@ -417,10 +428,31 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     }
 }
 
-/// Queues a line for the writer; false when the queue is full or the writer is gone, and
-/// the client should be dropped.
-fn push(out: &mpsc::Sender<String>, line: String) -> bool {
-    out.try_send(line).is_ok()
+/// One client's outgoing lines, capped by count (the channel) and by bytes.
+struct Outbox {
+    tx: mpsc::Sender<String>,
+    /// Bytes pushed and not yet written; the writer takes them off once written.
+    bytes: Arc<AtomicUsize>,
+}
+
+/// Queues a line for the writer; false when the queue is full (`OUT_QUEUE` lines or
+/// `OUT_BYTES` bytes) or the writer is gone, and the client should be dropped.
+fn push(out: &Outbox, line: String) -> bool {
+    let n = line.len();
+    let fits = out
+        .bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |b| {
+            (b + n <= OUT_BYTES).then_some(b + n)
+        })
+        .is_ok();
+    if !fits {
+        return false;
+    }
+    if out.tx.try_send(line).is_err() {
+        out.bytes.fetch_sub(n, Ordering::AcqRel);
+        return false;
+    }
+    true
 }
 
 /// One request: its reply line, and whether it was `quit`.
@@ -501,8 +533,14 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
 }
 
 /// Writes queued lines until the queue closes or the socket fails. Takes whatever else is
-/// already queued along with each line, so a burst goes out in one write.
-async fn write_lines<W: AsyncWrite + Unpin>(mut socket: W, mut queue: mpsc::Receiver<String>) {
+/// already queued along with each line, so a burst goes out in one write. `bytes` drops by
+/// what was written only once it is written: a batch stuck in a write still counts against
+/// the client's `OUT_BYTES`.
+async fn write_lines<W: AsyncWrite + Unpin>(
+    mut socket: W,
+    mut queue: mpsc::Receiver<String>,
+    bytes: Arc<AtomicUsize>,
+) {
     let mut buf = Vec::new();
     while let Some(line) = queue.recv().await {
         buf.clear();
@@ -513,6 +551,7 @@ async fn write_lines<W: AsyncWrite + Unpin>(mut socket: W, mut queue: mpsc::Rece
         if socket.write_all(&buf).await.is_err() {
             return;
         }
+        bytes.fetch_sub(buf.len(), Ordering::AcqRel);
     }
     let _ = socket.shutdown().await;
 }

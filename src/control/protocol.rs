@@ -470,8 +470,8 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
     m
 }
 
-/// One queue item on the wire. Borrowed and serialized straight to text: a 500-song queue
-/// goes out on every queue change, to every client, and a `Value` tree of it first would
+/// One queue item on the wire. Borrowed and serialized straight to text: a queue of up to
+/// 1,000 songs (`queue::MAX_ITEMS`) goes out on every queue change, to every client, and a `Value` tree of it first would
 /// copy every string once more.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
