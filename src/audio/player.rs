@@ -6,9 +6,16 @@
 //! until the output has room (so it decodes at most the output's buffer ahead, which keeps
 //! the CPU asleep most of the time); while paused or idle it blocks on the command channel;
 //! at the end of a track it waits, in steps, for the output to play what it holds.
+//!
+//! Gapless: the engine hands over the next track early (`preload`). When the current track's
+//! decoder runs out, the next one's frames go into the same output right behind it, with no
+//! flush, so the output never runs dry between them. The position clock starts again at the
+//! exact frame where the new track starts, once that frame is heard (`AudioEvent::Advanced`).
+//! A track at another sample rate can't share the output: the old track plays out, the output
+//! is opened again at the new rate, and the gap that costs is measured and logged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -31,8 +38,15 @@ pub enum AudioEvent {
     Started,
     Paused,
     Resumed,
-    /// The track played to its end (all of it heard, not just decoded).
+    /// The track played to its end (all of it heard, not just decoded), with nothing
+    /// preloaded behind it.
     Ended,
+    /// The preloaded track with this id (`AudioPlayer::preload`'s) is now the current one:
+    /// the old track's last frame and the new track's first frame were heard back to back.
+    /// Sent when the new track's first frame is heard, which is also where the position starts
+    /// again from 0. It takes the place of the old track's `Ended` and the new track's
+    /// `Started` (the new track plays on in the old one's state).
+    Advanced(u64),
     /// The track failed; the player is idle. The error itself, so its `code()` reaches the
     /// user (its `Display` is URL-free, ruling R6).
     Error(Error),
@@ -46,6 +60,14 @@ enum Command {
         start: f64,
         length_hint: Option<f64>,
     },
+    Preload {
+        id: u64,
+        reader: TrackReader,
+        mime: String,
+        gain: f32,
+        length_hint: Option<f64>,
+    },
+    CancelPreload,
     Play,
     Pause,
     Seek(f64),
@@ -66,16 +88,61 @@ const DRAIN_GRACE: Duration = Duration::from_secs(1);
 const DRAIN_STEP_MAX: Duration = Duration::from_millis(50);
 const DRAIN_STEP_MIN: Duration = Duration::from_millis(5);
 
+/// The gap budget between two tracks of the same rate (Global Constraints). Only a log line
+/// when it is broken: nothing can be done about it after the fact.
+const GAP_BUDGET: Duration = Duration::from_millis(5);
+
+/// `last_gap` before any handover.
+const NO_GAP: u64 = u64::MAX;
+
+/// The readers the engine can cancel: the current track's and the preloaded one's.
+///
+/// Shared with the audio thread, which moves the preload's into `current` at a handover
+/// under this lock. So a `preload` or `cancel_preload` sent just as the handover happens can
+/// only ever cancel a track that is still waiting, never the one that is playing.
+#[derive(Default)]
+struct Readers {
+    current: Option<ReaderCancel>,
+    next: Option<(u64, ReaderCancel)>,
+}
+
+impl Readers {
+    fn cancel_all(&mut self) {
+        if let Some(c) = self.current.take() {
+            c.cancel();
+        }
+        self.cancel_next();
+    }
+
+    fn cancel_next(&mut self) {
+        if let Some((_, c)) = self.next.take() {
+            c.cancel();
+        }
+    }
+
+    fn next_id(&self) -> Option<u64> {
+        self.next.as_ref().map(|(id, _)| *id)
+    }
+}
+
+fn lock(readers: &Mutex<Readers>) -> MutexGuard<'_, Readers> {
+    readers.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The handle the engine holds. Dropping it stops the thread.
 pub struct AudioPlayer {
     commands: Sender<Command>,
     events: Receiver<AudioEvent>,
     /// Seconds into the track, as f64 bits, kept fresh by the audio thread.
     position: Arc<AtomicU64>,
-    /// Cancels the newest loaded track's reader. The audio thread can be blocked in a read
-    /// waiting for a stalled download; `stop`, a new `load` and drop cancel it first, so they
-    /// never wait behind the network.
-    current: Mutex<Option<ReaderCancel>>,
+    /// Cancels the loaded and the preloaded tracks' readers. The audio thread can be blocked
+    /// in a read waiting for a stalled download; `stop`, a new `load`, a new `preload` and
+    /// drop cancel first, so they never wait behind the network.
+    readers: Arc<Mutex<Readers>>,
+    /// The last handover's gap in µs (`NO_GAP` before the first).
+    gap_us: Arc<AtomicU64>,
+    /// Ids handed out by `preload`.
+    preloads: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -92,12 +159,18 @@ impl AudioPlayer {
         }));
         let (events_tx, events) = crossbeam_channel::unbounded();
         let position = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let readers = Arc::new(Mutex::new(Readers::default()));
+        let gap_us = Arc::new(AtomicU64::new(NO_GAP));
         let worker = Worker {
             sink,
             inbox,
             events: events_tx,
             position: position.clone(),
+            readers: readers.clone(),
+            gap_us: gap_us.clone(),
             track: None,
+            next: None,
+            outgoing: None,
             scratch: Vec::new(),
         };
         let thread = std::thread::Builder::new()
@@ -108,7 +181,9 @@ impl AudioPlayer {
             commands,
             events,
             position,
-            current: Mutex::new(None),
+            readers,
+            gap_us,
+            preloads: AtomicU64::new(0),
             thread: Some(thread),
         }
     }
@@ -122,7 +197,7 @@ impl AudioPlayer {
     /// Replaces the current track with `reader`, paused at `start_seconds`, with `gain`
     /// applied to its samples (loudness normalisation). `length_hint` is the resolver's length
     /// in seconds, used when the file states none (see `Decoder::with_length_hint`). `play`
-    /// starts it.
+    /// starts it. Drops any preloaded track too.
     pub fn load(
         &self,
         reader: TrackReader,
@@ -131,7 +206,11 @@ impl AudioPlayer {
         start_seconds: f64,
         length_hint: Option<f64>,
     ) {
-        self.cancel_current(Some(reader.canceller()));
+        {
+            let mut readers = lock(&self.readers);
+            readers.cancel_all();
+            readers.current = Some(reader.canceller());
+        }
         self.send(Command::Load {
             reader,
             mime: mime.to_string(),
@@ -139,6 +218,41 @@ impl AudioPlayer {
             start: start_seconds,
             length_hint,
         });
+    }
+
+    /// Queues `reader` to play right after the current track, with no gap: `Advanced` with
+    /// the returned id says when it did. It replaces an earlier preload. The audio thread
+    /// opens it once both its download and the current track's are finished (so opening it
+    /// never waits on the network, and only one download runs at a time), or at the latest
+    /// when the current track runs out. A preload that can't be opened is dropped (logged by
+    /// code), and the current track then ends with `Ended`.
+    pub fn preload(
+        &self,
+        reader: TrackReader,
+        mime: &str,
+        gain: f32,
+        length_hint: Option<f64>,
+    ) -> u64 {
+        let id = self.preloads.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut readers = lock(&self.readers);
+            readers.cancel_next();
+            readers.next = Some((id, reader.canceller()));
+        }
+        self.send(Command::Preload {
+            id,
+            reader,
+            mime: mime.to_string(),
+            gain,
+            length_hint,
+        });
+        id
+    }
+
+    /// Drops the preloaded track, if it hasn't become the current one yet.
+    pub fn cancel_preload(&self) {
+        lock(&self.readers).cancel_next();
+        self.send(Command::CancelPreload);
     }
 
     pub fn play(&self) {
@@ -159,27 +273,27 @@ impl AudioPlayer {
         self.send(Command::Volume(volume));
     }
 
-    /// Unloads the track and empties the output.
+    /// Unloads the track (and any preload) and empties the output.
     pub fn stop(&self) {
-        self.cancel_current(None);
+        lock(&self.readers).cancel_all();
         self.send(Command::Stop);
-    }
-
-    /// Cancels the current track's reader and makes `next` the current one.
-    fn cancel_current(&self, next: Option<ReaderCancel>) {
-        let old = std::mem::replace(
-            &mut *self.current.lock().unwrap_or_else(|e| e.into_inner()),
-            next,
-        );
-        if let Some(old) = old {
-            old.cancel();
-        }
     }
 
     /// Seconds into the track that the listener is hearing now: (frames written − the
     /// output's delay) / rate, from the start point of the last load or seek.
     pub fn position(&self) -> f64 {
         f64::from_bits(self.position.load(Ordering::Acquire))
+    }
+
+    /// The silence the last handover put between two tracks. Same rate: how much longer
+    /// than the audio still queued at the old track's end the switch took (0 when the output
+    /// never ran dry). A new rate: from the old track's last frame heard to the new one's
+    /// first. `None` before the first handover.
+    pub fn last_gap(&self) -> Option<Duration> {
+        match self.gap_us.load(Ordering::Acquire) {
+            NO_GAP => None,
+            us => Some(Duration::from_micros(us)),
+        }
     }
 
     fn send(&self, command: Command) {
@@ -190,7 +304,7 @@ impl AudioPlayer {
 
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
-        self.cancel_current(None);
+        lock(&self.readers).cancel_all();
         self.send(Command::Quit);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -214,7 +328,58 @@ struct Track {
     playing: bool,
     /// Every frame is decoded and written; waiting for the output to play them.
     drain: Option<Instant>,
+    /// Draining before a handover to a track at another rate (the output reopens after).
+    reopen: bool,
     ended: bool,
+}
+
+/// The preloaded track.
+struct Next {
+    id: u64,
+    gain: f32,
+    cancel: ReaderCancel,
+    open: NextOpen,
+}
+
+enum NextOpen {
+    /// Not opened yet: opening reads the headers, which waits for them to download.
+    Waiting {
+        reader: TrackReader,
+        mime: String,
+        length_hint: Option<f64>,
+    },
+    // Boxed: a decoder is large, and a preload waits most of a song unopened.
+    Ready(Box<Decoder>),
+}
+
+/// The track just handed over from, until the new one's first frame is heard: until then
+/// the listener still hears the old one, so the position is still the old one's (and a seek
+/// still means the old one).
+struct Outgoing {
+    track: Track,
+    /// The new track's preload id, for `Advanced`.
+    id: u64,
+    /// The output was opened again at the new track's rate: nothing of the old track is left
+    /// in it.
+    reopened: bool,
+    gap: Gap,
+}
+
+/// Measuring the handover's gap.
+enum Gap {
+    /// Same rate: when the old track ran out, and how much of it the output still held then.
+    /// The gap is whatever the switch took beyond that, measured at the new track's first
+    /// write.
+    Same {
+        eof: Instant,
+        buffered: Duration,
+    },
+    /// New rate: when the old track's last frame was heard. The gap ends when the new track's
+    /// first frame is heard.
+    Reopen {
+        drained: Instant,
+    },
+    Counted(Duration),
 }
 
 struct Worker {
@@ -222,7 +387,11 @@ struct Worker {
     inbox: Receiver<Command>,
     events: Sender<AudioEvent>,
     position: Arc<AtomicU64>,
+    readers: Arc<Mutex<Readers>>,
+    gap_us: Arc<AtomicU64>,
     track: Option<Track>,
+    next: Option<Next>,
+    outgoing: Option<Outgoing>,
     /// The gain-scaled copy of a packet's frames, reused.
     scratch: Vec<f32>,
 }
@@ -232,12 +401,16 @@ impl Worker {
         loop {
             let busy = self.track.as_ref().filter(|t| t.playing && !t.ended);
             let command = match busy {
-                // Playing: take any waiting command, else decode the next packet.
-                Some(t) if t.drain.is_none() => match self.inbox.try_recv() {
-                    Ok(c) => Some(c),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => return,
-                },
+                // Playing: take any waiting command, else decode the next packet. Also while
+                // draining with a track of the same rate to hand over to: at once, before the
+                // output runs dry.
+                Some(t) if t.drain.is_none() || (self.next.is_some() && !t.reopen) => {
+                    match self.inbox.try_recv() {
+                        Ok(c) => Some(c),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
                 // Draining: wait for a command or the next check.
                 Some(t) => {
                     let wait = self.drain_step(t.rate);
@@ -276,6 +449,22 @@ impl Worker {
                 start,
                 length_hint,
             } => self.load(reader, &mime, gain, start, length_hint),
+            Command::Preload {
+                id,
+                reader,
+                mime,
+                gain,
+                length_hint,
+            } => self.preload(id, reader, mime, gain, length_hint),
+            Command::CancelPreload => {
+                if let Some(next) = self.next.take() {
+                    // Only its own entry: a newer preload may be on its way behind this.
+                    let mut readers = lock(&self.readers);
+                    if readers.next_id() == Some(next.id) {
+                        readers.cancel_next();
+                    }
+                }
+            }
             Command::Play => {
                 if self.track.as_ref().is_none_or(|t| t.playing || t.ended) {
                     return;
@@ -313,6 +502,9 @@ impl Worker {
                 self.emit(AudioEvent::Paused);
             }
             Command::Seek(seconds) => {
+                // Mid-handover the listener still hears the old track, and the engine still
+                // calls it current: the seek is about it.
+                self.roll_back();
                 let Some(t) = self.track.as_mut() else {
                     return;
                 };
@@ -321,6 +513,7 @@ impl Worker {
                         t.base = at;
                         t.written = 0;
                         t.drain = None;
+                        t.reopen = false;
                         t.ended = false;
                         self.sink.flush();
                         self.publish();
@@ -381,23 +574,113 @@ impl Worker {
             rate: f64::from(decoder.rate()),
             decoder,
             cancel,
-            gain: if gain.is_finite() {
-                gain.clamp(0.0, 1.0)
-            } else {
-                1.0
-            },
+            gain: clean_gain(gain),
             base,
             written: 0,
             started: false,
             playing: false,
             drain: None,
+            reopen: false,
             ended: false,
         });
         self.publish();
     }
 
-    /// Drops the track; the output is emptied and paused (an idle stream would keep the
-    /// audio graph, and the CPU, awake).
+    fn preload(
+        &mut self,
+        id: u64,
+        reader: TrackReader,
+        mime: String,
+        gain: f32,
+        length_hint: Option<f64>,
+    ) {
+        // A newer preload or a cancel came after this one: its reader is already cancelled.
+        if lock(&self.readers).next_id() != Some(id) {
+            return;
+        }
+        self.next = Some(Next {
+            id,
+            gain: clean_gain(gain),
+            cancel: reader.canceller(),
+            open: NextOpen::Waiting {
+                reader,
+                mime,
+                length_hint,
+            },
+        });
+        self.open_next_when_ready();
+    }
+
+    /// Opens the preload once both downloads are finished: its headers are then in memory, so
+    /// opening never blocks a write (and the current song's connection is closed, so the radio
+    /// carries one download at a time). If that hasn't happened by the current track's end,
+    /// `ready_next` opens it there.
+    fn open_next_when_ready(&mut self) {
+        let waiting = self
+            .next
+            .as_ref()
+            .is_some_and(|n| matches!(n.open, NextOpen::Waiting { .. }));
+        if waiting
+            && self
+                .next
+                .as_ref()
+                .is_some_and(|n| n.cancel.download_finished())
+            && self
+                .track
+                .as_ref()
+                .is_none_or(|t| t.cancel.download_finished())
+        {
+            self.ready_next();
+        }
+    }
+
+    /// Opens the preload if it is still waiting (blocking on its download). False when there
+    /// is none, or it could not be opened (then it is dropped).
+    fn ready_next(&mut self) -> bool {
+        let Some(mut next) = self.next.take() else {
+            return false;
+        };
+        next.open = match next.open {
+            NextOpen::Ready(d) => NextOpen::Ready(d),
+            NextOpen::Waiting {
+                reader,
+                mime,
+                length_hint,
+            } => match Decoder::open(reader, &mime) {
+                Ok(d) => {
+                    crate::trace::mark("next decoder open");
+                    NextOpen::Ready(Box::new(d.with_length_hint(length_hint)))
+                }
+                Err(e) => {
+                    if !next.cancel.is_cancelled() {
+                        // The code only (ruling R6). The engine loads it the usual way when
+                        // the current track ends, and reports the error then if it is real.
+                        eprintln!("ytmfast: could not open the next track ({})", e.code());
+                    }
+                    let mut readers = lock(&self.readers);
+                    if readers.next_id() == Some(next.id) {
+                        readers.cancel_next();
+                    }
+                    return false;
+                }
+            },
+        };
+        self.next = Some(next);
+        true
+    }
+
+    /// Drops the preload, and cancels its reader if it is still the registered one.
+    fn drop_next(&mut self) {
+        if let Some(next) = self.next.take() {
+            let mut readers = lock(&self.readers);
+            if readers.next_id() == Some(next.id) {
+                readers.cancel_next();
+            }
+        }
+    }
+
+    /// Drops the track and any preload; the output is emptied and paused (an idle stream
+    /// would keep the audio graph, and the CPU, awake).
     fn unload(&mut self) {
         self.drop_track();
         self.position.store(0f64.to_bits(), Ordering::Release);
@@ -406,36 +689,25 @@ impl Worker {
     /// `unload`, keeping the last position: after a failure it says where the song stopped.
     fn drop_track(&mut self) {
         self.track = None;
+        self.outgoing = None;
+        self.drop_next();
         self.sink.flush();
         self.sink.pause(true);
     }
 
-    /// One unit of work while playing: decode and write a packet, or check the drain.
+    /// One unit of work while playing: decode and write a packet, check the drain, or hand
+    /// over to the preloaded track.
     fn step(&mut self) {
+        self.open_next_when_ready();
         let Some(t) = self.track.as_mut() else {
             return;
         };
         if let Some(since) = t.drain {
-            let delay = self.sink.delay_frames();
-            let deadline = since + Duration::from_secs_f64(delay as f64 / t.rate) + DRAIN_GRACE;
-            if delay == 0 || Instant::now() >= deadline {
-                t.ended = true;
-                t.playing = false;
-                self.sink.pause(true);
-                self.publish();
-                self.emit(AudioEvent::Ended);
-            } else {
-                self.publish();
-            }
-            return;
+            return self.drain(since);
         }
         let frames = match t.decoder.next_frames() {
             Ok(Some(f)) => f,
-            Ok(None) => {
-                t.drain = Some(Instant::now());
-                self.publish();
-                return;
-            }
+            Ok(None) => return self.at_end(),
             Err(e) => {
                 let cancel = t.cancel.clone();
                 return self.fail_unless_cancelled(e, &cancel);
@@ -449,6 +721,16 @@ impl Worker {
             self.scratch.extend(frames.iter().map(|s| s * t.gain));
             &self.scratch
         };
+        if t.written == 0
+            && let Some(o) = self.outgoing.as_mut()
+            && let Gap::Same { eof, buffered } = o.gap
+        {
+            // The new track's first frames: the output still plays the old track's last ones
+            // unless the switch took longer than they last.
+            let gap = eof.elapsed().saturating_sub(buffered);
+            o.gap = Gap::Counted(gap);
+            self.gap_us.store(gap.as_micros() as u64, Ordering::Release);
+        }
         if let Err(e) = self.sink.write(out) {
             return self.fail(e);
         }
@@ -460,19 +742,242 @@ impl Worker {
         self.publish();
     }
 
-    /// Recomputes the position from what was written and the output's delay.
-    fn publish(&self) {
+    /// The current track's decoder ran out: hand over to the preload at once (same rate), or
+    /// drain first (a new rate, or nothing preloaded).
+    fn at_end(&mut self) {
+        let eof = Instant::now();
+        let buffered = self.sink.delay_frames();
+        let mut reopen = false;
+        if self.ready_next() {
+            if self.next_rate() == self.track.as_ref().map(|t| t.rate) {
+                let buffered = Duration::from_secs_f64(buffered as f64 / self.rate());
+                return self.hand_over(Gap::Same { eof, buffered });
+            }
+            reopen = true;
+        }
+        if let Some(t) = self.track.as_mut() {
+            t.drain = Some(eof);
+            t.reopen = reopen;
+        }
+        self.publish();
+    }
+
+    /// Every frame is written: wait for the output to play them, then end, or hand over.
+    fn drain(&mut self, since: Instant) {
+        let rate = self.rate();
+        let reopen = self.track.as_ref().is_some_and(|t| t.reopen);
+        // A preload that came in while draining: at the same rate, it follows at once.
+        if !reopen && self.ready_next() {
+            if self.next_rate() == Some(rate) {
+                let buffered = self.sink.delay_frames() as f64 / rate;
+                return self.hand_over(Gap::Same {
+                    eof: Instant::now(),
+                    buffered: Duration::from_secs_f64(buffered),
+                });
+            }
+            if let Some(t) = self.track.as_mut() {
+                t.reopen = true;
+            }
+        }
+        let delay = self.sink.delay_frames();
+        let deadline = since + Duration::from_secs_f64(delay as f64 / rate) + DRAIN_GRACE;
+        if delay != 0 && Instant::now() < deadline {
+            return self.publish();
+        }
+        // All of the old track was heard: a preload at another rate (or one that replaced it
+        // while draining) gets its own output, and the gap starts now.
+        if self.ready_next() {
+            return self.hand_over(Gap::Reopen {
+                drained: Instant::now(),
+            });
+        }
+        let Some(t) = self.track.as_mut() else {
+            return;
+        };
+        t.ended = true;
+        t.playing = false;
+        self.sink.pause(true);
+        self.publish();
+        // A preloaded track shorter than the output's delay: heard in full by now.
+        self.finish_advance();
+        self.emit(AudioEvent::Ended);
+    }
+
+    /// The preload (opened) becomes the current track. Its frames follow the old track's in
+    /// the same output (same rate), or in a reopened one (`Gap::Reopen`).
+    fn hand_over(&mut self, gap: Gap) {
+        let Some(next) = self.next.take() else {
+            return;
+        };
+        let NextOpen::Ready(decoder) = next.open else {
+            return;
+        };
+        {
+            let mut readers = lock(&self.readers);
+            // A newer preload or a cancel is on its way: this one is no longer wanted (its
+            // reader is already cancelled), and the old track just ends.
+            if readers.next_id() != Some(next.id) {
+                return;
+            }
+            readers.current = readers.next.take().map(|(_, c)| c);
+        }
+        // A track shorter than the output's delay, still waiting to be heard: it is, as of
+        // the frames that follow it now.
+        self.finish_advance();
+        let Some(old) = self.track.take() else {
+            return;
+        };
+        let reopened = matches!(gap, Gap::Reopen { .. });
+        let rate = decoder.rate();
+        let old_rate = old.rate;
+        self.track = Some(Track {
+            rate: f64::from(rate),
+            decoder: *decoder,
+            cancel: next.cancel,
+            gain: next.gain,
+            base: 0.0,
+            written: 0,
+            // It plays on in the old track's state (a pause while draining included).
+            started: true,
+            playing: old.playing,
+            drain: None,
+            reopen: false,
+            ended: false,
+        });
+        self.outgoing = Some(Outgoing {
+            track: old,
+            id: next.id,
+            reopened,
+            gap,
+        });
+        if reopened {
+            crate::trace::mark("output reopen for a new rate");
+            if let Err(e) = self.sink.open(rate, 2) {
+                // The old track was heard to its end; the new one is current, and failed
+                // before a gap could be measured.
+                if let Some(o) = self.outgoing.as_mut() {
+                    o.gap = Gap::Counted(Duration::ZERO);
+                }
+                return self.fail(e);
+            }
+            eprintln!(
+                "ytmfast: the next song is at {rate} Hz, not {old_rate} Hz: reopening the output"
+            );
+        }
+        self.publish();
+    }
+
+    /// Mid-handover, a seek of the old track: it becomes current again, and the new track goes
+    /// back to waiting, from its start (none of it was heard).
+    fn roll_back(&mut self) {
+        let Some(old) = self.outgoing.take() else {
+            return;
+        };
+        let Some(mut new) = self.track.take() else {
+            return;
+        };
+        let keep = {
+            let mut readers = lock(&self.readers);
+            readers.current = Some(old.track.cancel.clone());
+            // A newer preload (or a cancel) since: drop this one for it.
+            if readers.next.is_none() && new.decoder.seek(0.0).is_ok() {
+                readers.next = Some((old.id, new.cancel.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if keep {
+            self.next = Some(Next {
+                id: old.id,
+                gain: new.gain,
+                cancel: new.cancel,
+                open: NextOpen::Ready(Box::new(new.decoder)),
+            });
+        } else {
+            new.cancel.cancel();
+        }
+        let rate = old.track.rate;
+        self.track = Some(old.track);
+        if old.reopened
+            && let Err(e) = self.sink.open(rate as u32, 2)
+        {
+            self.fail(e);
+        }
+    }
+
+    /// The handover is heard (or has to count as heard): the position is the new track's from
+    /// now, and then the engine is told (so a position read on `Advanced` is the new one's).
+    fn finish_advance(&mut self) {
+        let Some(o) = self.outgoing.take() else {
+            return;
+        };
+        self.publish();
+        let gap = match o.gap {
+            Gap::Reopen { drained } => {
+                let gap = drained.elapsed();
+                self.gap_us.store(gap.as_micros() as u64, Ordering::Release);
+                eprintln!(
+                    "ytmfast: {:.1} ms of silence between songs (sample rate change)",
+                    gap.as_secs_f64() * 1000.0
+                );
+                gap
+            }
+            Gap::Counted(gap) => gap,
+            Gap::Same { .. } => Duration::ZERO,
+        };
+        if !o.reopened && gap > GAP_BUDGET {
+            eprintln!(
+                "ytmfast: {:.1} ms of silence between songs (over the {} ms budget)",
+                gap.as_secs_f64() * 1000.0,
+                GAP_BUDGET.as_millis()
+            );
+        }
+        self.emit(AudioEvent::Advanced(o.id));
+    }
+
+    /// The opened preload's rate.
+    fn next_rate(&self) -> Option<f64> {
+        match &self.next.as_ref()?.open {
+            NextOpen::Ready(d) => Some(f64::from(d.rate())),
+            NextOpen::Waiting { .. } => None,
+        }
+    }
+
+    /// The current track's rate (48 kHz, never used without a track).
+    fn rate(&self) -> f64 {
+        self.track.as_ref().map_or(48_000.0, |t| t.rate)
+    }
+
+    /// Recomputes the position from what was written and the output's delay. Mid-handover it
+    /// is still the old track's, until the new track's first frame is heard.
+    fn publish(&mut self) {
+        let delay = self.sink.delay_frames();
+        if self.outgoing.is_some() && self.track.as_ref().is_some_and(|t| t.written > delay) {
+            // Publishes the new track's position itself, before it says so.
+            return self.finish_advance();
+        }
         let Some(t) = &self.track else {
             return;
         };
-        let heard = t.written.saturating_sub(self.sink.delay_frames());
-        let seconds = t.base + heard as f64 / t.rate;
+        let seconds = match &self.outgoing {
+            Some(o) => {
+                // What of the old track is still queued ahead of the new one's frames.
+                let unheard = if o.reopened { 0 } else { delay - t.written };
+                let old = &o.track;
+                old.base + old.written.saturating_sub(unheard) as f64 / old.rate
+            }
+            None => t.base + t.written.saturating_sub(delay) as f64 / t.rate,
+        };
         self.position.store(seconds.to_bits(), Ordering::Release);
     }
 
     /// A failed track: report it and go idle. The position stays where the song stopped, for
     /// the engine's status and its replay after an output restart.
     fn fail(&mut self, e: Error) {
+        // Mid-handover, the failure is the new track's (or the output's, under it): the
+        // engine must know it is current before it hears what went wrong.
+        self.finish_advance();
         self.drop_track();
         self.emit(AudioEvent::Error(e));
     }
@@ -490,6 +995,15 @@ impl Worker {
     fn emit(&self, event: AudioEvent) {
         // Nobody listening is fine: the engine may not care about events.
         let _ = self.events.send(event);
+    }
+}
+
+/// A loudness gain the samples can take: within 0..=1, and 1 when it isn't a number.
+fn clean_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -809,6 +1323,55 @@ mod tests {
         p.play();
         assert_eq!(next_event(&events), AudioEvent::Started);
         assert_eq!(next_event(&events), AudioEvent::Ended);
+    }
+
+    #[test]
+    fn a_preload_still_downloading_is_not_opened_mid_song() {
+        // Opening reads the headers: a preload whose bytes haven't come must not block the
+        // song that plays (it would stop writing, and the output would run dry).
+        let (p, events, _) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        p.preload(stalled("sine440_48k.webm", 100), OPUS_MIME, 1.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(400));
+        let at = p.position();
+        assert!(at > 0.3, "the song plays on: {at}");
+        // At the song's end it has to be opened, and waits for its bytes; a cancel frees it,
+        // and the song just ends.
+        std::thread::sleep(Duration::from_millis(1700));
+        p.cancel_preload();
+        assert_eq!(next_event(&events), AudioEvent::Ended);
+    }
+
+    #[test]
+    fn a_seek_mid_handover_is_about_the_old_track() {
+        // The old track's end is decoded (and the handover made) up to 200 ms before it is
+        // heard. Until the new track's first frame is heard, the listener hears the old one,
+        // so a seek then goes back into the old one, and the new one waits again.
+        let (p, events, _) = player(NullSink::realtime());
+        // 1 s from the end (as close as a seek goes).
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 1.0, None);
+        let id = p.preload(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        // Inside the last 200 ms: handed over, not heard yet. (Past 1.8 s, the writer, 200 ms
+        // ahead, has reached the end, and the handover is made there and then.)
+        std::thread::sleep(Duration::from_millis(850));
+        assert!(events.try_recv().is_err(), "not heard yet");
+        let before = p.position();
+        assert!(before > 1.8, "the old track's clock: {before}");
+        let t = std::time::Instant::now();
+        p.seek(0.5);
+        assert_eq!(next_event(&events), AudioEvent::Advanced(id));
+        let after = t.elapsed().as_secs_f64();
+        // 1.5 s more of the old track first, not the 0.1 s that was left before the seek.
+        assert!(
+            after > 1.4 && after < 1.6,
+            "Advanced {after} s after the seek"
+        );
+        assert!(p.position() < 0.05, "{}", p.position());
+        p.stop();
     }
 
     #[test]

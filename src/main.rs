@@ -456,6 +456,7 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
             AudioEvent::Ended => return Ok(()),
             AudioEvent::Error(e) => return Err(e.to_string()),
             AudioEvent::Loading
+            | AudioEvent::Advanced(_)
             | AudioEvent::Started
             | AudioEvent::Paused
             | AudioEvent::Resumed => {}

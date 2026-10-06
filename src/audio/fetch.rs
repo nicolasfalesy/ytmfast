@@ -52,7 +52,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type Relink = Box<dyn Fn() -> BoxFuture<'static, Result<String, Error>> + Send + Sync>;
 
 /// A song being downloaded into memory. Cheap to read from many places: each `reader` is an
-/// independent cursor over the same bytes.
+/// independent cursor over the same bytes. A clone is another handle on the same download.
+#[derive(Clone)]
 pub struct TrackBuffer {
     shared: Arc<Shared>,
     owner: Arc<Owner>,
@@ -92,6 +93,13 @@ impl ReaderCancel {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// The reader's track has stopped downloading (all of it arrived, or it failed): reading
+    /// it never waits on the network, and its connection is closed. The audio thread opens a
+    /// preloaded track only then (or at the boundary), so opening it never blocks a write.
+    pub fn download_finished(&self) -> bool {
+        self.shared.lock().end.is_some()
     }
 }
 
@@ -348,6 +356,11 @@ impl TrackBuffer {
             pos: 0,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The download failed or stopped before the end (the bytes that came stay readable).
+    pub fn failed(&self) -> bool {
+        matches!(self.shared.lock().end, Some(End::Failed(_) | End::Stopped))
     }
 
     /// Bytes downloaded so far, from the start of the track.
@@ -733,6 +746,23 @@ mod tests {
         assert_eq!(ours, Some(Error::Internal("the track was stopped".into())));
         assert!(cancel.is_cancelled());
         assert!(!other.canceller().is_cancelled(), "only that reader");
+    }
+
+    #[test]
+    fn download_finished_once_it_ends() {
+        let stalled = TrackBuffer::stalled(vec![1, 2, 3], 100);
+        assert!(!stalled.reader().canceller().download_finished());
+        let whole = TrackBuffer::from_bytes(vec![1, 2, 3]);
+        assert!(whole.reader().canceller().download_finished());
+        assert!(!stalled.failed() && !whole.failed());
+        stalled
+            .shared
+            .finish(End::Failed(Error::Internal("x".into())));
+        assert!(
+            stalled.reader().canceller().download_finished(),
+            "a failure ends it too"
+        );
+        assert!(stalled.failed());
     }
 
     use super::*;

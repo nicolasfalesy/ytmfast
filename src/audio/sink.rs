@@ -51,6 +51,9 @@ pub struct NullStats {
     /// f32 bits.
     volume: AtomicU32,
     rate: AtomicU32,
+    /// Realtime: nanoseconds the pretend buffer sat empty while playing, between two pieces
+    /// of audio (a gap a listener would hear).
+    silence_ns: AtomicU64,
     /// Set by `lose_output`, cleared by the next `open`.
     lost: AtomicBool,
     /// Told when `lose_output` loses the output.
@@ -88,6 +91,13 @@ impl NullStats {
     pub fn rate(&self) -> u32 {
         self.rate.load(Ordering::SeqCst)
     }
+    /// Realtime: how long the output ran dry while playing, after audio and before more
+    /// came (the gaps a listener would hear). Not counted: before the first audio, after a
+    /// flush, after the last audio, and while paused.
+    pub fn silence(&self) -> Duration {
+        Duration::from_nanos(self.silence_ns.load(Ordering::SeqCst))
+    }
+
     /// Plays a sound server restart: the sink acts like a `PipeWireSink` whose stream died
     /// (writes fail, `lost` is true) until it is opened again.
     pub fn lose_output(&self) {
@@ -125,6 +135,11 @@ pub struct NullSink {
     queued: u64,
     since: Instant,
     paused: bool,
+    /// Realtime: audio was written since the last flush, so running dry is a gap...
+    primed: bool,
+    /// ...once more audio follows: dry time not yet counted, in seconds. A song's end (no
+    /// more audio, then a pause) is not a gap.
+    dry: f64,
 }
 
 impl NullSink {
@@ -155,6 +170,8 @@ impl NullSink {
             queued: 0,
             since: Instant::now(),
             paused: false,
+            primed: false,
+            dry: 0.0,
         }
     }
 
@@ -172,6 +189,14 @@ impl NullSink {
     }
 
     fn settle(&mut self) {
+        if self.primed && !self.paused && self.rate > 0 {
+            // Played past what was queued: the buffer ran dry for the difference.
+            let dry =
+                self.since.elapsed().as_secs_f64() - self.queued as f64 / f64::from(self.rate);
+            if dry > 0.0 {
+                self.dry += dry;
+            }
+        }
         self.queued = self.fill_now();
         self.since = Instant::now();
     }
@@ -188,6 +213,8 @@ impl Sink for NullSink {
         if rate == 0 || channels == 0 {
             return Err(Error::Internal("bad output format".into()));
         }
+        // Account for the old rate's buffer (and any dry time) before the rate changes.
+        self.settle();
         self.rate = rate;
         self.channels = channels;
         self.stats.rate.store(rate, Ordering::SeqCst);
@@ -224,6 +251,13 @@ impl Sink for NullSink {
                 ));
             }
             self.queued += n;
+            self.primed = true;
+            if self.dry > 0.0 {
+                self.stats
+                    .silence_ns
+                    .fetch_add((self.dry * 1e9) as u64, Ordering::SeqCst);
+                self.dry = 0.0;
+            }
         }
         self.stats.frames.fetch_add(n, Ordering::SeqCst);
         self.stats.writes.fetch_add(1, Ordering::SeqCst);
@@ -237,6 +271,8 @@ impl Sink for NullSink {
     }
 
     fn flush(&mut self) {
+        self.primed = false;
+        self.dry = 0.0;
         self.queued = 0;
         self.since = Instant::now();
         self.stats.flushes.fetch_add(1, Ordering::SeqCst);
@@ -318,6 +354,36 @@ mod tests {
             2,
             "a new output can be lost again"
         );
+    }
+
+    #[test]
+    fn realtime_counts_silence_while_dry() {
+        let mut s = NullSink::realtime();
+        let stats = s.stats();
+        s.open(48_000, 2).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // Before the first audio: not a gap.
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert_eq!(stats.silence(), Duration::ZERO);
+        // 20 ms queued, then 60 ms without a write: dry for about 40 ms.
+        std::thread::sleep(Duration::from_millis(60));
+        s.write(&[0.0; 960 * 2]).unwrap();
+        let dry = stats.silence();
+        assert!(
+            dry >= Duration::from_millis(35) && dry <= Duration::from_millis(60),
+            "{dry:?}"
+        );
+        // Paused: nothing plays, so nothing runs dry.
+        s.pause(true);
+        std::thread::sleep(Duration::from_millis(60));
+        s.pause(false);
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert!(stats.silence() - dry < Duration::from_millis(5));
+        // A flush (a seek, a stop) ends the audio on purpose: the wait after it isn't a gap.
+        s.flush();
+        std::thread::sleep(Duration::from_millis(40));
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert!(stats.silence() - dry < Duration::from_millis(5));
     }
 
     #[test]

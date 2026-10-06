@@ -8,7 +8,7 @@
 //! The audio thread writes into the ring and, when it is full, sleeps for as long as the
 //! missing room takes to play: no busy wait, and decoding stays at most 200 ms ahead.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -538,7 +538,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
         .register()
         .map_err(no_pipewire)?;
 
-    let volume = Rc::new(Cell::new(setup.volume));
+    let volume = Rc::new(RefCell::new(VolumeGate::new(setup.volume)));
     let state_volume = volume.clone();
     let state_shared = setup.shared.clone();
     let _state = stream
@@ -546,12 +546,13 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
         .state_changed(move |s, _, _, new| {
             if stream_gone(&new) {
                 mark_gone(&state_shared, &setup.notify);
-            } else if matches!(new, StreamState::Paused | StreamState::Streaming) {
-                // Controls only stick once the stream is negotiated: apply the volume then.
-                set_volume(s, state_volume.get());
-                if new == StreamState::Streaming {
-                    crate::trace::mark("stream running");
-                }
+                return;
+            }
+            if let Some(v) = state_volume.borrow_mut().state(&new) {
+                set_volume(s, v);
+            }
+            if new == StreamState::Streaming {
+                crate::trace::mark("stream running");
             }
         })
         .register()
@@ -575,7 +576,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
             let _ = control_stream.set_active(on);
         }
         Control::Volume(v) => {
-            volume.set(v);
+            let v = volume.borrow_mut().change(v);
             set_volume(&control_stream, v);
         }
         Control::Flush => {
@@ -588,6 +589,46 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     mainloop.run();
     let _ = stream.disconnect();
     Ok(())
+}
+
+/// When the stream's volume goes to PipeWire: on every change of ours, and on state changes
+/// only until the stream first runs.
+///
+/// Until then a control set on the stream doesn't stay: it is connected (Paused) before it is
+/// linked, and linking sets up its ports again, which resets the volume to 1.0 (seen against
+/// a private daemon: tests/gapless.rs). So the volume is sent on every state up to the first
+/// Streaming, which comes after the link. After that, a state change is a pause or a resume:
+/// sending the volume again there would undo a change the user made in a mixer since (step 1
+/// parked Minor 5).
+struct VolumeGate {
+    /// PipeWire channel volume (already mapped from the slider value).
+    value: f32,
+    /// The stream has run once: its controls stay as set from now on.
+    settled: bool,
+}
+
+impl VolumeGate {
+    fn new(value: f32) -> VolumeGate {
+        VolumeGate {
+            value,
+            settled: false,
+        }
+    }
+
+    /// A new volume of ours: always sent.
+    fn change(&mut self, v: f32) -> f32 {
+        self.value = v;
+        v
+    }
+
+    /// The stream's new state: what to send now, if anything.
+    fn state(&mut self, state: &StreamState) -> Option<f32> {
+        if self.settled || !matches!(state, StreamState::Paused | StreamState::Streaming) {
+            return None;
+        }
+        self.settled = *state == StreamState::Streaming;
+        Some(self.value)
+    }
 }
 
 fn set_volume(stream: &pw::stream::Stream, v: f32) {
@@ -705,6 +746,7 @@ fn fill(consumer: &mut rtrb::Consumer<f32>, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn fill_copies_whole_frames_then_silence() {
@@ -741,6 +783,24 @@ mod tests {
         assert_eq!(w, ms(5.0));
         // No cycle seen yet: a fixed short wait.
         assert_eq!(cycle_wait(0, now, 0, 48_000, 960), ms(5.0));
+    }
+
+    #[test]
+    fn volume_applied_once_per_change() {
+        let mut v = VolumeGate::new(0.125);
+        assert_eq!(v.state(&StreamState::Connecting), None);
+        // Connected but not linked yet: the link will reset it, so it goes again until the
+        // stream first runs.
+        assert_eq!(v.state(&StreamState::Paused), Some(0.125));
+        assert_eq!(v.change(0.5), 0.5);
+        assert_eq!(v.state(&StreamState::Paused), Some(0.5));
+        assert_eq!(v.state(&StreamState::Streaming), Some(0.5));
+        // From then on, pause and resume leave it alone: a mixer may have changed it.
+        assert_eq!(v.state(&StreamState::Paused), None);
+        assert_eq!(v.state(&StreamState::Streaming), None);
+        // A change of ours still goes, once.
+        assert_eq!(v.change(0.25), 0.25);
+        assert_eq!(v.state(&StreamState::Paused), None);
     }
 
     #[test]

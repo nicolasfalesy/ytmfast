@@ -11,13 +11,22 @@
 //! the next song's link is prefetched halfway through the current one, and radio songs are
 //! fetched when the queue is about to run out.
 //!
-//! Three counters keep late news out of the state:
+//! Gapless: 10 s before the current song's end (or at once, for a song with less left), the
+//! next item's link is resolved (already cached by the prefetch), its download started and
+//! handed to the audio thread (`AudioPlayer::preload`). The audio thread plays it right after
+//! the current one and says `Advanced` when its first frame is heard; the engine then makes
+//! it current without a load. Any queue change that changes the next item drops the preload
+//! (and preloads the new next one when it is time).
+//!
+//! Four counters keep late news out of the state:
 //! - every play gets a generation number, and a resolve that comes back for an older one is
 //!   dropped (its task is aborted too, but an answer already in the channel isn't);
 //! - every new queue gets a queue generation, and a queue page that comes back for an older
 //!   queue is dropped the same way;
 //! - every load handed to the audio thread is counted, and so is every `AudioEvent::Loading`
-//!   it sends back; until they match, its events are about an earlier track and are dropped.
+//!   it sends back; until they match, its events are about an earlier track and are dropped;
+//! - every preload's resolve gets a preload generation, and every preload handed to the audio
+//!   thread its id: an `Advanced` for any other id is about a preload the engine dropped.
 //!
 //! The state follows the commands (pause is paused at once), except that a song only turns
 //! `Playing` when the audio thread says it started: until then it is `Buffering`.
@@ -185,10 +194,67 @@ const LIKED_SONGS: &str = "LM";
 /// A song's radio is the playlist `RDAMVM` + its id, asked for together with the id.
 const RADIO_PREFIX: &str = "RDAMVM";
 
+/// The next song is preloaded this long before the current one ends (Global Constraints).
+const PRELOAD_LEAD_SECS: f64 = 10.0;
+
 /// A finished resolve, tagged with the play it was for.
 struct Resolved {
     generation: u64,
     result: Result<Stream, Error>,
+}
+
+/// A finished preload resolve, tagged with the preload it was for.
+struct Preresolved {
+    generation: u64,
+    result: Result<Stream, Error>,
+}
+
+/// A song's download and how to decode it: all the audio thread needs to play it.
+#[derive(Clone)]
+struct Source {
+    buffer: TrackBuffer,
+    video_id: String,
+    mime: String,
+    gain: f32,
+    length_hint: Option<f64>,
+    /// The details from its link.
+    meta: TrackMeta,
+}
+
+/// The next item, made ready before the current one ends.
+struct Preload {
+    /// The queue item it is for: it is dropped once that is no longer the next.
+    queue_id: u64,
+    state: PreloadState,
+}
+
+enum PreloadState {
+    Resolving {
+        generation: u64,
+        task: AbortHandle,
+    },
+    /// Handed to the audio thread under this id (`AudioEvent::Advanced`).
+    Ready {
+        ticket: u64,
+        source: Source,
+    },
+    /// Its link failed: not asked again for this item, whose own turn reports it.
+    Failed,
+}
+
+impl Preload {
+    #[cfg(test)]
+    fn resolving(&self) -> bool {
+        matches!(self.state, PreloadState::Resolving { .. })
+    }
+
+    #[cfg(test)]
+    fn ticket(&self) -> Option<u64> {
+        match self.state {
+            PreloadState::Ready { ticket, .. } => Some(ticket),
+            _ => None,
+        }
+    }
 }
 
 /// A finished queue request, tagged with the queue it was for (`Engine::queue_generation`).
@@ -253,6 +319,14 @@ pub struct Engine {
     resolved_meta: Option<TrackMeta>,
     /// The latest link prefetch, by queue id.
     prefetch: Option<(u64, AbortHandle)>,
+    /// The current song's download: repeat one (or the same song twice in a row) preloads a
+    /// second reader over its bytes instead of downloading it again.
+    current: Option<Source>,
+    preload: Option<Preload>,
+    /// Bumped by every preload resolve: an answer for an older one is dropped.
+    preload_generation: u64,
+    preloads_tx: mpsc::UnboundedSender<Preresolved>,
+    preloads_rx: mpsc::UnboundedReceiver<Preresolved>,
     /// Where the current song starts: the play's start, moved by a seek while resolving.
     start_seconds: f64,
     /// The current song was handed to the audio thread and has not ended or failed.
@@ -297,6 +371,7 @@ impl Engine {
         let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let (pages_tx, pages_rx) = mpsc::unbounded_channel();
+        let (preloads_tx, preloads_rx) = mpsc::unbounded_channel();
         let engine = Engine {
             resolver,
             source,
@@ -334,6 +409,11 @@ impl Engine {
             resume_from: None,
             resolved_meta: None,
             prefetch: None,
+            current: None,
+            preload: None,
+            preload_generation: 0,
+            preloads_tx,
+            preloads_rx,
             start_seconds: 0.0,
             loaded: false,
             started: false,
@@ -357,11 +437,13 @@ impl Engine {
                 },
                 Some(r) = self.resolved_rx.recv() => self.on_resolved(r),
                 Some(p) = self.pages_rx.recv() => self.on_page(p),
+                Some(p) = self.preloads_rx.recv() => self.on_preloaded(p),
                 Some(e) = audio.recv() => self.on_audio(e),
                 () = next_tick(&mut self.ticker) => self.on_tick(),
             }
         }
         let prefetch = self.prefetch.take().map(|(_, task)| task);
+        self.drop_preload();
         for task in [
             self.resolving.take(),
             self.loading.take(),
@@ -435,6 +517,9 @@ impl Engine {
             // Handled by `run`.
             EngineCmd::Quit => {}
         }
+        // Whatever changed the next item (a skip, a jump, a removal, a move, shuffle, repeat,
+        // a new play) changed what follows the current song.
+        self.check_preload();
     }
 
     fn play(
@@ -535,6 +620,7 @@ impl Engine {
     /// come.
     fn new_queue(&mut self) {
         self.queue_generation += 1;
+        self.drop_preload();
         let prefetch = self.prefetch.take().map(|(_, task)| task);
         for task in [self.loading.take(), self.refilling.take(), prefetch]
             .into_iter()
@@ -578,6 +664,7 @@ impl Engine {
             self.loading = None;
             self.on_load(p.result);
         }
+        self.check_preload();
     }
 
     /// A play's queue arrived (or failed).
@@ -778,6 +865,8 @@ impl Engine {
         if let Some(task) = self.resolving.take() {
             task.abort();
         }
+        self.drop_preload();
+        self.current = None;
         self.player.stop();
         self.loaded = false;
         self.started = false;
@@ -892,15 +981,31 @@ impl Engine {
         self.status.album = item.song.album.clone();
         // The queue item's details show at once; the link's only fill its gaps.
         self.status.meta = song_meta(&item.song, None);
-        self.start(item.song.video_id, start);
+        // Skipped (or jumped) to the preloaded item: its link and download are here already.
+        let ready = match self.preload.take() {
+            Some(Preload {
+                queue_id,
+                state: PreloadState::Ready { source, .. },
+            }) if queue_id == item.id => Some(source),
+            other => {
+                self.preload = other;
+                None
+            }
+        };
+        match ready {
+            Some(source) => self.start_from(source, start),
+            None => self.start(item.song.video_id, start),
+        }
     }
 
-    /// A new song: drop the old one at once and resolve the new one in the background.
-    fn start(&mut self, video_id: String, start: f64) {
+    /// Drops the old song at once, and shows the new one buffering.
+    fn begin(&mut self, video_id: &str, start: f64) {
         self.generation += 1;
         if let Some(task) = self.resolving.take() {
             task.abort();
         }
+        self.drop_preload();
+        self.current = None;
         // Cancels the old track's reader too, so an audio thread stuck opening it is freed.
         self.player.stop();
         self.loaded = false;
@@ -909,11 +1014,23 @@ impl Engine {
         self.ticker = None;
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
-        self.status.video_id = Some(video_id.clone());
+        self.status.video_id = Some(video_id.to_string());
         self.status.position = start;
         self.emit_state();
-        crate::trace::play(&video_id);
+        crate::trace::play(video_id);
+    }
 
+    /// A song whose download is already running (its preload): no resolve, no new download.
+    fn start_from(&mut self, source: Source, start: f64) {
+        self.begin(&source.video_id, start);
+        self.resolved_meta = Some(source.meta.clone());
+        self.refresh_meta();
+        self.load_source(source);
+    }
+
+    /// A new song: drop the old one at once and resolve the new one in the background.
+    fn start(&mut self, video_id: String, start: f64) {
+        self.begin(&video_id, start);
         let resolver = self.resolver.clone();
         let tx = self.resolved_tx.clone();
         let generation = self.generation;
@@ -944,16 +1061,23 @@ impl Engine {
         crate::trace::mark("link resolved");
         self.resolved_meta = Some(stream.meta.clone());
         self.refresh_meta();
+        let known = self.status.meta.as_ref().map_or(0, |m| m.length_seconds);
+        let source = self.source(stream, known);
+        self.load_source(source);
+    }
+
+    /// Starts `stream`'s download. `known` is the song's length from elsewhere (its queue
+    /// item), for a link that states none.
+    fn source(&self, stream: Stream, known: u32) -> Source {
         let gain = loudness_gain(stream.loudness_db);
         let mime = stream.mime.clone();
+        let video_id = stream.video_id.clone();
+        let meta = stream.meta.clone();
         // The link's own length first: it describes the file the audio thread decodes.
-        let length_hint = [
-            stream.meta.length_seconds,
-            self.status.meta.as_ref().map_or(0, |m| m.length_seconds),
-        ]
-        .into_iter()
-        .find(|s| *s > 0)
-        .map(f64::from);
+        let length_hint = [stream.meta.length_seconds, known]
+            .into_iter()
+            .find(|s| *s > 0)
+            .map(f64::from);
         // A link that stops working mid-song is replaced by a fresh one, never a cached one
         // (ruling R2).
         let relink: Relink = {
@@ -965,15 +1089,26 @@ impl Engine {
                 Box::pin(async move { resolver.resolve_fresh(&id).await.map(|s| s.url) })
             })
         };
-        // The reader keeps the download alive; the buffer itself isn't needed after this.
-        let buffer = (self.start_buffer)(stream, relink);
-        self.player.load(
-            buffer.reader(),
-            &mime,
+        Source {
+            buffer: (self.start_buffer)(stream, relink),
+            video_id,
+            mime,
             gain,
-            self.start_seconds,
             length_hint,
+            meta,
+        }
+    }
+
+    /// Hands the current song's download to the audio thread, and plays it unless paused.
+    fn load_source(&mut self, source: Source) {
+        self.player.load(
+            source.buffer.reader(),
+            &source.mime,
+            source.gain,
+            self.start_seconds,
+            source.length_hint,
         );
+        self.current = Some(source);
         self.loads_sent += 1;
         self.loaded = true;
         // Paused while it resolved: it loads paused at its start point.
@@ -1110,7 +1245,11 @@ impl Engine {
                     self.set_playing();
                     self.emit_state();
                 }
+                // A song started with under 10 s left preloads the next at once.
+                let at = self.player.position();
+                self.maybe_preload(at);
             }
+            AudioEvent::Advanced(ticket) => self.on_advanced(ticket),
             // The engine set these states when it sent the command.
             AudioEvent::Paused | AudioEvent::Resumed | AudioEvent::Loading => {}
             AudioEvent::Ended => {
@@ -1118,7 +1257,17 @@ impl Engine {
                 self.loaded = false;
                 self.started = false;
                 self.ticker = None;
-                // A normal load of the next item (ruling S2; gapless handover is Task 5).
+                // Nothing was handed over: no preload yet, it reached the audio thread after
+                // the end (a song shorter than the time its link took), or it couldn't be
+                // opened. The next item loads the usual way, from the preload's download if
+                // there is one (no second download), unless that download failed.
+                let failed = self.preload.as_ref().is_some_and(|p| match &p.state {
+                    PreloadState::Ready { source, .. } => source.buffer.failed(),
+                    _ => false,
+                });
+                if failed {
+                    self.drop_preload();
+                }
                 self.advance(true, true);
             }
             AudioEvent::Error(e) => {
@@ -1145,6 +1294,8 @@ impl Engine {
     /// The current song failed: report it, and stop, keeping the song and where it stopped
     /// in the status, so a play goes on from there.
     fn fail(&mut self, e: &Error) {
+        self.drop_preload();
+        self.current = None;
         self.loaded = false;
         self.started = false;
         self.ticker = None;
@@ -1175,6 +1326,180 @@ impl Engine {
             seeked: false,
         });
         self.maybe_prefetch(seconds);
+        self.maybe_preload(seconds);
+    }
+
+    /// The audio thread moved on to the preload with this id: its song is current now, as if
+    /// it had been loaded (but with no load, and no `Buffering`: it is already playing).
+    fn on_advanced(&mut self, ticket: u64) {
+        let next = self.queue.peek_next(true).map(|i| i.id);
+        let source = match self.preload.take() {
+            Some(Preload {
+                queue_id,
+                state: PreloadState::Ready { ticket: t, source },
+            }) if t == ticket && Some(queue_id) == next => source,
+            other => {
+                // A preload the engine had dropped (the queue changed just as the audio thread
+                // moved on to it): play the item that really is next instead.
+                self.preload = other;
+                self.status.position = self.player.position();
+                self.loaded = false;
+                self.started = false;
+                self.ticker = None;
+                return self.advance(true, true);
+            }
+        };
+        let Some(item) = self.queue.next(true).cloned() else {
+            return;
+        };
+        // What `start_current` and `on_resolved` would set, without the load.
+        self.generation += 1;
+        if let Some(task) = self.resolving.take() {
+            task.abort();
+        }
+        self.waiting = false;
+        self.at_end = false;
+        self.resume_from = None;
+        self.replayed = false;
+        self.skip_streak = 0;
+        self.start_seconds = 0.0;
+        self.status.video_id = Some(item.song.video_id.clone());
+        self.status.queue_id = Some(item.id);
+        self.status.album = item.song.album.clone();
+        self.resolved_meta = Some(source.meta.clone());
+        self.status.meta = song_meta(&item.song, self.resolved_meta.as_ref());
+        self.current = Some(source);
+        let at = self.player.position();
+        self.status.position = at;
+        if let Some(t) = self.ticker.as_mut() {
+            // Ticks a whole second into the new song, not on the old one's beat.
+            t.reset();
+        }
+        self.emit_queue();
+        self.emit_state();
+        self.maybe_refill();
+        // A short song: the one after it is due at once.
+        self.maybe_preload(at);
+    }
+
+    /// From 10 s before the current song's end (`PRELOAD_LEAD_SECS`), makes the next item
+    /// ready and hands it to the audio thread. Once per next item.
+    fn maybe_preload(&mut self, position: f64) {
+        if !(self.loaded && self.started) || self.preload.is_some() {
+            return;
+        }
+        let Some(len) = self
+            .status
+            .meta
+            .as_ref()
+            .map(|m| m.length_seconds)
+            .filter(|l| *l > 0)
+        else {
+            return;
+        };
+        if f64::from(len) - position > PRELOAD_LEAD_SECS {
+            return;
+        }
+        let Some(next) = self.queue.peek_next(true).cloned() else {
+            return;
+        };
+        // Repeat one, or the same song twice in a row: a second reader over the bytes that
+        // are already here, not a second download.
+        if let Some(current) = self
+            .current
+            .as_ref()
+            .filter(|c| c.video_id == next.song.video_id)
+        {
+            let source = current.clone();
+            return self.preload_source(next.id, source);
+        }
+        self.preload_generation += 1;
+        let generation = self.preload_generation;
+        let resolver = self.resolver.clone();
+        let tx = self.preloads_tx.clone();
+        let video_id = next.song.video_id.clone();
+        let task = tokio::spawn(async move {
+            // Usually from the link cache: the prefetch at half the song resolved it.
+            let result = resolver.resolve(&video_id).await;
+            let _ = tx.send(Preresolved { generation, result });
+        });
+        self.preload = Some(Preload {
+            queue_id: next.id,
+            state: PreloadState::Resolving {
+                generation,
+                task: task.abort_handle(),
+            },
+        });
+    }
+
+    /// The next item's link: start its download and hand it to the audio thread.
+    fn on_preloaded(&mut self, p: Preresolved) {
+        let queue_id = match &self.preload {
+            Some(Preload {
+                queue_id,
+                state: PreloadState::Resolving { generation, .. },
+            }) if *generation == p.generation => *queue_id,
+            _ => return,
+        };
+        match p.result {
+            Ok(stream) => {
+                let known = self
+                    .queue
+                    .items()
+                    .iter()
+                    .find(|i| i.id == queue_id)
+                    .map_or(0, |i| i.song.length_seconds);
+                let source = self.source(stream, known);
+                self.preload_source(queue_id, source);
+            }
+            Err(e) => {
+                // The code only (R6); the song's own turn tries again and reports it.
+                eprintln!("ytmfast: could not preload the next song ({})", e.code());
+                self.preload = Some(Preload {
+                    queue_id,
+                    state: PreloadState::Failed,
+                });
+            }
+        }
+    }
+
+    fn preload_source(&mut self, queue_id: u64, source: Source) {
+        let ticket = self.player.preload(
+            source.buffer.reader(),
+            &source.mime,
+            source.gain,
+            source.length_hint,
+        );
+        self.preload = Some(Preload {
+            queue_id,
+            state: PreloadState::Ready { ticket, source },
+        });
+    }
+
+    /// Drops the preload, wherever it got to.
+    fn drop_preload(&mut self) {
+        match self.preload.take().map(|p| p.state) {
+            Some(PreloadState::Resolving { task, .. }) => task.abort(),
+            Some(PreloadState::Ready { .. }) => self.player.cancel_preload(),
+            Some(PreloadState::Failed) | None => {}
+        }
+    }
+
+    /// Keeps the preload only while it is still for the next item, and preloads the next one
+    /// if it is time (a queue change near the end of a song).
+    fn check_preload(&mut self) {
+        let next = self.queue.peek_next(true).map(|i| i.id);
+        if self
+            .preload
+            .as_ref()
+            .is_some_and(|p| Some(p.queue_id) != next)
+        {
+            self.drop_preload();
+        }
+        if self.loaded && self.started {
+            let at = self.player.position();
+            self.maybe_preload(at);
+        }
     }
 
     /// Past half the song, fetches the next song's link, so it starts without waiting for
@@ -2408,7 +2733,9 @@ mod tests {
         let status = r.status().await;
         assert_eq!(status.queue_id, Some(id_of(&q, 'B')));
         assert_eq!(status.album.as_deref(), Some("Album"));
-        assert_eq!(r.started(), [vid('B')]);
+        // B plays first; C (the 2 s song's next) may be preloaded already.
+        assert_eq!(r.started()[0], vid('B'));
+        assert!(!r.started().contains(&vid('A')));
     }
 
     #[tokio::test]
@@ -2446,12 +2773,15 @@ mod tests {
         r.until_song(&vid('A'), PlayState::Playing).await;
         let seen = r.until_song(&vid('B'), PlayState::Playing).await;
         no_errors(&seen);
-        // It waited (buffering) rather than stopping, and nothing played twice.
+        // It waited (buffering) rather than stopping, and nothing played twice (C may be
+        // preloaded behind B already).
         assert!(
             !states(&seen).iter().any(|s| s.state == PlayState::Stopped),
             "{seen:?}"
         );
-        assert_eq!(r.started(), [vid('A'), vid('B')]);
+        let started = r.started();
+        assert_eq!(started[..2], [vid('A'), vid('B')]);
+        assert!(started[2..].iter().all(|id| *id == vid('C')) && started.len() <= 3);
         let radio: Vec<_> = r
             .source
             .requests()
@@ -2560,37 +2890,216 @@ mod tests {
         assert!(r.started().is_empty());
     }
 
+    /// An engine (not run) playing A, from a queue of `songs`, with A loaded and started.
+    async fn playing(songs: Vec<SongItem>) -> (Built, Arc<Fake>, Server) {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut built = engine_for(&server, fake.clone(), Arc::default(), true, false);
+        let engine = &mut built.engine;
+        engine.queue.replace(songs, 0);
+        engine.start_current(0.0);
+        engine.on_resolved(Resolved {
+            generation: engine.generation,
+            result: Ok(fake.stream(&vid('A'))),
+        });
+        engine.on_audio(AudioEvent::Loading);
+        engine.on_audio(AudioEvent::Started);
+        (built, fake, server)
+    }
+
+    /// Hands the engine its preload resolves as they finish (its `run` loop would).
+    async fn take_preloads(engine: &mut Engine) {
+        let t = std::time::Instant::now();
+        while engine.preload.as_ref().is_some_and(Preload::resolving) {
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "the preload resolve hung"
+            );
+            match tokio::time::timeout(Duration::from_millis(50), engine.preloads_rx.recv()).await {
+                Ok(Some(p)) => engine.on_preloaded(p),
+                _ => continue,
+            }
+        }
+    }
+
+    fn long(c: char) -> SongItem {
+        SongItem {
+            length_seconds: 100,
+            ..song(c)
+        }
+    }
+
     #[tokio::test]
     async fn next_link_prefetched_at_half() {
-        // The queue says each song is 1 s long (the fixture plays 2 s): half is 0.5 s, so the
-        // first tick (1 s) prefetches.
-        let short = |c| SongItem {
-            length_seconds: 1,
-            ..song(c)
-        };
+        let (built, fake, _server) = playing(vec![long('A'), long('B')]).await;
+        let mut engine = built.engine;
+        let has_b = |fake: &Fake| fake.calls.lock().unwrap().contains(&vid('B'));
+        engine.maybe_prefetch(49.0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!has_b(&fake), "nothing before half");
+        engine.maybe_prefetch(50.0);
+        let calls = fake.clone();
+        eventually("B's link is fetched", || has_b(&calls)).await;
+        // Only its link: B isn't downloaded at half.
+        assert_eq!(*built.started.lock().unwrap(), [vid('A')]);
+        assert_eq!(engine.status.video_id, Some(vid('A')));
+    }
+
+    #[tokio::test]
+    async fn preload_starts_10_s_before_the_end() {
+        let (built, _fake, _server) = playing(vec![long('A'), long('B')]).await;
+        let mut engine = built.engine;
+        engine.maybe_preload(89.0);
+        assert!(engine.preload.is_none(), "nothing 11 s before the end");
+        engine.maybe_preload(90.0);
+        take_preloads(&mut engine).await;
+        // B's download started and was handed to the audio thread; A is still current.
+        assert_eq!(*built.started.lock().unwrap(), [vid('A'), vid('B')]);
+        assert!(
+            engine
+                .preload
+                .as_ref()
+                .is_some_and(|p| p.ticket().is_some())
+        );
+        assert_eq!(engine.status.video_id, Some(vid('A')));
+        // Once per next item.
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        assert_eq!(*built.started.lock().unwrap(), [vid('A'), vid('B')]);
+    }
+
+    #[tokio::test]
+    async fn advanced_makes_the_next_current() {
+        let (built, _fake, _server) = playing(vec![long('A'), long('B')]).await;
+        let mut engine = built.engine;
+        let mut rx = built.events.subscribe();
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        let ticket = engine.preload.as_ref().and_then(Preload::ticket).unwrap();
+        let b = engine.queue.items()[1].id;
+        engine.on_audio(AudioEvent::Advanced(ticket));
+        // B is current and playing, with no load (and no Buffering) of its own.
+        assert_eq!(engine.status.video_id, Some(vid('B')));
+        assert_eq!(engine.status.queue_id, Some(b));
+        assert_eq!(engine.status.state, PlayState::Playing);
+        assert_eq!(engine.queue.current().map(|i| i.id), Some(b));
+        assert!(engine.loaded && engine.started);
+        assert!(engine.preload.is_none());
+        assert_eq!(*built.started.lock().unwrap(), [vid('A'), vid('B')]);
+        let mut saw_queue = false;
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                EngineEvent::State(s) => {
+                    assert_ne!(s.state, PlayState::Buffering, "{s:?}");
+                }
+                EngineEvent::Queue { current_id, .. } => saw_queue = current_id == Some(b),
+                _ => {}
+            }
+        }
+        assert!(saw_queue, "a queue event with B current");
+        assert_eq!(engine.status.meta.as_ref().unwrap().title, "Title B");
+    }
+
+    #[tokio::test]
+    async fn a_stale_advance_plays_the_real_next() {
+        // The preload was replaced (the queue changed) just as the audio thread moved on to
+        // it: the engine plays the queue's real next item instead.
+        let (built, _fake, _server) = playing(vec![long('A'), long('B'), long('C')]).await;
+        let mut engine = built.engine;
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        let stale = engine.preload.as_ref().and_then(Preload::ticket).unwrap();
+        let c = engine.queue.items()[2].id;
+        engine.handle(EngineCmd::QueueMove { id: c, index: 1 });
+        assert!(
+            engine
+                .preload
+                .as_ref()
+                .is_none_or(|p| p.queue_id != engine.queue.items()[2].id),
+            "B's preload is gone"
+        );
+        engine.on_audio(AudioEvent::Advanced(stale));
+        assert_eq!(engine.status.video_id, Some(vid('C')));
+        assert_eq!(engine.queue.current().map(|i| i.id), Some(c));
+    }
+
+    #[tokio::test]
+    async fn queue_changes_replace_the_preload() {
+        let (built, _fake, _server) = playing(vec![long('A'), long('B'), long('C')]).await;
+        let mut engine = built.engine;
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        let [_, b, c] = [0, 1, 2].map(|i| engine.queue.items()[i].id);
+        assert_eq!(engine.preload.as_ref().map(|p| p.queue_id), Some(b));
+        // Seek and pause keep it.
+        engine.handle(EngineCmd::Pause);
+        engine.handle(EngineCmd::Seek(50.0));
+        assert_eq!(engine.preload.as_ref().map(|p| p.queue_id), Some(b));
+        engine.handle(EngineCmd::Toggle);
+        // Repeat one: the next is A itself.
+        engine.handle(EngineCmd::Repeat(Repeat::One));
+        assert!(engine.preload.is_none(), "dropped when the next changed");
+        engine.handle(EngineCmd::Repeat(Repeat::Off));
+        // Removing the next item.
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        assert_eq!(engine.preload.as_ref().map(|p| p.queue_id), Some(b));
+        engine.handle(EngineCmd::QueueRemove(b));
+        assert!(engine.preload.as_ref().is_none_or(|p| p.queue_id == c));
+        // A new play drops it too.
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        assert_eq!(engine.preload.as_ref().map(|p| p.queue_id), Some(c));
+        engine.handle(EngineCmd::Play {
+            video_id: Some(vid('D')),
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        });
+        assert!(engine.preload.is_none());
+    }
+
+    #[tokio::test]
+    async fn skip_uses_the_preloaded_track() {
+        let (built, fake, _server) = playing(vec![long('A'), long('B')]).await;
+        let mut engine = built.engine;
+        engine.maybe_preload(95.0);
+        take_preloads(&mut engine).await;
+        let calls = fake.calls.lock().unwrap().len();
+        engine.handle(EngineCmd::Next);
+        // B loads at once from its preloaded download: no new resolve, no second download.
+        assert_eq!(engine.status.video_id, Some(vid('B')));
+        assert!(engine.loaded);
+        assert_eq!(fake.calls.lock().unwrap().len(), calls);
+        assert_eq!(*built.started.lock().unwrap(), [vid('A'), vid('B')]);
+    }
+
+    #[tokio::test]
+    async fn ended_hands_over_to_the_preloaded_next() {
+        // The whole path, in real time: B follows A with no load of its own.
         let mut r = rig(Setup {
-            pages: vec![(
-                "PLlist".into(),
-                0,
-                Ok(NextPage {
-                    items: vec![short('A'), short('B')],
-                    ..NextPage::default()
-                }),
-            )],
+            pages: vec![ok("PLlist", 0, "AB", None)],
             ..Setup::default()
         })
         .await;
         r.play_list("PLlist", None).await;
         r.until_song(&vid('A'), PlayState::Playing).await;
-        assert_eq!(r.calls(), [vid('A')], "nothing before half");
-        let calls = r.resolver.clone();
-        eventually("B's link is fetched", || {
-            calls.calls.lock().unwrap().contains(&vid('B'))
-        })
-        .await;
-        // Only its link: B isn't loaded while A plays.
-        assert_eq!(r.started(), [vid('A')]);
-        assert_eq!(r.status().await.video_id, Some(vid('A')));
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        no_errors(&seen);
+        assert!(
+            !states(&seen)
+                .iter()
+                .any(|s| s.video_id == Some(vid('B')) && s.state != PlayState::Playing),
+            "B went straight to playing: {seen:?}"
+        );
+        assert_eq!(r.started(), [vid('A'), vid('B')]);
+        let seen = r.until(PlayState::Stopped).await;
+        no_errors(&seen);
     }
 
     #[tokio::test]
