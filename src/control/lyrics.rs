@@ -31,6 +31,10 @@ use crate::streams::is_video_id;
 /// going back and forth through a stretch of the queue. Each is a few KB.
 pub const KEPT: usize = 20;
 
+/// The most lyrics text kept (and sent): 256 KiB. Real lyrics are a few KB, and a song's whole
+/// answer must fit one socket line (`protocol::MAX_LINE`, 1 MiB) with room for JSON escapes.
+pub const MAX_TEXT: usize = 256 * 1024;
+
 /// How long a "this song has no lyrics" stands, here and in the engine's tab cache, before the
 /// song is asked about again.
 pub const NONE_FOR: Duration = Duration::from_secs(60 * 60);
@@ -123,7 +127,7 @@ impl LyricsCache {
         // A "none" because the engine knew of no tab dates from when it learned that, so it
         // isn't kept here for longer than there.
         let (answer, at) = match page {
-            Some(p) => (browser.lyrics_page(&p).await?, Instant::now()),
+            Some(p) => (browser.lyrics_page(&p).await?.map(capped), Instant::now()),
             None => (None, at),
         };
         self.keep(video_id, answer.clone(), at);
@@ -155,4 +159,18 @@ impl LyricsCache {
             kept.pop_front();
         }
     }
+}
+
+/// The lyrics with their text cut to `MAX_TEXT`, at the last character boundary at or before it.
+/// Cut here, before the cache: an answer too long for a socket line would otherwise be kept
+/// (20 of them) only for `control::answer` to refuse it every time it is asked for.
+fn capped(mut lyrics: Lyrics) -> Lyrics {
+    if lyrics.text.len() > MAX_TEXT {
+        let mut end = MAX_TEXT;
+        while !lyrics.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        lyrics.text.truncate(end);
+    }
+    lyrics
 }

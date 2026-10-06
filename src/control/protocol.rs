@@ -472,6 +472,12 @@ fn parse_endpoint(v: &Value) -> Result<Endpoint, &'static str> {
     if !v.is_object() {
         return Err(ENDPOINT_RULE);
     }
+    // One endpoint, one key. `Endpoint::from_endpoint` would take the `watchEndpoint` and drop
+    // the other, so "this song" and "this list from the top" sent together would quietly be
+    // read as the one the client may not have meant. A `null` one is absent, as below.
+    if !v["watchEndpoint"].is_null() && !v["watchPlaylistEndpoint"].is_null() {
+        return Err(ENDPOINT_RULE);
+    }
     let endpoint = Endpoint::from_endpoint(v).ok_or(ENDPOINT_RULE)?;
     let given = |raw: &Value, key: &str| {
         raw.get(key)

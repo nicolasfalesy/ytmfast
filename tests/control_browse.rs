@@ -21,7 +21,7 @@ use ytmfast::browse::{
     self, Browser, Endpoint, Kind, Lyrics, MorePage, Page, PageHeader, Row, SearchPage, Section,
     WatchEndpoint, WatchPlaylistEndpoint,
 };
-use ytmfast::control::lyrics::{LyricsCache, LyricsTabs};
+use ytmfast::control::lyrics::{self, LyricsCache, LyricsTabs};
 use ytmfast::control::{self, Exit, Options};
 use ytmfast::engine::{
     Engine, EngineCmd, EngineEvent, KnownTab, PlayState, QueueSource, QueueView, Status,
@@ -431,6 +431,9 @@ async fn play_endpoint_is_sanitised() {
         json!({}),
         json!("watchEndpoint"),
         json!([{"watchEndpoint": {"videoId": SONG}}]),
+        // Both kinds at once: which one the user meant is not clear, so neither is guessed.
+        json!({"watchEndpoint": {"videoId": SONG},
+               "watchPlaylistEndpoint": {"playlistId": "PLfake"}}),
     ]
     .into_iter()
     .enumerate()
@@ -1402,4 +1405,55 @@ async fn none_expires_after_an_hour() {
     tokio::time::sleep(5 * 60 * MIN).await;
     assert_eq!(cache.get(&browser, SONG).await, Ok(Some(words())));
     assert_eq!(calls.lock().unwrap().len(), 4, "found lyrics don't expire");
+}
+
+/// Lyrics over `lyrics::MAX_TEXT` are cut to it, on a character boundary, before they are kept:
+/// the cache holds 20 answers, and an answer is sent as one line, so neither can grow with what
+/// YouTube sends. The source line is kept, and the cut text is what a second ask gets.
+#[tokio::test]
+async fn long_lyrics_are_cut_before_they_are_kept() {
+    // A 2-byte character straddles the cap: it goes whole, never split.
+    let text = format!(
+        "{}é{}",
+        "a".repeat(lyrics::MAX_TEXT - 1),
+        "b".repeat(100_000)
+    );
+    let calls = Calls::default();
+    let browser = FakeBrowser {
+        calls: calls.clone(),
+        lyrics: HashMap::from([(
+            LYRICS_PAGE.to_string(),
+            Lyrics {
+                text,
+                source: "Source: Musixmatch".into(),
+            },
+        )]),
+        ..with_lyrics()
+    };
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let got = cache.get(&browser, SONG).await.unwrap().unwrap();
+    assert_eq!(got.text.len(), lyrics::MAX_TEXT - 1);
+    assert!(got.text.bytes().all(|b| b == b'a'));
+    assert_eq!(got.source, "Source: Musixmatch");
+    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(got)));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "the second ask was the cut, kept answer"
+    );
+
+    // Text right at the cap is kept whole.
+    let browser = FakeBrowser {
+        lyrics: HashMap::from([(
+            LYRICS_PAGE.to_string(),
+            Lyrics {
+                text: "a".repeat(lyrics::MAX_TEXT),
+                source: String::new(),
+            },
+        )]),
+        ..with_lyrics()
+    };
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let got = cache.get(&browser, SONG).await.unwrap().unwrap();
+    assert_eq!(got.text.len(), lyrics::MAX_TEXT);
 }

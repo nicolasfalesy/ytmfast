@@ -146,9 +146,9 @@ pub enum EngineCmd {
     Shuffle(bool),
     Repeat(Repeat),
     /// The play epoch now: how many commands that pick what plays (`Play`, `QueueJump`,
-    /// `Next`, `Previous`, from any client or MPRIS) the engine has taken. A `Play` with no id
-    /// and a `Toggle` count only from Stopped, where they start something; otherwise they
-    /// resume or pause. Asked through the command channel, so the answer counts every such
+    /// `Next`, `Previous`, a `Seek` at or past the end, a `QueueRemove` of the current song,
+    /// from any client or MPRIS) the engine has taken. A `Play` with no id and a `Toggle` count
+    /// only from Stopped, where they start something; otherwise they resume or pause. Asked through the command channel, so the answer counts every such
     /// command sent before it (rulings P7, P9).
     PlayEpoch(oneshot::Sender<u64>),
     /// A play decided on at `epoch` and sent later (`playPage`, whose page had to load
@@ -921,6 +921,10 @@ impl Engine {
             } => video_id.is_some() || playlist_id.is_some() || stopped,
             EngineCmd::Toggle => stopped,
             EngineCmd::QueueJump(_) | EngineCmd::Next | EngineCmd::Previous => true,
+            // These two change what plays as `Next` does: a seek at or past the end plays the
+            // next song, and removing the current song plays the one taking its place (or stops).
+            EngineCmd::Seek(seconds) => self.seek_ends_song(*seconds),
+            EngineCmd::QueueRemove(id) => self.queue.current().is_some_and(|i| i.id == *id),
             _ => false,
         };
         if picks {
@@ -1857,18 +1861,31 @@ impl Engine {
         self.emit_state();
     }
 
+    /// A seek to `seconds` ends the song: at or past its end (a known length), with a song
+    /// loaded. `seek` then plays the next one, as `Next` would; the play epoch counts it so.
+    fn seek_ends_song(&self, seconds: f64) -> bool {
+        seconds.is_finite()
+            && self.status.state != PlayState::Stopped
+            && self
+                .status
+                .meta
+                .as_ref()
+                .map(|m| m.length_seconds)
+                .is_some_and(|len| len > 0 && seconds.max(0.0) >= f64::from(len))
+    }
+
     fn seek(&mut self, seconds: f64) {
         if !seconds.is_finite() || self.status.state == PlayState::Stopped {
             return;
+        }
+        // At or past the end: the song is over, as if it had played out.
+        if self.seek_ends_song(seconds) {
+            return self.advance(false, false);
         }
         let mut at = seconds.max(0.0);
         if let Some(len) = self.status.meta.as_ref().map(|m| m.length_seconds)
             && len > 0
         {
-            // At or past the end: the song is over, as if it had played out.
-            if at >= f64::from(len) {
-                return self.advance(false, false);
-            }
             // The decoder lands at most 1 s before the end (so a seek never lands on
             // silence); the reported position must match where the audio really goes.
             at = at.min((f64::from(len) - 1.0).max(0.0));
@@ -4297,6 +4314,51 @@ mod tests {
         r.until(PlayState::Stopped).await;
         r.send(resume()).await;
         assert_eq!(epoch(&r).await, playing + 1);
+    }
+
+    /// A seek at or past the end acts like `Next`, and removing the current song plays the next
+    /// one: both change what plays, so both count for the play epoch, and a `playPage` still
+    /// loading no longer overrides them. A seek within the song, removing another song, or a
+    /// seek past the end with nothing loaded (it does nothing) don't count.
+    #[tokio::test]
+    async fn a_seek_past_the_end_and_removing_the_current_song_count_as_picks() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABCD", None)],
+            ..Setup::default()
+        })
+        .await;
+        let epoch = |r: &Rig| {
+            let (tx, rx) = oneshot::channel();
+            let cmds = r.cmds.clone();
+            async move {
+                cmds.send(EngineCmd::PlayEpoch(tx)).await.unwrap();
+                rx.await.unwrap()
+            }
+        };
+        // Stopped, nothing loaded: a seek does nothing, so it picks nothing.
+        let start = epoch(&r).await;
+        r.send(EngineCmd::Seek(500.0)).await;
+        assert_eq!(epoch(&r).await, start);
+
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let playing = epoch(&r).await;
+        // Within the 2 s song: no.
+        r.send(EngineCmd::Seek(0.5)).await;
+        assert_eq!(epoch(&r).await, playing);
+        // At its end: it plays B, so it counts.
+        r.send(EngineCmd::Seek(2.0)).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        assert_eq!(epoch(&r).await, playing + 1);
+
+        // Removing a song that isn't playing: no.
+        let q = r.queue().await;
+        r.send(EngineCmd::QueueRemove(id_of(&q, 'D'))).await;
+        assert_eq!(epoch(&r).await, playing + 1);
+        // Removing the one playing: C takes its place, so it counts.
+        r.send(EngineCmd::QueueRemove(id_of(&q, 'B'))).await;
+        r.until_song(&vid('C'), PlayState::Playing).await;
+        assert_eq!(epoch(&r).await, playing + 2);
     }
 
     /// An artist's shuffle button: the list with its params, which reach `next`.

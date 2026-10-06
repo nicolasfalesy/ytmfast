@@ -258,8 +258,9 @@ Other fields in the endpoint are ignored. In an endpoint, `videoId` is as above,
 `playlistId` is 2 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-` (the rule rows are
 made with, not the plain `play`'s 1 to 256), `index` is a whole number from 0 to 4294967295,
 and `params` is as in browsing. A malformed one is `bad_request`, as is an endpoint that
-plays nothing. The reply is `{}`; what comes of the play arrives as events, as with any
-`play`.
+plays nothing, and one holding both a `watchEndpoint` and a `watchPlaylistEndpoint` (rows
+carry one or the other, so which was meant is not guessed). The reply is `{}`; what comes
+of the play arrives as events, as with any `play`.
 
 ### playPage
 
@@ -269,12 +270,15 @@ section). For a tile that has no play of its own, such as an artist. The reply i
 the play went to the engine. A page with nothing to play is `bad_request` with the message
 `Nothing here can be played.`
 
-A newer choice wins: when a command that picks what plays (`play`, `playPage`'s own play,
-`queue.jump`, `next`, `previous`, from any client or MPRIS) reaches the engine after this
+A newer choice wins: when a command that picks what plays reaches the engine after this
 `playPage` and before its page has loaded, the page's play is dropped, and the reply is
-`{"id": ..., "ok": true, "data": {"superseded": true}}`. A `play` with no id and a `toggle`
-(and MPRIS Play and PlayPause) count only when the state is `stopped`: then they start
-something. Otherwise they only resume or pause the song, and the page still plays.
+`{"id": ..., "ok": true, "data": {"superseded": true}}`. The commands that pick what plays,
+from any client or MPRIS, are `play`, `playPage`'s own play, `queue.jump`, `next`,
+`previous`, a `seek` at or past the song's end (it plays the next song), and a
+`queue.remove` of the song playing (the next one takes its place). A `play` with no id
+and a `toggle` (and MPRIS Play and PlayPause) count only when the state is `stopped`: then
+they start something. Otherwise they only resume or pause the song, and the page still
+plays.
 
 ### lyrics
 
@@ -286,7 +290,8 @@ no timings.
                                  "source": "Source: Musixmatch"}}
 ```
 
-- `text` is as YouTube gives it, newlines kept. It can run to a few KB.
+- `text` is as YouTube gives it, newlines kept. It can run to a few KB; past 256 KiB it is
+  cut there, at a character's end (no real lyrics come close).
 - `source` is the line YouTube shows under them (`"Source: ..."`), or `""`.
 - A song with no lyrics is `{"id": 8, "ok": true, "data": {"none": true}}`.
 

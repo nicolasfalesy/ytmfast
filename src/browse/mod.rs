@@ -502,12 +502,15 @@ pub fn id_ok(s: &str) -> bool {
     (2..=128).contains(&s.len()) && s.bytes().all(id_char)
 }
 
+/// The longest `params` value or continuation token taken (`token_ok`).
+pub const MAX_TOKEN: usize = 4096;
+
 /// A `params` value or a continuation token: base64, either alphabet (YouTube's tokens and params can
 /// hold `+` and `/` as well as `-` and `_`; blanking those would silently stop paging and filters,
 /// ruling P3), with `=` padding or its `%3D` escape, at most 4 KiB. These go back to YouTube as JSON
 /// strings; the charset keeps anything else (spaces, quotes, colons, markup, a smuggled URL) out.
 pub fn token_ok(s: &str) -> bool {
-    (1..=4096).contains(&s.len())
+    (1..=MAX_TOKEN).contains(&s.len())
         && s.bytes()
             .all(|c| id_char(c) || matches!(c, b'%' | b'=' | b'+' | b'/'))
 }

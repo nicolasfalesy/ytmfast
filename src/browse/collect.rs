@@ -6,7 +6,10 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::row::{ITEM_KEYS, button_play, item, thumb_of};
-use super::{MoreLink, PageHeader, SEP, Section, clean_id, clean_token, get, text, truthy};
+use super::{
+    MAX_TOKEN, MoreLink, PageHeader, SEP, Section, clean_id, clean_token, get, text, token_ok,
+    truthy,
+};
 
 /// The renderers that hold a list of rows.
 const SHELF_KEYS: [&str; 5] = [
@@ -57,36 +60,54 @@ fn shelf_title(s: &Value) -> String {
 /// `reloadContinuationData` is not a next page (sort menus, filter chips, the offline tab), so it is
 /// never followed.
 pub(crate) fn next_of(s: Option<&Value>) -> String {
-    let Some(s) = s.filter(|s| truthy(s)) else {
-        return String::new();
-    };
+    let token = next_token(s);
+    if let Some(code) = token.and_then(Value::as_str).and_then(refused_token) {
+        // Refused, the list still ends here (`""`), which looks just like its real end: one
+        // line says it didn't, by code only (a token is never logged, ruling R6).
+        eprintln!("ytmfast: a next-page token was refused ({code}); the list stops there");
+    }
+    clean_token(token)
+}
+
+/// Why a next-page token from YouTube fails the shape check (`token_ok`): `"too_long"` past
+/// 4,096 characters, `"bad_shape"` for characters outside base64. `None` for one that passes,
+/// and for `""`, which is how a list says it has ended.
+fn refused_token(token: &str) -> Option<&'static str> {
+    if token.is_empty() || token_ok(token) {
+        None
+    } else if token.len() > MAX_TOKEN {
+        Some("too_long")
+    } else {
+        Some("bad_shape")
+    }
+}
+
+/// The raw token `next_of` cleans, from whichever of the two shapes the list uses.
+fn next_token(s: Option<&Value>) -> Option<&Value> {
+    let s = s.filter(|s| truthy(s))?;
     if let Some(t) = s
         .pointer("/continuations/0/nextContinuationData/continuation")
         .filter(|t| truthy(t))
     {
-        return clean_token(Some(t));
+        return Some(t);
     }
     let list = get(s, "contents")
         .or_else(|| get(s, "items"))
         .or_else(|| get(s, "continuationItems"));
-    let Some(ep) = list
+    let ep = list
         .and_then(Value::as_array)
         .and_then(|l| l.last())
         .and_then(|last| last.get("continuationItemRenderer"))
-        .and_then(|c| get(c, "continuationEndpoint"))
-    else {
-        return String::new();
-    };
+        .and_then(|c| get(c, "continuationEndpoint"))?;
     if let Some(cc) = get(ep, "continuationCommand") {
-        return clean_token(cc.get("token"));
+        return cc.get("token");
     }
     let cmds = ep.pointer("/commandExecutorCommand/commands");
     cmds.and_then(Value::as_array)
         .into_iter()
         .flatten()
         .find_map(|c| get(c, "continuationCommand"))
-        .map(|cc| clean_token(cc.get("token")))
-        .unwrap_or_default()
+        .and_then(|cc| cc.get("token"))
 }
 
 /// A shelf's own "Show all" or "More" button (artist pages: Top songs, Albums, Singles, Videos; Home's
@@ -288,5 +309,44 @@ pub(crate) fn header_of(res: &Value) -> PageHeader {
         subtitle,
         thumb: thumb_of(h),
         play: button_play(buttons),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The three places a next-page token sits, each holding `token`.
+    fn shapes(token: &str) -> [Value; 3] {
+        [
+            json!({"continuations": [{"nextContinuationData": {"continuation": token}}]}),
+            json!({"contents": [{"continuationItemRenderer": {"continuationEndpoint": {
+                "continuationCommand": {"token": token}}}}]}),
+            json!({"contents": [{"continuationItemRenderer": {"continuationEndpoint": {
+                "commandExecutorCommand": {"commands": [{"continuationCommand": {"token": token}}]}}}}]}),
+        ]
+    }
+
+    /// A token the shape check refuses still ends the list (`""`), as before, but no longer
+    /// silently: it is named by a code (never its text, ruling R6) for the log line, so a list
+    /// that stops early can be told from one that ended.
+    #[test]
+    fn a_refused_next_page_token_ends_the_list_with_a_code() {
+        let ok = "4qmFsgK-ABC_def+/%3D";
+        let long = "A".repeat(4097);
+        for shape in shapes(ok) {
+            assert_eq!(next_of(Some(&shape)), ok, "{shape}");
+        }
+        for shape in shapes(&long).iter().chain(&shapes("bad token")) {
+            assert_eq!(next_of(Some(shape)), "", "still the end of the list");
+        }
+        assert_eq!(refused_token(&"A".repeat(4096)), None);
+        assert_eq!(refused_token(&long), Some("too_long"));
+        assert_eq!(refused_token("bad token"), Some("bad_shape"));
+        assert_eq!(refused_token("x\"y"), Some("bad_shape"));
+        // An empty token is how a list says it has ended: nothing was refused.
+        assert_eq!(refused_token(""), None);
+        assert_eq!(refused_token(ok), None);
     }
 }
