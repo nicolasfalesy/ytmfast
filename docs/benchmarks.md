@@ -96,9 +96,10 @@ asked again, from the cache.
 
 The same live YouTube answers were read by ytmfast and by the bar widget's own parser (`Page.js`), and the two
 results compared field by field. After one fix (YouTube Music's own tile art on `www.gstatic.com`, such as the Liked
-songs tile, had come out blank), there were 0 differences on: Home and its next 2 pages, Liked albums, Library
-artists, a search (mixed results, the Songs filter and its next page), an album, an artist and its "Show all" page,
-a 140-song playlist and its next page, a podcast page, and lyrics.
+songs tile, had come out blank), all 18 pages of the re-run had 0 differences: Home and its next 2 pages, the Library
+landing page, Liked playlists, Liked albums, Library artists, Liked songs, a search (mixed results, the Songs filter
+and its next page), an album, an artist and its "Show all" page, a playlist search, a 140-song playlist and its next
+page, and a podcast page. Lyrics matched too (checked before the fix, which did not touch them).
 
 ## Power (CPU package energy), 2026-10-05, on AC power
 

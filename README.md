@@ -5,10 +5,12 @@ takes commands over a local socket, with no browser running.
 
 ## Status
 
-Step 2 is done. The engine plays YouTube Music Premium quality (Opus, about 256 kbps) with pause, seek, volume and
-status over the socket and over MPRIS, and now has a full queue: albums, playlists and Liked songs, a song's radio,
-radio when the queue runs out, shuffle and repeat, gapless playback between songs, resume after a restart, and play
-history on the account. MPRIS has next, previous, shuffle and loop too.
+Step 3 is done. The engine plays YouTube Music Premium quality (Opus, about 256 kbps) with pause, seek, volume and
+status over the socket and over MPRIS, and has a full queue: albums, playlists and Liked songs, a song's radio, radio
+when the queue runs out, shuffle and repeat, gapless playback between songs, resume after a restart, and play history
+on the account. MPRIS has next, previous, shuffle and loop too. Step 3 added browsing over the socket, in the shapes
+the bar widget already reads: browse (Home, the Library, playlists, albums, artists and podcasts, page by page),
+search (mixed results and the Songs, Albums and other filters), like and dislike, mute, and a song's lyrics.
 
 It is built to replace the Electron app behind a bar widget (the widget switches over in step 4), at a fraction of
 the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
@@ -22,15 +24,14 @@ the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
 | Extra CPU power while playing | 0.71 W | 0.10 W (measured on step 1) |
 
 The power figure is step 1's (when the engine used 31.5 MB and 0.51% CPU); it was not measured again for step 2.
+Step 3 did not change how songs play, so these are step 2's figures; its own (page load times, and memory while
+browsing) are in the benchmarks file.
 
-Coming next:
-
-1. **Step 3, browsing:** search, Library, like and dislike, lyrics.
-2. **Step 4, widget:** the Omarchy bar widget switches to the engine.
+Coming next: **step 4, the widget.** The Omarchy bar widget switches to the engine.
 
 ## Resume and history
 
-The queue, the current song and the second it was at, volume, shuffle and repeat are kept in
+The queue, the current song and the second it was at, volume, mute, shuffle and repeat are kept in
 `$XDG_STATE_HOME/ytmfast/state.json` (else `~/.local/state/ytmfast/state.json`; mode 0600), so a restart comes back
 to the same place, paused. That file is a list of the songs the user queued and played, so it is listening history
 on disk: it holds song details and public thumbnail links, never a cookie, a session value or a stream link.
