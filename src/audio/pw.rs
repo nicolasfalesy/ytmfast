@@ -433,6 +433,13 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     // The connection's own errors. libpipewire also moves the stream to Unconnected when the
     // daemon goes away, but this does not depend on that: any fatal error on the core marks
     // the output gone, so the next `open` connects again.
+    //
+    // Drop order matters here. The listener's hook sits in a list inside the pw_core, and
+    // dropping the listener unlinks it by writing into that list. So the core must outlive the
+    // listener: `core` is declared before `_core` (locals drop in reverse order) and the stream
+    // gets a clone, never the last reference. Moving `core` into the stream let the stream's
+    // drop free the pw_core first, and then `_core`'s drop wrote into freed memory on every
+    // close (AddressSanitizer: heap-use-after-free in libspa's list remove).
     let core_shared = setup.shared.clone();
     let _core = core
         .add_listener_local()
@@ -443,7 +450,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
         })
         .register();
     let stream = StreamRc::new(
-        core,
+        core.clone(),
         APP_NAME,
         properties! {
             *pw::keys::APP_NAME => APP_NAME,
