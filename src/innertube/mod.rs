@@ -5,8 +5,10 @@
 //! stays valid on its own. Answers are capped at `net::MAX_ANSWER` while they are read.
 
 pub mod clients;
+mod next;
 mod player;
 
+pub use next::{NextPage, NextRequest, SongItem, clean_artist};
 pub use player::{AudioFormat, PlayerResponse, Tracking};
 
 use std::sync::{Arc, Mutex};
@@ -20,43 +22,71 @@ use crate::error::Error;
 use crate::net;
 use clients::ClientInfo;
 
-/// Where the `player` request goes in production. Tests pass a local base to `Innertube::new`
-/// instead; that constructor argument is the only way past the https allowlist (ruling R7).
-pub const API_BASE: &str = "https://www.youtube.com";
-
 /// The domains whose `Set-Cookie` answers may change the session (ruling R10). Stream hosts
 /// (`googlevideo.com`) and image hosts are on the request allowlist but never set the
 /// session's cookies, so anything they send is ignored.
 const COOKIE_DOMAINS: &[&str] = &["youtube.com", "google.com"];
 
+/// Where requests go.
+enum Target {
+    /// Production: each client to `https://{api_host}` from its own `ClientInfo`, so `player`
+    /// (TV) goes to www.youtube.com and `next` (WEB_REMIX) to music.youtube.com.
+    ApiHost,
+    /// Tests: every client to one injected base, the only way past the https allowlist
+    /// (ruling R7).
+    Fixed(Url),
+}
+
 pub struct Innertube {
     http: reqwest::Client,
     session: Arc<Mutex<Session>>,
     store: Arc<dyn SessionStore>,
-    base: Url,
+    target: Target,
     /// Held across "copy the session, save it" by each background save, so two answers that
     /// both rotate a cookie can't save out of order and leave the older copy in the store.
     save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Innertube {
-    /// `base` is `API_BASE` in production. It is not checked against the allowlist here, so
-    /// tests can point it at a local http server; production callers pass the constant.
+    /// The production client: every request goes to its client's `api_host` over https.
+    pub fn production(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>) -> Self {
+        Self::with_target(session, store, Target::ApiHost)
+    }
+
+    /// A client that sends every request, whatever its client, to `base`. For tests only: `base`
+    /// is not checked against the allowlist, so it can be a local http server (ruling R7).
+    /// Production code uses `production`.
     pub fn new(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>, base: Url) -> Self {
+        Self::with_target(session, store, Target::Fixed(base))
+    }
+
+    fn with_target(
+        session: Arc<Mutex<Session>>,
+        store: Arc<dyn SessionStore>,
+        target: Target,
+    ) -> Self {
         Innertube {
             // The per-request `User-Agent` header overrides this default, so one client
             // serves every entry in the client table.
             http: net::client(clients::TV.user_agent),
             session,
             store,
-            base,
+            target,
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// `{base}/youtubei/v1/{endpoint}?prettyPrint=false`.
-    fn endpoint_url(&self, endpoint: &str) -> Url {
-        let mut url = self.base.clone();
+    /// Where `client`'s `endpoint` request goes:
+    /// `https://{client.api_host}/youtubei/v1/{endpoint}?prettyPrint=false` in production,
+    /// the same path and query on the injected base in tests.
+    pub fn endpoint_url(&self, client: &ClientInfo, endpoint: &str) -> Url {
+        let mut url = match &self.target {
+            Target::Fixed(base) => base.clone(),
+            // `api_host` is a constant from the client table, and a unit test parses every
+            // entry, so this can only fail on a broken edit to that table.
+            Target::ApiHost => Url::parse(&format!("https://{}", client.api_host))
+                .expect("every client table api_host is a valid host"),
+        };
         url.set_path(&format!("/youtubei/v1/{endpoint}"));
         // prettyPrint=false: the answer comes without indentation, which is a good part of
         // its size.
@@ -72,7 +102,13 @@ impl Innertube {
         endpoint: &str,
         body: &serde_json::Value,
     ) -> Result<Vec<u8>, Error> {
-        let url = self.endpoint_url(endpoint);
+        let url = self.endpoint_url(client, endpoint);
+        // Ruling R7: production checks every URL it builds. The test base is the one bypass.
+        if matches!(self.target, Target::ApiHost) && !net::allowed_host(&url) {
+            return Err(Error::Internal(
+                "the API host is not an allowed host".into(),
+            ));
+        }
         let (cookie, auth) = {
             // A poisoned lock still holds a whole session (every write is one assignment
             // under the lock), so it is safe to use.
@@ -110,6 +146,14 @@ impl Innertube {
             HeaderName::from_static("x-youtube-client-version"),
             HeaderValue::from_static(client.version),
         );
+        if client.sends_auth_user {
+            // The account index among the browser's signed-in Google accounts; the session
+            // holds one account's cookies, so it is always the first.
+            headers.insert(
+                HeaderName::from_static("x-goog-authuser"),
+                HeaderValue::from_static("0"),
+            );
+        }
         headers.insert(header::AUTHORIZATION, secret_header(&auth)?);
         if !cookie.is_empty() {
             headers.insert(header::COOKIE, secret_header(&cookie)?);
@@ -146,7 +190,11 @@ impl Innertube {
     /// of them changed it.
     fn absorb_set_cookies(&self, resp: &reqwest::Response) {
         let from = resp.url();
-        if !cookie_source_allowed(from, &self.base) {
+        let base = match &self.target {
+            Target::Fixed(base) => Some(base),
+            Target::ApiHost => None,
+        };
+        if !cookie_source_allowed(from, base) {
             return;
         }
         let changed = {
@@ -196,9 +244,9 @@ fn secret_header(value: &str) -> Result<HeaderValue, Error> {
 }
 
 /// True when an answer from `url` may set session cookies: https from youtube.com or
-/// google.com or a subdomain (ruling R10), or the injected test base (ruling R7; in
-/// production `base` is `API_BASE`, which the first rule already covers).
-fn cookie_source_allowed(url: &Url, base: &Url) -> bool {
+/// google.com or a subdomain (ruling R10), or the injected test base (ruling R7; production
+/// has none).
+fn cookie_source_allowed(url: &Url, base: Option<&Url>) -> bool {
     let google = url.scheme() == "https"
         && match url.host() {
             Some(Host::Domain(host)) => COOKIE_DOMAINS.iter().any(|d| {
@@ -206,7 +254,7 @@ fn cookie_source_allowed(url: &Url, base: &Url) -> bool {
             }),
             _ => false,
         };
-    google || url.origin() == base.origin()
+    google || base.is_some_and(|b| url.origin() == b.origin())
 }
 
 fn now_unix() -> u64 {
@@ -227,8 +275,14 @@ mod tests {
     #[test]
     fn production_urls_pass_the_allowlist() {
         // Ruling R7: everything production code sends to must pass `allowed_host`.
-        assert!(net::allowed_host(&url(API_BASE)));
+        let store: Arc<dyn SessionStore> = Arc::new(crate::auth::MemoryStore::new());
+        let api = Innertube::production(Arc::default(), store);
         for c in clients::ALL {
+            assert!(
+                net::allowed_host(&api.endpoint_url(c, "next")),
+                "{}",
+                c.name
+            );
             assert!(net::allowed_host(&url(c.origin)), "{} origin", c.name);
             let api = url(&format!("https://{}/youtubei/v1/player", c.api_host));
             assert!(net::allowed_host(&api), "{} api host", c.name);
@@ -237,14 +291,14 @@ mod tests {
 
     #[test]
     fn set_cookie_only_from_youtube_or_google() {
-        let base = url(API_BASE);
+        let base = None;
         for ok in [
             "https://www.youtube.com/youtubei/v1/player",
             "https://music.youtube.com/",
             "https://youtube.com/",
             "https://accounts.google.com/",
         ] {
-            assert!(cookie_source_allowed(&url(ok), &base), "{ok}");
+            assert!(cookie_source_allowed(&url(ok), base), "{ok}");
         }
         for bad in [
             // On the request allowlist, but not a cookie source (ruling R10).
@@ -254,26 +308,28 @@ mod tests {
             "https://youtube.com.evil.example/",
             "http://www.youtube.com/",
         ] {
-            assert!(!cookie_source_allowed(&url(bad), &base), "{bad}");
+            assert!(!cookie_source_allowed(&url(bad), base), "{bad}");
         }
         // The injected test base is the one exception.
         let test_base = url("http://127.0.0.1:4000");
         assert!(cookie_source_allowed(
             &url("http://127.0.0.1:4000/youtubei/v1/player"),
-            &test_base
+            Some(&test_base)
         ));
         assert!(!cookie_source_allowed(
             &url("http://127.0.0.1:4001/"),
-            &test_base
+            Some(&test_base)
         ));
+        // Production has no test base: a local answer never sets a cookie.
+        assert!(!cookie_source_allowed(&url("http://127.0.0.1:4000/"), None));
     }
 
     #[test]
     fn endpoint_url_shape() {
         let store: Arc<dyn SessionStore> = Arc::new(crate::auth::MemoryStore::new());
-        let api = Innertube::new(Arc::default(), store, url(API_BASE));
+        let api = Innertube::production(Arc::default(), store);
         assert_eq!(
-            api.endpoint_url("player").as_str(),
+            api.endpoint_url(&clients::TV, "player").as_str(),
             "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
         );
     }

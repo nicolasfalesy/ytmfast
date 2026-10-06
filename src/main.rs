@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use url::Url;
 use ytmfast::audio::decode::loudness_gain;
 use ytmfast::audio::fetch::{Relink, TrackBuffer};
 use ytmfast::audio::player::{AudioEvent, AudioPlayer};
@@ -19,7 +18,7 @@ use ytmfast::auth::{KeyringStore, Session, SessionStore, chromium, sidhash};
 use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
-use ytmfast::innertube::{API_BASE, Innertube, clients};
+use ytmfast::innertube::{Innertube, clients};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
 use ytmfast::streams::lazy::{self, LazyResolver};
@@ -267,17 +266,12 @@ fn describe(e: Error) -> String {
 /// up. A message when a folder is missing.
 fn resolver() -> Result<Arc<dyn Resolver>, String> {
     let store: Arc<dyn SessionStore> = Arc::new(KeyringStore::new());
-    let base = Url::parse(API_BASE).map_err(|_| "bad API address".to_string())?;
     let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
     let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
     let api_store = store.clone();
     let build: lazy::Build = Box::new(move |session| {
         let session = Arc::new(Mutex::new(session));
-        let api = Arc::new(Innertube::new(
-            session.clone(),
-            api_store.clone(),
-            base.clone(),
-        ));
+        let api = Arc::new(Innertube::production(session.clone(), api_store.clone()));
         Arc::new(Streams::new(
             api,
             session,

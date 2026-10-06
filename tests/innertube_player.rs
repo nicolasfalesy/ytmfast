@@ -112,6 +112,8 @@ async fn player_request_shape() {
         "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
     );
     assert_eq!(header(req, "content-type"), "application/json");
+    // Step 1's TV request never sent it; the music client's does (innertube_next.rs).
+    assert!(req.headers.get("x-goog-authuser").is_none());
     let auth = header(req, "authorization");
     assert!(auth.starts_with("SAPISIDHASH "), "authorization scheme");
     // Only the cookies for the request's own host, in the stored order.

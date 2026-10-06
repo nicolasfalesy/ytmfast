@@ -9,10 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use url::Url;
 use ytmfast::auth::{KeyringStore, Session, SessionStore};
 use ytmfast::error::Error;
-use ytmfast::innertube::{API_BASE, Innertube, clients};
+use ytmfast::innertube::{Innertube, clients};
 use ytmfast::solver::{Answers, ChallengeKind, ChallengeSolver, Solver};
 use ytmfast::streams::ytdlp::{YtDlp, YtDlpCommand};
 use ytmfast::streams::{Resolver, Stream, Streams};
@@ -55,11 +54,7 @@ impl ChallengeSolver for NoSolver {
 async fn streams(solver: Arc<dyn ChallengeSolver>, ytdlp: Arc<dyn YtDlp>) -> Streams {
     let store = Arc::new(KeyringStore::new());
     let session = Arc::new(Mutex::new(store.load().await.expect("a stored session")));
-    let api = Arc::new(Innertube::new(
-        session.clone(),
-        store,
-        Url::parse(API_BASE).unwrap(),
-    ));
+    let api = Arc::new(Innertube::production(session.clone(), store));
     Streams::new(api, session, solver, ytdlp, paths::cache_dir().unwrap())
 }
 

@@ -162,7 +162,7 @@ struct RawMicroformatRenderer {
 /// YouTube's text object: `{"simpleText": …}` or `{"runs": [{"text": …}, …]}`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawText {
+pub(super) struct RawText {
     simple_text: Option<String>,
     #[serde(default)]
     runs: Vec<RawRun>,
@@ -174,7 +174,7 @@ struct RawRun {
 }
 
 impl RawText {
-    fn text(self) -> String {
+    pub(super) fn text(self) -> String {
         match self.simple_text {
             Some(t) => t,
             None => self.runs.into_iter().filter_map(|r| r.text).collect(),
@@ -200,7 +200,7 @@ struct RawDetails {
 }
 
 #[derive(Deserialize)]
-struct RawThumbnails {
+pub(super) struct RawThumbnails {
     #[serde(default)]
     thumbnails: Vec<RawThumbnail>,
 }
@@ -399,7 +399,7 @@ fn audio_format(f: RawFormat) -> Option<AudioFormat> {
 
 /// The widest thumbnail with an allowed URL. Some answers give protocol-relative links
 /// (`//i.ytimg.com/…`); those are made https.
-fn widest_thumbnail(t: RawThumbnails) -> Option<String> {
+pub(super) fn widest_thumbnail(t: RawThumbnails) -> Option<String> {
     t.thumbnails
         .into_iter()
         .filter_map(|t| {
