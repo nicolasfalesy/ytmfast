@@ -295,6 +295,24 @@ async fn parses_liked_byline_variants() {
     assert_eq!(upload.album, None);
 }
 
+/// Task 6: a queue asked for with a song carries that song's Lyrics tab (the lyrics page's
+/// browse id), as it carries its like status: lyrics for the song then need only that browse.
+#[tokio::test]
+async fn a_song_s_queue_carries_its_lyrics_tab() {
+    let radio = NextRequest {
+        video_id: Some("fakeV000001".into()),
+        playlist_id: Some("RDAMVMfakeV000001".into()),
+        ..NextRequest::default()
+    };
+    let page = next_from(RADIO, radio).await.unwrap();
+    assert_eq!(page.lyrics_tab.as_deref(), Some("MPLYt_fakeB0058"));
+    // A playlist names no song: its tabs are not used.
+    assert_eq!(
+        next_from(RADIO, playlist("LM")).await.unwrap().lyrics_tab,
+        None
+    );
+}
+
 #[tokio::test]
 async fn a_song_s_queue_carries_its_like_status() {
     // A queue asked for with a song: the answer's like button is that song's (ruling P1).

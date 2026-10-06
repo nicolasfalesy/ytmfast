@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::next::{context, request_body};
-use super::{Innertube, NextRequest, clients};
-use crate::browse::{self, LikeStatus, MorePage, Page, SearchPage, id_ok, token_ok};
+use super::{Innertube, NextRequest, SongNext, clients};
+use crate::browse::{self, LikeStatus, Lyrics, MorePage, Page, SearchPage, id_ok, token_ok};
 use crate::error::Error;
 use crate::streams::is_video_id;
 
@@ -116,11 +116,17 @@ impl Innertube {
             .inspect_err(|e| log_failure(endpoint, e))
     }
 
-    /// A song's like status: the song's `next` (the queue's own body for one song, as the app
-    /// asks it), read for its like button (`browse::parse_like_for`). `Ok(None)` when the
-    /// answer has no button for the song. For a song whose queue fetch didn't name it (ruling
-    /// P1). Errors as for `browse`.
+    /// A song's like status: the song's `next` (`song_next`), read for its like button. For a
+    /// song whose queue fetch didn't name it (ruling P1). Errors as for `browse`.
     pub async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+        Ok(self.song_next(video_id).await?.like)
+    }
+
+    /// A song's own `next` (the queue's body for one song, as the app asks it), read for what
+    /// it says about the song: its like status (`browse::parse_like_for`) and its Lyrics tab
+    /// (`browse::parse_lyrics_tab`). One answer serves the like lookup and lyrics alike.
+    /// Errors: `BadRequest` for a malformed video id (nothing is sent), else as for `browse`.
+    pub async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
         check_video_id(video_id)?;
         let body = request_body(
             &clients::WEB_REMIX,
@@ -130,32 +136,39 @@ impl Innertube {
             },
         );
         let next = self.post_value("next", &body).await?;
-        Ok(browse::parse_like_for(&next, video_id))
+        Ok(SongNext {
+            like: browse::parse_like_for(&next, video_id),
+            // `parse_lyrics_tab` shape-checks the id it returns.
+            lyrics_tab: browse::parse_lyrics_tab(&next),
+        })
+    }
+
+    /// The lyrics page a song's Lyrics tab names (`SongNext::lyrics_tab`): one browse.
+    /// `Ok(None)` when the page has no text. Errors: `BadRequest` for a malformed page id
+    /// (nothing is sent), else as for `browse`.
+    pub async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error> {
+        if !id_ok(page_id) {
+            return Err(Error::BadRequest("not a browse id".into()));
+        }
+        let mut fields = Map::new();
+        fields.insert("browseId".into(), json!(page_id));
+        let page = self.post_json("browse", fields).await?;
+        Ok(browse::parse_lyrics(&page).map(|(text, source)| Lyrics { text, source }))
     }
 
     /// A song's lyrics as YouTube Music shows them, `(text, source)`: two requests, the song's
     /// `next` (whose Lyrics tab names the lyrics page) and then a browse of that page.
     /// `Ok(None)` when the song has no Lyrics tab, or the page has no text. Errors as for
-    /// `browse`.
+    /// `browse`. The socket's `lyrics` makes the same two through `browse::Browser`, skipping
+    /// the first when the engine already knows the tab (`control::lyrics`).
     pub async fn lyrics(&self, video_id: &str) -> Result<Option<(String, String)>, Error> {
-        check_video_id(video_id)?;
-        // The queue's own body for one song, so this `next` looks like the app's.
-        let next_body = request_body(
-            &clients::WEB_REMIX,
-            &NextRequest {
-                video_id: Some(video_id.to_owned()),
-                ..NextRequest::default()
-            },
-        );
-        let next = self.post_value("next", &next_body).await?;
-        // `parse_lyrics_tab` shape-checks the id it returns.
-        let Some(page_id) = browse::parse_lyrics_tab(&next) else {
+        let Some(page_id) = self.song_next(video_id).await?.lyrics_tab else {
             return Ok(None);
         };
-        let mut fields = Map::new();
-        fields.insert("browseId".into(), json!(page_id));
-        let page = self.post_json("browse", fields).await?;
-        Ok(browse::parse_lyrics(&page))
+        Ok(self
+            .lyrics_page(&page_id)
+            .await?
+            .map(|l| (l.text, l.source)))
     }
 
     /// POSTs the music web context plus `fields` to `endpoint` and reads the answer as JSON.
@@ -196,6 +209,14 @@ impl browse::Browser for Innertube {
 
     async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error> {
         Innertube::more(self, kind, token).await
+    }
+
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        Innertube::song_next(self, video_id).await
+    }
+
+    async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error> {
+        Innertube::lyrics_page(self, page_id).await
     }
 }
 

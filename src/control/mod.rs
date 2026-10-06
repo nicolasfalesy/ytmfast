@@ -8,7 +8,7 @@
 //!   writer task fed through a bounded queue. A client whose queue fills (it stopped
 //!   reading) is dropped: nothing here ever waits on a client, so a stuck widget can't hold
 //!   up the engine or the other widgets.
-//! - A browsing request (`browse`, `search`, `more`, `playPage`), and a `like`, runs in a task
+//! - A browsing request (`browse`, `search`, `more`, `playPage`, `lyrics`), and a `like`, runs in a task
 //!   of the client's own, so a request that waits on YouTube never holds up that client's
 //!   other requests, and its answer goes back to that client alone. At most `MAX_BROWSING` at
 //!   once per client.
@@ -17,6 +17,7 @@
 //! daemon binds `$XDG_RUNTIME_DIR/ytmfast/socket` itself.
 
 pub mod idle;
+pub mod lyrics;
 pub mod protocol;
 pub mod stop;
 
@@ -43,6 +44,7 @@ use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
 use crate::error::Error;
 use crate::mpris;
 use idle::IdlePolicy;
+use lyrics::{EngineTabs, LyricsCache};
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
 
 /// The socket's name in the runtime folder.
@@ -245,6 +247,8 @@ struct Shared {
     /// Activity and quit, shared with MPRIS.
     hub: Hub,
     browser: Option<Arc<dyn Browser>>,
+    /// Lyrics answers kept for every client, and the engine's Lyrics tabs.
+    lyrics: LyricsCache,
 }
 
 /// Serves the socket until `quit`, idle, or the engine stopping. Leaves the engine running.
@@ -268,6 +272,7 @@ async fn serve_with(
     let my_uid = current_uid();
     let mut monitor = events.subscribe();
     let shared = Arc::new(Shared {
+        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone()))),
         cmds,
         events,
         hub,
@@ -602,6 +607,7 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
         request @ (Request::Browse { .. }
         | Request::Search { .. }
         | Request::More { .. }
+        | Request::Lyrics { .. }
         | Request::Like { .. }) => {
             return Handled::Browse(id, request, None);
         }
@@ -682,36 +688,45 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
     let Some(browser) = shared.browser.clone() else {
         return protocol::error_reply(Some(id), "unavailable", "browsing is not available");
     };
-    let result = match request {
-        Request::Browse { browse_id, params } => browser
-            .browse(&browse_id, params.as_deref())
-            .await
-            .map(|page| protocol::data_reply(id, &page)),
-        Request::Search { query, params } => browser
-            .search(&query, params.as_deref())
-            .await
-            .map(|page| protocol::data_reply(id, &page)),
-        Request::More { kind, token } => browser
-            .more(kind, &token)
-            .await
-            .map(|page| protocol::data_reply(id, &page)),
-        Request::PlayPage { browse_id, params } => {
-            match browser.browse(&browse_id, params.as_deref()).await {
-                Ok(page) => {
-                    let play = browse::page_play(&page)
-                        .cloned()
-                        .and_then(EngineCmd::play_endpoint);
-                    Ok(match play {
-                        Some(cmd) => play_if_latest(&shared.cmds, id, cmd, epoch).await,
-                        None => protocol::error_reply(Some(id), BAD_REQUEST, NOTHING_TO_PLAY),
-                    })
+    let result =
+        match request {
+            Request::Browse { browse_id, params } => browser
+                .browse(&browse_id, params.as_deref())
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::Search { query, params } => browser
+                .search(&query, params.as_deref())
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::More { kind, token } => browser
+                .more(kind, &token)
+                .await
+                .map(|page| protocol::data_reply(id, &page)),
+            Request::Lyrics { video_id } => shared
+                .lyrics
+                .get(browser.as_ref(), &video_id)
+                .await
+                .map(|lyrics| match lyrics {
+                    Some(l) => protocol::data_reply(id, &l),
+                    None => protocol::ok_reply(id, json!({ "none": true })),
+                }),
+            Request::PlayPage { browse_id, params } => {
+                match browser.browse(&browse_id, params.as_deref()).await {
+                    Ok(page) => {
+                        let play = browse::page_play(&page)
+                            .cloned()
+                            .and_then(EngineCmd::play_endpoint);
+                        Ok(match play {
+                            Some(cmd) => play_if_latest(&shared.cmds, id, cmd, epoch).await,
+                            None => protocol::error_reply(Some(id), BAD_REQUEST, NOTHING_TO_PLAY),
+                        })
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
-        }
-        // `handle` sends only the browsing requests here.
-        _ => Err(Error::Internal("not a browsing request".into())),
-    };
+            // `handle` sends only the browsing requests here.
+            _ => Err(Error::Internal("not a browsing request".into())),
+        };
     match result {
         // Widgets read lines of at most `MAX_LINE`, as the socket does. The parsing caps
         // (300 rows a section, 1,000 a continuation) keep real answers under it (a full

@@ -51,7 +51,7 @@ use crate::audio::fetch::{Relink, TrackBuffer};
 use crate::audio::player::{AudioEvent, AudioPlayer};
 use crate::browse::{Endpoint, LikeStatus};
 use crate::error::Error;
-use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
+use crate::innertube::{Innertube, NextPage, NextRequest, SongItem, SongNext};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
 use crate::report::{self, PlayReport, Reporter};
 use crate::state::{self, Saved, Writer};
@@ -62,13 +62,14 @@ use url::Url;
 /// production; a trait so the engine's tests can answer with their own pages. Used as
 /// `Arc<dyn QueueSource>`, hence async-trait (ruling R1).
 ///
-/// Also the account's per-song calls that go with what plays: a song's like status, and
-/// liking it. The same `next` request, and the same session, as the queue.
+/// Also the account's per-song calls that go with what plays: a song's like status (with its
+/// Lyrics tab, from the same answer), and liking it. The same `next` request, and the same
+/// session, as the queue.
 #[async_trait]
 pub trait QueueSource: Send + Sync {
     async fn next(&self, req: NextRequest) -> Result<NextPage, Error>;
-    /// The song's like status (`Innertube::like_status`); `Ok(None)` when unknown.
-    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error>;
+    /// The song's own `next`, read for its like status and Lyrics tab (`Innertube::song_next`).
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error>;
     /// Sets the song's like status (`Innertube::like`).
     async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error>;
 }
@@ -80,8 +81,8 @@ impl QueueSource for Innertube {
         Innertube::next(self, req).await
     }
 
-    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
-        Innertube::like_status(self, video_id).await
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        Innertube::song_next(self, video_id).await
     }
 
     async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
@@ -171,7 +172,29 @@ pub enum EngineCmd {
     /// Silences the output (its volume to 0) and keeps `Status::volume` for unmuting; `false`
     /// puts that volume back. Setting the volume while muted (`Volume`, or a mixer) unmutes.
     Mute(bool),
+    /// What the per-song cache knows of the song's Lyrics tab, learned from a `next` that
+    /// named the song (its queue's, or its like lookup's): the socket's `lyrics` then needs no
+    /// `next` of its own (ruling P6's carry). `None` when nothing is known.
+    LyricsTab {
+        video_id: String,
+        reply: oneshot::Sender<Option<KnownTab>>,
+    },
+    /// A song's own `next` that the socket's `lyrics` had to make: its Lyrics tab and like
+    /// status are kept as the like lookup's would be, so that song needs no lookup either.
+    LearnSong {
+        video_id: String,
+        next: SongNext,
+    },
     Quit,
+}
+
+/// A song's Lyrics tab as the engine learned it: the lyrics page's browse id, or `None` for a
+/// song whose `next` had no Lyrics tab, and when that was learned. A "no tab" grows stale
+/// (YouTube adds lyrics to songs later), so its asker weighs it by `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownTab {
+    pub page: Option<String>,
+    pub at: Instant,
 }
 
 impl EngineCmd {
@@ -302,8 +325,8 @@ const PRELOAD_LEAD_SECS: f64 = 10.0;
 /// Constraints), so a crash or a power loss loses at most that much of the song.
 const SAVE_EVERY_TICKS: u32 = 30;
 
-/// How many songs' like statuses are kept (the last learned), so a song played again (or
-/// gone back to) needs no new request.
+/// How many songs' like statuses (and Lyrics tabs) are kept (the last learned), so a song
+/// played again (or gone back to) needs no new request.
 const LIKES_KEPT: usize = 100;
 
 /// How long a quit waits for its last save: long enough for any working disk, short enough
@@ -380,46 +403,92 @@ struct Paged {
     result: Result<NextPage, Error>,
 }
 
-/// The like statuses learned lately, by video id: the last `LIKES_KEPT`. A small list, looked
-/// through in order: at 100 short ids a scan is well under a microsecond, about once per song,
-/// and the list itself is the order to drop the oldest by (a map would need a second one).
+/// The like statuses (and Lyrics tabs) learned lately, by video id: the last `LIKES_KEPT`
+/// songs. A small list, looked through in order: at 100 short ids a scan is well under a
+/// microsecond, about once per song, and the list itself is the order to drop the oldest by
+/// (a map would need a second one).
+///
+/// The tab rides here because it comes in the same `next` answer as the status: keeping the
+/// two together is what lets lyrics skip that request (ruling P6's carry).
 #[derive(Default)]
 struct Likes(std::collections::VecDeque<KnownLike>);
 
 struct KnownLike {
     video_id: String,
-    status: LikeStatus,
+    /// `None` while only the song's tab is known (the answer had no like button for it).
+    status: Option<LikeStatus>,
     /// Set by a like the user made here. YouTube's answers never replace it: one sent before
     /// the like (a queue fetch already on its way) would put the old status back.
     ours: bool,
+    /// `None` until a `next` that named the song came back.
+    tab: Option<KnownTab>,
 }
 
 impl Likes {
     fn get(&self, video_id: &str) -> Option<LikeStatus> {
-        self.0
-            .iter()
-            .find(|k| k.video_id == video_id)
-            .map(|k| k.status)
+        self.find(video_id).and_then(|k| k.status)
+    }
+
+    fn tab(&self, video_id: &str) -> Option<KnownTab> {
+        self.find(video_id).and_then(|k| k.tab.clone())
+    }
+
+    fn find(&self, video_id: &str) -> Option<&KnownLike> {
+        self.0.iter().find(|k| k.video_id == video_id)
     }
 
     /// Keeps `status` for `video_id`, newest last; false when an earlier like of the user's
     /// stands instead (`KnownLike::ours`).
     fn learn(&mut self, video_id: &str, status: LikeStatus, ours: bool) -> bool {
-        if let Some(at) = self.0.iter().position(|k| k.video_id == video_id) {
-            if self.0[at].ours && !ours {
-                return false;
-            }
-            self.0.remove(at);
+        let mut entry = self.take(video_id);
+        if entry.ours && !ours {
+            self.put(entry);
+            return false;
         }
-        self.0.push_back(KnownLike {
-            video_id: video_id.into(),
-            status,
-            ours,
+        entry.status = Some(status);
+        entry.ours = ours;
+        self.put(entry);
+        true
+    }
+
+    /// Keeps the song's Lyrics tab (`None`: it has none), learned now; newest last.
+    fn learn_tab(&mut self, video_id: &str, page: Option<String>) {
+        let mut entry = self.take(video_id);
+        entry.tab = Some(KnownTab {
+            page,
+            at: Instant::now(),
         });
+        self.put(entry);
+    }
+
+    /// The song's entry, out of the list (a blank one when it had none).
+    fn take(&mut self, video_id: &str) -> KnownLike {
+        match self.0.iter().position(|k| k.video_id == video_id) {
+            Some(at) => self
+                .0
+                .remove(at)
+                .unwrap_or_else(|| KnownLike::blank(video_id)),
+            None => KnownLike::blank(video_id),
+        }
+    }
+
+    /// Back in, as the newest; the oldest goes past `LIKES_KEPT`.
+    fn put(&mut self, entry: KnownLike) {
+        self.0.push_back(entry);
         if self.0.len() > LIKES_KEPT {
             self.0.pop_front();
         }
-        true
+    }
+}
+
+impl KnownLike {
+    fn blank(video_id: &str) -> KnownLike {
+        KnownLike {
+            video_id: video_id.into(),
+            status: None,
+            ours: false,
+            tab: None,
+        }
     }
 }
 
@@ -430,7 +499,7 @@ enum LikeNews {
     Looked {
         generation: u64,
         video_id: String,
-        result: Result<Option<LikeStatus>, Error>,
+        result: Result<SongNext, Error>,
     },
     /// A like, done or refused; `reply` is the asker's.
     Set {
@@ -888,6 +957,18 @@ impl Engine {
                 reply,
             } => self.like(video_id, status, reply),
             EngineCmd::Mute(on) => self.mute(on),
+            // Neither changes what plays: no preload check below.
+            EngineCmd::LyricsTab { video_id, reply } => {
+                let _ = reply.send(self.likes.tab(&video_id));
+                return;
+            }
+            EngineCmd::LearnSong { video_id, next } => {
+                self.likes.learn_tab(&video_id, next.lyrics_tab);
+                if let Some(status) = next.like {
+                    self.learn_like(&video_id, status);
+                }
+                return;
+            }
             // Handled by `run`.
             EngineCmd::Quit => {}
         }
@@ -1045,9 +1126,13 @@ impl Engine {
         if p.queue_generation != self.queue_generation {
             return;
         }
-        // The song the request named: its like status came with the queue (ruling P1).
-        if let (Some(id), Ok(NextPage { like: Some(s), .. })) = (&p.video_id, &p.result) {
-            self.learn_like(id, *s);
+        // The song the request named: its like status and Lyrics tab came with the queue
+        // (ruling P1; the tab for lyrics, Task 6).
+        if let (Some(id), Ok(page)) = (&p.video_id, &p.result) {
+            self.likes.learn_tab(id, page.lyrics_tab.clone());
+            if let Some(s) = page.like {
+                self.learn_like(id, s);
+            }
         }
         if p.refill {
             self.refilling = None;
@@ -1832,7 +1917,7 @@ impl Engine {
         let tx = self.like_news_tx.clone();
         let generation = self.liked_generation;
         let task = tokio::spawn(async move {
-            let result = source.like_status(&id).await;
+            let result = source.song_next(&id).await;
             let _ = tx.send(LikeNews::Looked {
                 generation,
                 video_id: id,
@@ -1897,14 +1982,21 @@ impl Engine {
                 video_id,
                 result,
             } => {
+                // The tab is the song's whatever plays now (only the like status is about the
+                // song shown), so even a late answer's is kept.
+                if let Ok(next) = &result {
+                    self.likes.learn_tab(&video_id, next.lyrics_tab.clone());
+                }
                 if generation != self.liked_generation {
                     return;
                 }
                 self.liked_lookup = None;
                 match result {
-                    Ok(Some(status)) => self.learn_like(&video_id, status),
+                    Ok(SongNext {
+                        like: Some(status), ..
+                    }) => self.learn_like(&video_id, status),
                     // Unknown stays unknown (null) until the song starts again.
-                    Ok(None) => {}
+                    Ok(_) => {}
                     // The code only, and no error event: the song plays on, and the like
                     // button just shows nothing.
                     Err(e) => eprintln!("ytmfast: could not read the like status ({})", e.code()),
@@ -2662,6 +2754,8 @@ mod tests {
         pages: HashMap<String, (Duration, Result<NextPage, Error>)>,
         requests: Mutex<Vec<NextRequest>>,
         statuses: HashMap<String, (Duration, Result<Option<LikeStatus>, Error>)>,
+        /// Lyrics tabs (the lyrics page's browse id) by video id, read with the like status.
+        tabs: HashMap<String, String>,
         lookups: Mutex<Vec<String>>,
         liked: Mutex<Vec<(String, LikeStatus)>>,
         like_fails: Mutex<Option<Error>>,
@@ -2681,15 +2775,19 @@ mod tests {
             }
         }
 
-        async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+        async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
             self.lookups.lock().unwrap().push(video_id.into());
-            match self.statuses.get(video_id) {
+            let like = match self.statuses.get(video_id) {
                 Some((delay, answer)) => {
                     tokio::time::sleep(*delay).await;
-                    answer.clone()
+                    answer.clone()?
                 }
-                None => Ok(None),
-            }
+                None => None,
+            };
+            Ok(SongNext {
+                like,
+                lyrics_tab: self.tabs.get(video_id).cloned(),
+            })
         }
 
         async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
@@ -2721,6 +2819,8 @@ mod tests {
         pages: Vec<(String, u64, Result<NextPage, Error>)>,
         /// Like statuses: (video id, delay in ms, answer).
         statuses: Vec<(String, u64, Result<Option<LikeStatus>, Error>)>,
+        /// Lyrics tabs: (video id, lyrics page id).
+        tabs: Vec<(String, String)>,
         delays: Vec<(&'static str, u64)>,
         failures: Vec<(&'static str, Error)>,
         /// A sink that plays as fast as it can, instead of in real time.
@@ -2916,6 +3016,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, ms, answer)| (id, (Duration::from_millis(ms), answer)))
                 .collect(),
+            tabs: setup.tabs.into_iter().collect(),
             ..FakeSource::default()
         });
         let Built {
@@ -3083,6 +3184,7 @@ mod tests {
             continuation: continuation.map(String::from),
             playlist_id: None,
             like: None,
+            lyrics_tab: None,
         }
     }
 
@@ -5571,6 +5673,100 @@ mod tests {
         r.send(EngineCmd::Next).await;
         r.until_song(&vid('D'), PlayState::Playing).await;
         assert_eq!(r.source.lookups(), [vid('C'), vid('D'), vid('D')]);
+    }
+
+    /// What the engine's per-song cache knows of a song's Lyrics tab: `None` unknown,
+    /// `Some(None)` known to have none.
+    async fn lyrics_tab(r: &Rig, video_id: &str) -> Option<Option<String>> {
+        let (reply, rx) = oneshot::channel();
+        r.send(EngineCmd::LyricsTab {
+            video_id: video_id.into(),
+            reply,
+        })
+        .await;
+        rx.await.unwrap().map(|k| k.page)
+    }
+
+    /// Task 6 (ruling P6's carry): every `next` read for a song's like status also yields its
+    /// Lyrics tab, kept with the status, so lyrics for the song need no `next` of their own;
+    /// and a `next` the lyrics had to make gives the like status too.
+    #[tokio::test]
+    async fn the_lyrics_tab_is_kept_with_the_like_status() {
+        // The like lookup's answer (a list's song, which its queue fetch didn't name).
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "CD", None)],
+            statuses: vec![(vid('C'), 0, Ok(Some(Like)))],
+            tabs: vec![(vid('C'), "MPLYtfake_C".into())],
+            ..Setup::default()
+        })
+        .await;
+        assert_eq!(lyrics_tab(&r, &vid('C')).await, None);
+        r.play_list("PLlist", None).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('C')) && s.liked == Some(Like)
+        })
+        .await;
+        assert_eq!(
+            lyrics_tab(&r, &vid('C')).await,
+            Some(Some("MPLYtfake_C".into()))
+        );
+        // D's lookup finds no tab: known to have none.
+        r.until_song(&vid('D'), PlayState::Playing).await;
+        let t = std::time::Instant::now();
+        while lyrics_tab(&r, &vid('D')).await.is_none() {
+            assert!(t.elapsed() < Duration::from_secs(3), "D's lookup");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(lyrics_tab(&r, &vid('D')).await, Some(None));
+
+        // A queue whose request named the song: its answer carries the tab (ruling P1).
+        // (With its like status too, so no lookup of A's own is made.)
+        let mut radio = page("AB", None);
+        radio.like = Some(Like);
+        radio.lyrics_tab = Some("MPLYtfake_A".into());
+        let mut r = rig(Setup {
+            pages: vec![(radio_of('A'), 0, Ok(radio))],
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('A')) && s.liked == Some(Like)
+        })
+        .await;
+        assert_eq!(
+            lyrics_tab(&r, &vid('A')).await,
+            Some(Some("MPLYtfake_A".into()))
+        );
+        assert!(r.source.lookups().is_empty());
+
+        // A `next` the lyrics made: its tab is kept, and its like status serves the song's
+        // next start with no lookup.
+        r.send(EngineCmd::LearnSong {
+            video_id: vid('E'),
+            next: SongNext {
+                like: Some(Dislike),
+                lyrics_tab: Some("MPLYtfake_E".into()),
+            },
+        })
+        .await;
+        assert_eq!(
+            lyrics_tab(&r, &vid('E')).await,
+            Some(Some("MPLYtfake_E".into()))
+        );
+        let lookups = r.source.lookups();
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('E')],
+            at: AddAt::Next,
+            added: oneshot::channel().0,
+        })
+        .await;
+        r.send(EngineCmd::Next).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('E')) && s.liked == Some(Dislike)
+        })
+        .await;
+        assert_eq!(r.source.lookups(), lookups);
     }
 
     #[tokio::test]

@@ -18,10 +18,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::auth::{Session, SessionStore};
-use crate::browse::{Browser, LikeStatus, MorePage, Page, SearchPage};
+use crate::browse::{Browser, LikeStatus, Lyrics, MorePage, Page, SearchPage};
 use crate::engine::QueueSource;
 use crate::error::Error;
-use crate::innertube::{MoreKind, NextPage, NextRequest, Tracking};
+use crate::innertube::{MoreKind, NextPage, NextRequest, SongNext, Tracking};
 use crate::report::ReportApi;
 use crate::streams::{Resolver, Stream};
 use url::Url;
@@ -141,8 +141,8 @@ impl QueueSource for LazySession {
         self.get().await?.queue.next(req).await
     }
 
-    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
-        self.get().await?.queue.like_status(video_id).await
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        self.get().await?.queue.song_next(video_id).await
     }
 
     async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
@@ -162,6 +162,14 @@ impl Browser for LazySession {
 
     async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error> {
         self.get().await?.browser.more(kind, token).await
+    }
+
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        self.get().await?.browser.song_next(video_id).await
+    }
+
+    async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error> {
+        self.get().await?.browser.lyrics_page(page_id).await
     }
 }
 
@@ -242,8 +250,11 @@ mod tests {
                 ..NextPage::default()
             })
         }
-        async fn like_status(&self, _: &str) -> Result<Option<LikeStatus>, Error> {
-            Ok(Some(LikeStatus::Dislike))
+        async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+            Ok(SongNext {
+                like: Some(LikeStatus::Dislike),
+                lyrics_tab: None,
+            })
         }
         /// Refused with the session's first cookie value as the text, so a test can tell
         /// which session the like went through.
@@ -286,6 +297,18 @@ mod tests {
         async fn more(&self, _: MoreKind, _: &str) -> Result<MorePage, Error> {
             Ok(MorePage::default())
         }
+        async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+            Ok(SongNext {
+                like: None,
+                lyrics_tab: Some(self.0.clone()),
+            })
+        }
+        async fn lyrics_page(&self, _: &str) -> Result<Option<Lyrics>, Error> {
+            Ok(Some(Lyrics {
+                text: self.0.clone(),
+                source: String::new(),
+            }))
+        }
     }
 
     fn counting_build(builds: Arc<AtomicUsize>) -> Build {
@@ -317,7 +340,15 @@ mod tests {
             lazy.browse("FEmusic_home", None).await,
             Err(Error::SignedOut)
         );
-        assert_eq!(lazy.like_status("testvideo01").await, Err(Error::SignedOut));
+        assert_eq!(
+            QueueSource::song_next(&lazy, "testvideo01").await,
+            Err(Error::SignedOut)
+        );
+        assert_eq!(
+            Browser::song_next(&lazy, "testvideo01").await,
+            Err(Error::SignedOut)
+        );
+        assert_eq!(lazy.lyrics_page("MPLYtfake").await, Err(Error::SignedOut));
         assert_eq!(
             lazy.like("testvideo01", LikeStatus::Like).await,
             Err(Error::SignedOut)
@@ -339,10 +370,25 @@ mod tests {
         // And the socket's browsing.
         let page = lazy.browse("FEmusic_home", None).await.unwrap();
         assert_eq!(page.header.title, "first");
+        // And the lyrics.
+        assert_eq!(
+            Browser::song_next(&lazy, "testvideo01")
+                .await
+                .unwrap()
+                .lyrics_tab,
+            Some("first".into())
+        );
+        assert_eq!(
+            lazy.lyrics_page("MPLYtfake").await.unwrap().unwrap().text,
+            "first"
+        );
         // And the likes, through the queue source.
         assert_eq!(
-            lazy.like_status("testvideo01").await,
-            Ok(Some(LikeStatus::Dislike))
+            QueueSource::song_next(&lazy, "testvideo01")
+                .await
+                .unwrap()
+                .like,
+            Some(LikeStatus::Dislike)
         );
         assert_eq!(
             lazy.like("testvideo01", LikeStatus::Like).await,

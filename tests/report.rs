@@ -508,8 +508,8 @@ impl QueueSource for FakeSource {
         Err(Error::Unavailable("YouTube sent no queue".into()))
     }
     /// Unknown: the reports don't depend on it.
-    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
-        Ok(None)
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
+        Ok(ytmfast::innertube::SongNext::default())
     }
     async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
         Ok(())

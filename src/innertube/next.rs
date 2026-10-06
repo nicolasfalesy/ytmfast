@@ -46,6 +46,19 @@ pub struct NextPage {
     /// playlist or a continuation, whose answer may be about some other song) or the answer
     /// has no button for it.
     pub like: Option<LikeStatus>,
+    /// The browse id of that song's lyrics page (`MPLYt…`), from the answer's Lyrics tab, on
+    /// the same terms as `like`: lyrics for the song then need only that page's browse (Task
+    /// 6). `None` when the request named no song or the song has no Lyrics tab.
+    pub lyrics_tab: Option<String>,
+}
+
+/// What a song's own `next` (one naming just the song) says about it beyond its queue: its
+/// like status and its Lyrics tab. One answer serves both the like lookup and lyrics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SongNext {
+    pub like: Option<LikeStatus>,
+    /// The lyrics page's browse id, shape-checked; `None` when the song has no Lyrics tab.
+    pub lyrics_tab: Option<String>,
 }
 
 /// One song in a queue. Serializable because the queue is saved across restarts and sent to
@@ -170,6 +183,9 @@ struct RawTab {
 #[derive(Deserialize)]
 struct RawTabRenderer {
     content: Option<RawTabContent>,
+    /// Where the tab leads (the Lyrics tab: its page's browse id). Small, kept raw, and read
+    /// by `browse::lyrics_tab_in`, the one reader of a Lyrics tab.
+    endpoint: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -340,25 +356,34 @@ fn parse(answer: &[u8], video_id: Option<&str>) -> Result<NextPage, Error> {
         }
         _ => None,
     };
+    let tabs = raw
+        .contents
+        .and_then(|c| c.single_column_music_watch_next_results_renderer)
+        .and_then(|w| w.tabbed_renderer)
+        .and_then(|t| t.watch_next_tabbed_results_renderer)
+        .map(|t| t.tabs)
+        .unwrap_or_default();
+    // Only for a song the request named, as with the like button: a playlist's answer is
+    // about whichever song YouTube picked.
+    let lyrics_tab = video_id.and_then(|_| {
+        browse::lyrics_tab_in(
+            tabs.iter()
+                .filter_map(|t| t.tab_renderer.as_ref()?.endpoint.as_ref()),
+        )
+    });
     // A continuation answer can also carry `contents` (the tab headers), so its own queue
     // is looked at first.
     let panel = raw
         .continuation_contents
         .and_then(|c| c.playlist_panel_continuation)
         .or_else(|| {
-            raw.contents?
-                .single_column_music_watch_next_results_renderer?
-                .tabbed_renderer?
-                .watch_next_tabbed_results_renderer?
-                .tabs
-                .into_iter()
-                .find_map(|t| {
-                    t.tab_renderer?
-                        .content?
-                        .music_queue_renderer?
-                        .content?
-                        .playlist_panel_renderer
-                })
+            tabs.into_iter().find_map(|t| {
+                t.tab_renderer?
+                    .content?
+                    .music_queue_renderer?
+                    .content?
+                    .playlist_panel_renderer
+            })
         });
     let Some(panel) = panel else {
         return Err(Error::Unavailable("YouTube sent no queue".into()));
@@ -389,6 +414,7 @@ fn parse(answer: &[u8], video_id: Option<&str>) -> Result<NextPage, Error> {
         continuation,
         playlist_id: panel.playlist_id,
         like,
+        lyrics_tab,
     })
 }
 

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::innertube::MoreKind;
+use crate::innertube::{MoreKind, SongNext};
 
 use collect::{collect, header_of, next_of};
 
@@ -244,6 +244,14 @@ pub fn page_play(page: &Page) -> Option<&Endpoint> {
     })
 }
 
+/// A song's lyrics, `Page.js`'s shape: the text as YouTube gives it (newlines kept) and the
+/// shelf's footer ("Source: Musixmatch"). A song with none is `{"none": true}` on the socket.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lyrics {
+    pub text: String,
+    pub source: String,
+}
+
 /// The browsing requests the socket serves: `Innertube`'s in production (through the lazily
 /// loaded session, `streams::lazy`), a fake in tests. Used as `Arc<dyn Browser>`, hence
 /// async-trait, as for `engine::QueueSource` (ruling R1). Each one checks its input before
@@ -253,6 +261,11 @@ pub trait Browser: Send + Sync {
     async fn browse(&self, browse_id: &str, params: Option<&str>) -> Result<Page, Error>;
     async fn search(&self, query: &str, params: Option<&str>) -> Result<SearchPage, Error>;
     async fn more(&self, kind: MoreKind, token: &str) -> Result<MorePage, Error>;
+    /// A song's `next`, read for its like status and its Lyrics tab: the first of the two
+    /// requests lyrics take, made only when the engine doesn't know the tab yet.
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error>;
+    /// The lyrics page a Lyrics tab names (`MPLYt…`); `None` when it holds no text.
+    async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error>;
 }
 
 /// A browse answer: the page header, its sections in page order, and its own next page.
@@ -359,10 +372,21 @@ pub fn parse_lyrics_tab(next: &Value) -> Option<String> {
     let tabs = next.pointer(
         "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs",
     )?;
+    lyrics_tab_in(
+        tabs.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.pointer("/tabRenderer/endpoint")),
+    )
+}
+
+/// `parse_lyrics_tab` over the tabs' `tabRenderer.endpoint`s alone: the queue's own reader
+/// (`innertube::next`) keeps just those, not the whole answer.
+pub fn lyrics_tab_in<'a>(endpoints: impl IntoIterator<Item = &'a Value>) -> Option<String> {
     // The last lyrics tab wins, as in Page.js (its forEach kept overwriting).
     let mut found = None;
-    for t in tabs.as_array().into_iter().flatten() {
-        let Some(b) = t.pointer("/tabRenderer/endpoint/browseEndpoint") else {
+    for e in endpoints {
+        let Some(b) = e.get("browseEndpoint") else {
             continue;
         };
         let page_type = b

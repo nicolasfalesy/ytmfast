@@ -112,6 +112,11 @@ pub enum Request {
     Mute {
         on: bool,
     },
+    /// A song's plain lyrics (`control::lyrics`): answered like a browsing command, to the
+    /// asking client only.
+    Lyrics {
+        video_id: String,
+    },
     Quit,
 }
 
@@ -204,6 +209,7 @@ impl Request {
                 ("like", Some(args))
             }
             Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
+            Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -424,6 +430,12 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 .get("on")
                 .and_then(Value::as_bool)
                 .ok_or("on must be true or false")?,
+        },
+        "lyrics" => Request::Lyrics {
+            video_id: match field(args, "videoId") {
+                Some(Value::String(s)) if is_video_id(s) => s.clone(),
+                _ => return Err(VIDEO_ID_RULE),
+            },
         },
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
@@ -937,6 +949,9 @@ mod tests {
             },
             Request::Mute { on: true },
             Request::Mute { on: false },
+            Request::Lyrics {
+                video_id: "dQw4w9WgXcQ".into(),
+            },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {

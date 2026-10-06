@@ -371,6 +371,53 @@ async fn lyrics_two_requests() {
     assert_eq!(requests(&none).await.len(), 1);
 }
 
+/// Task 6: the lyrics' `next` and its browse, as two calls, so a song whose Lyrics tab is
+/// already known (from the like lookup's `next`) costs only the browse.
+#[tokio::test]
+async fn song_next_reads_the_like_and_the_lyrics_tab() {
+    let rig = rig().await;
+    endpoint("next", json_answer(NEXT_FOR_LYRICS))
+        .expect(1)
+        .mount(&rig.server)
+        .await;
+    endpoint("browse", json_answer(LYRICS))
+        .expect(1)
+        .mount(&rig.server)
+        .await;
+    let next = rig.api.song_next("fakeV000797").await.unwrap();
+    assert_eq!(next.lyrics_tab.as_deref(), Some(LYRICS_ID));
+    // The like status is read from the same answer, by the like lookup's own reader.
+    assert_eq!(
+        next.like,
+        ytmfast::browse::parse_like_for(&value(NEXT_FOR_LYRICS), "fakeV000797")
+    );
+    let page = rig.api.lyrics_page(LYRICS_ID).await.unwrap().unwrap();
+    let (text, source) = parse_lyrics(&value(LYRICS)).unwrap();
+    assert_eq!((page.text, page.source), (text, source));
+    let reqs = requests(&rig).await;
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(
+        keys(&web_remix(&reqs[0], "next")),
+        ["isAudioOnly", "videoId"]
+    );
+    let body = web_remix(&reqs[1], "browse");
+    assert_eq!(keys(&body), ["browseId"]);
+    assert_eq!(body["browseId"], LYRICS_ID);
+
+    // Shapes are checked before anything is sent.
+    for bad in ["../x", "", "MPLYt fake"] {
+        assert!(
+            matches!(rig.api.lyrics_page(bad).await, Err(Error::BadRequest(_))),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        rig.api.song_next("../x").await,
+        Err(Error::BadRequest(_))
+    ));
+    assert_eq!(requests(&rig).await.len(), 2);
+}
+
 #[tokio::test]
 async fn query_length_capped() {
     let rig = rig().await;

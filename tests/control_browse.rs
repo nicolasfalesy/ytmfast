@@ -1,5 +1,5 @@
-//! Browsing over the control socket (step 3): `browse`, `search`, `more`, `play {endpoint}`
-//! and `playPage`, end to end on a socket in a temp folder, with a fake engine side and a fake
+//! Browsing over the control socket (step 3): `browse`, `search`, `more`, `play {endpoint}`,
+//! `playPage` and `lyrics`, end to end on a socket in a temp folder, with a fake engine side and a fake
 //! `Browser`. Never the network, never the real account.
 
 use std::collections::HashMap;
@@ -18,13 +18,16 @@ use tokio::task::JoinHandle;
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::browse::{
-    self, Browser, Endpoint, Kind, MorePage, Page, PageHeader, Row, SearchPage, Section,
+    self, Browser, Endpoint, Kind, Lyrics, MorePage, Page, PageHeader, Row, SearchPage, Section,
     WatchEndpoint, WatchPlaylistEndpoint,
 };
+use ytmfast::control::lyrics::{LyricsCache, LyricsTabs};
 use ytmfast::control::{self, Exit, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
+use ytmfast::engine::{
+    Engine, EngineCmd, EngineEvent, KnownTab, PlayState, QueueSource, QueueView, Status,
+};
 use ytmfast::error::Error;
-use ytmfast::innertube::{MoreKind, NextPage, NextRequest};
+use ytmfast::innertube::{MoreKind, NextPage, NextRequest, SongItem, SongNext};
 use ytmfast::queue::Repeat;
 use ytmfast::streams::{Resolver, Stream};
 
@@ -32,7 +35,8 @@ const SONG: &str = "dQw4w9WgXcQ";
 const WAIT: Duration = Duration::from_secs(10);
 
 /// What the fake browser was asked, in order: `"browse <id> <params>"`, `"search <query>
-/// <params>"`, `"more <kind> <token>"`.
+/// <params>"`, `"more <kind> <token>"`, `"next <videoId>"` (a lyrics' own `next`) and
+/// `"lyrics <MPLYt id>"`.
 type Calls = Arc<Mutex<Vec<String>>>;
 
 /// Answers from fixed pages. With a gate, every call first waits for a permit, so a test can
@@ -44,6 +48,10 @@ struct FakeBrowser {
     fail: Option<Error>,
     gate: Option<Arc<Semaphore>>,
     calls: Calls,
+    /// Lyrics tabs by video id (a song not here has none).
+    tabs: HashMap<String, String>,
+    /// Lyrics by lyrics page id (a page not here has no text).
+    lyrics: HashMap<String, Lyrics>,
 }
 
 impl FakeBrowser {
@@ -98,7 +106,32 @@ impl Browser for FakeBrowser {
             cont: String::new(),
         })
     }
+
+    async fn song_next(&self, video_id: &str) -> Result<SongNext, Error> {
+        self.calls.lock().unwrap().push(format!("next {video_id}"));
+        self.wait().await;
+        if let Some(e) = &self.fail {
+            return Err(e.clone());
+        }
+        Ok(SongNext {
+            like: None,
+            lyrics_tab: self.tabs.get(video_id).cloned(),
+        })
+    }
+
+    async fn lyrics_page(&self, page_id: &str) -> Result<Option<Lyrics>, Error> {
+        self.calls.lock().unwrap().push(format!("lyrics {page_id}"));
+        self.wait().await;
+        if let Some(e) = &self.fail {
+            return Err(e.clone());
+        }
+        Ok(self.lyrics.get(page_id).cloned())
+    }
 }
+
+/// What the engine's per-song cache knows of each song's Lyrics tab, faked: the rig's engine
+/// side keeps it as the real engine does (`EngineCmd::LyricsTab` and `LearnSong`).
+type Known = Arc<Mutex<HashMap<String, KnownTab>>>;
 
 fn song_row(id: &str) -> Row {
     Row {
@@ -158,6 +191,7 @@ struct Rig {
     events: broadcast::Sender<EngineEvent>,
     commands: mpsc::UnboundedReceiver<EngineCmd>,
     calls: Calls,
+    known: Known,
     serve: JoinHandle<Exit>,
     _dir: TempDir,
 }
@@ -170,6 +204,8 @@ fn rig(mut browser: FakeBrowser) -> Rig {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
     let (events, _) = broadcast::channel(64);
     let (seen_tx, commands) = mpsc::unbounded_channel();
+    let known = Known::default();
+    let engine_known = known.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
@@ -198,6 +234,18 @@ fn rig(mut browser: FakeBrowser) -> Rig {
                     let _ = played.send(true);
                     let _ = seen_tx.send(*play);
                 }
+                EngineCmd::LyricsTab { video_id, reply } => {
+                    let _ = reply.send(engine_known.lock().unwrap().get(&video_id).cloned());
+                }
+                EngineCmd::LearnSong { video_id, next } => {
+                    engine_known.lock().unwrap().insert(
+                        video_id,
+                        KnownTab {
+                            page: next.lyrics_tab,
+                            at: tokio::time::Instant::now(),
+                        },
+                    );
+                }
                 EngineCmd::Quit => return,
                 other => {
                     let _ = seen_tx.send(other);
@@ -224,6 +272,7 @@ fn rig(mut browser: FakeBrowser) -> Rig {
         events,
         commands,
         calls,
+        known,
         serve,
         _dir: dir,
     }
@@ -960,7 +1009,7 @@ impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
         std::future::pending().await
     }
-    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
+    async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
         std::future::pending().await
     }
     async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
@@ -1063,4 +1112,290 @@ async fn an_oversized_answer_is_refused_not_sent() {
                "message": "unavailable: the page is too big to send"}})
     );
     assert_eq!(c.ask(2, "status", json!({})).await["ok"], true);
+}
+
+const LYRICS_PAGE: &str = "MPLYtfake000001";
+
+fn words() -> Lyrics {
+    Lyrics {
+        text: "First line\nSecond line\n\nChorus".into(),
+        source: "Source: Musixmatch".into(),
+    }
+}
+
+/// A browser that knows `SONG`'s Lyrics tab and its text.
+fn with_lyrics() -> FakeBrowser {
+    FakeBrowser {
+        tabs: HashMap::from([(SONG.to_string(), LYRICS_PAGE.to_string())]),
+        lyrics: HashMap::from([(LYRICS_PAGE.to_string(), words())]),
+        ..FakeBrowser::default()
+    }
+}
+
+/// Lyrics are `Page.js`'s shape: the text as YouTube gives it (newlines kept) and the shelf's
+/// footer as the source. A song nobody knew about costs its `next` and the lyrics browse, and
+/// the tab that `next` found is handed to the engine's per-song cache.
+#[tokio::test]
+async fn lyrics_found() {
+    let r = rig(with_lyrics());
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(
+        v,
+        json!({"id": 1, "ok": true, "data": {
+            "text": "First line\nSecond line\n\nChorus",
+            "source": "Source: Musixmatch",
+        }})
+    );
+    assert_eq!(
+        serde_json::to_string(&v["data"]).unwrap(),
+        r#"{"text":"First line\nSecond line\n\nChorus","source":"Source: Musixmatch"}"#,
+        "the field order is Page.js's"
+    );
+    assert_eq!(
+        r.calls(),
+        [format!("next {SONG}"), format!("lyrics {LYRICS_PAGE}")]
+    );
+    let known = r.known.lock().unwrap().get(SONG).cloned().unwrap();
+    assert_eq!(known.page.as_deref(), Some(LYRICS_PAGE));
+}
+
+/// No Lyrics tab, or a lyrics page with no text: `{none: true}`. A malformed id is the
+/// client's mistake (`bad_request`), and nothing is sent.
+#[tokio::test]
+async fn lyrics_none() {
+    let mut browser = with_lyrics();
+    // A tab whose page has no text.
+    browser
+        .tabs
+        .insert("BBBBBBBBBBB".into(), "MPLYtfake_empty".into());
+    let r = rig(browser);
+    let mut c = connect(&r.path).await;
+    let none = |id: u64| json!({"id": id, "ok": true, "data": {"none": true}});
+    assert_eq!(
+        c.ask(1, "lyrics", json!({"videoId": "AAAAAAAAAAA"})).await,
+        none(1)
+    );
+    assert_eq!(
+        c.ask(2, "lyrics", json!({"videoId": "BBBBBBBBBBB"})).await,
+        none(2)
+    );
+    assert_eq!(
+        r.calls(),
+        [
+            "next AAAAAAAAAAA",
+            "next BBBBBBBBBBB",
+            "lyrics MPLYtfake_empty"
+        ]
+    );
+    // "No tab" is known now too.
+    let known = r.known.lock().unwrap().get("AAAAAAAAAAA").cloned().unwrap();
+    assert_eq!(known.page, None);
+
+    for (id, args) in [
+        (3, json!({})),
+        (4, json!({"videoId": "../x"})),
+        (5, json!({"videoId": 7})),
+        (6, json!({"videoId": "AAAAAAAAAA"})),
+    ] {
+        let v = c.ask(id, "lyrics", args.clone()).await;
+        assert_eq!(code(&v), "bad_request", "{args} -> {v}");
+    }
+    assert_eq!(r.calls().len(), 3, "nothing sent for a bad id");
+
+    // A failure is the asker's, with its code; it is not kept as "none".
+    let r = rig(FakeBrowser {
+        fail: Some(Error::SignedOut),
+        ..with_lyrics()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(code(&v), "signed_out", "{v}");
+    let v = c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(code(&v), "signed_out", "{v}");
+    assert_eq!(r.calls().len(), 2, "asked again: a failure is not kept");
+}
+
+fn nth_song(i: usize) -> String {
+    format!("song{i:07}")
+}
+
+/// The last 20 answers ("none" too) are kept in the daemon, for every client: reopening the
+/// Lyrics tab costs nothing. The 21st pushes out the one used longest ago; asked again, it is
+/// fetched again, and the tab the engine kept saves its `next`.
+#[tokio::test]
+async fn lyrics_cached_per_video() {
+    let mut browser = FakeBrowser::default();
+    for i in 0..21 {
+        // Every third song has no lyrics: "none" is kept as well.
+        if i % 3 != 2 {
+            let page = format!("MPLYtfake{i:06}");
+            browser.tabs.insert(nth_song(i), page.clone());
+            browser.lyrics.insert(
+                page,
+                Lyrics {
+                    text: format!("words {i}"),
+                    source: "Source: LyricFind".into(),
+                },
+            );
+        }
+    }
+    let r = rig(browser);
+    let mut a = connect(&r.path).await;
+    let mut b = connect(&r.path).await;
+    let mut want = Vec::new();
+    for i in 0..21 {
+        let v = a
+            .ask(i as u64, "lyrics", json!({"videoId": nth_song(i)}))
+            .await;
+        assert_eq!(v["ok"], true, "{v}");
+        want.push(v["data"].clone());
+    }
+    let fetched = r.calls().len();
+    assert_eq!(fetched, 21 + 14);
+
+    // Songs 1 to 20 are kept: asked again, from another client, nothing is sent.
+    for (i, data) in want.iter().enumerate().skip(1) {
+        let v = b
+            .ask(100 + i as u64, "lyrics", json!({"videoId": nth_song(i)}))
+            .await;
+        assert_eq!(&v["data"], data, "song {i}");
+    }
+    assert_eq!(r.calls().len(), fetched);
+
+    // Song 0 was pushed out: fetched again, with only the lyrics browse (its tab is known).
+    let v = b.ask(200, "lyrics", json!({"videoId": nth_song(0)})).await;
+    assert_eq!(v["data"], want[0]);
+    assert_eq!(r.calls()[fetched..], ["lyrics MPLYtfake000000"]);
+    // That pushed out the one used longest ago, song 1; song 20 stays.
+    let v = b.ask(201, "lyrics", json!({"videoId": nth_song(20)})).await;
+    assert_eq!(v["data"], want[20]);
+    assert_eq!(r.calls().len(), fetched + 1);
+    let v = b.ask(202, "lyrics", json!({"videoId": nth_song(1)})).await;
+    assert_eq!(v["data"], want[1]);
+    assert_eq!(r.calls()[fetched + 1..], ["lyrics MPLYtfake000001"]);
+}
+
+/// Answers the queue's `next` with one song and that song's Lyrics tab, as the real `next`
+/// does when the request names the song. A lyrics `next` of its own is never wanted here.
+struct Tabbed;
+
+#[async_trait]
+impl QueueSource for Tabbed {
+    async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
+        assert_eq!(req.video_id.as_deref(), Some(SONG));
+        Ok(NextPage {
+            items: vec![SongItem {
+                video_id: SONG.into(),
+                title: "Song".into(),
+                length_seconds: 200,
+                ..SongItem::default()
+            }],
+            lyrics_tab: Some(LYRICS_PAGE.into()),
+            ..NextPage::default()
+        })
+    }
+    async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        std::future::pending().await
+    }
+}
+
+/// Ruling P6's carry: the like lookup and lyrics share one `next` per song. A song played by id
+/// gets its like status from its queue's `next` (ruling P1), and that answer's Lyrics tab is
+/// kept with it; lyrics for the song then cost only the lyrics browse.
+#[tokio::test]
+async fn lyrics_reuses_the_like_lookup_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(control::SOCKET_NAME);
+    let (std, _bound) = control::bind_socket(&path).unwrap();
+    let listener = UnixListener::from_std(std).unwrap();
+    let player = AudioPlayer::spawn(Box::new(NullSink::new()));
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Tabbed), player);
+    let calls = Calls::default();
+    let options = Options {
+        browser: Some(Arc::new(FakeBrowser {
+            calls: calls.clone(),
+            ..with_lyrics()
+        })),
+        ..Options::default()
+    };
+    tokio::spawn(control::run(
+        listener,
+        engine,
+        cmds,
+        events,
+        options,
+        std::future::pending(),
+    ));
+    let mut c = connect(&path).await;
+    assert_eq!(c.ask(1, "play", json!({"videoId": SONG})).await["ok"], true);
+    // The queue's answer is in once the queue lists the song.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let q = c.ask(2, "queue.get", json!({})).await;
+        if q["data"]["items"].as_array().is_some_and(|i| !i.is_empty()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no queue: {q}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let v = c.ask(3, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["text"], words().text, "{v}");
+    assert_eq!(*calls.lock().unwrap(), [format!("lyrics {LYRICS_PAGE}")]);
+}
+
+/// The engine's cache, faked for the cache-level test below.
+#[derive(Default)]
+struct FakeTabs(Known);
+
+#[async_trait]
+impl LyricsTabs for FakeTabs {
+    async fn known(&self, video_id: &str) -> Option<KnownTab> {
+        self.0.lock().unwrap().get(video_id).cloned()
+    }
+    async fn learn(&self, video_id: &str, next: SongNext) {
+        self.0.lock().unwrap().insert(
+            video_id.into(),
+            KnownTab {
+                page: next.lyrics_tab,
+                at: tokio::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// A kept "none" is asked again after an hour (YouTube may have added lyrics since), and so is
+/// the engine's "no Lyrics tab"; found lyrics stay for the daemon's life.
+#[tokio::test(start_paused = true)]
+async fn none_expires_after_an_hour() {
+    const MIN: Duration = Duration::from_secs(60);
+    let calls = Calls::default();
+    let browser = FakeBrowser {
+        calls: calls.clone(),
+        ..with_lyrics()
+    };
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let none = "AAAAAAAAAAA";
+    assert_eq!(cache.get(&browser, none).await, Ok(None));
+    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(words())));
+    assert_eq!(calls.lock().unwrap().len(), 3);
+
+    tokio::time::sleep(59 * MIN).await;
+    assert_eq!(cache.get(&browser, none).await, Ok(None));
+    assert_eq!(calls.lock().unwrap().len(), 3, "kept for the hour");
+
+    tokio::time::sleep(2 * MIN).await;
+    assert_eq!(cache.get(&browser, none).await, Ok(None));
+    assert_eq!(
+        calls.lock().unwrap()[3..],
+        [format!("next {none}")],
+        "asked again, past the engine's own 'no tab' too"
+    );
+
+    tokio::time::sleep(5 * 60 * MIN).await;
+    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(words())));
+    assert_eq!(calls.lock().unwrap().len(), 4, "found lyrics don't expire");
 }

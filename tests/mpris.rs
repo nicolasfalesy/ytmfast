@@ -978,7 +978,7 @@ impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
         std::future::pending().await
     }
-    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
+    async fn song_next(&self, _: &str) -> Result<ytmfast::innertube::SongNext, Error> {
         std::future::pending().await
     }
     async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
