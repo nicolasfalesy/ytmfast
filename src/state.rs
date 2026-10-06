@@ -75,8 +75,12 @@ pub struct Saved {
     pub current_index: usize,
     /// Seconds into the current song.
     pub position: f64,
-    /// 0.0 to 1.0.
+    /// 0.0 to 1.0. While muted, the volume unmuting goes back to.
     pub volume: f32,
+    /// The output is silenced (its volume 0) with `volume` kept. Files written before mute
+    /// have no such key, and load unmuted: the version stays 1.
+    #[serde(default)]
+    pub muted: bool,
     pub shuffle: bool,
     /// While shuffled: the order from before shuffling, as indexes into `queue`, so turning
     /// shuffle off after a restart still goes back to it. `None` while shuffle is off.
@@ -111,6 +115,7 @@ impl Default for Saved {
             current_index: 0,
             position: 0.0,
             volume: 1.0,
+            muted: false,
             shuffle: false,
             original_order: None,
             repeat: Repeat::Off,
@@ -206,6 +211,7 @@ fn fit(saved: &Saved, cap: u64) -> Saved {
         current_index: saved.current_index,
         position: saved.position,
         volume: saved.volume,
+        muted: saved.muted,
         shuffle: saved.shuffle,
         original_order: saved.original_order.as_ref().map(|_| Vec::new()),
         repeat: saved.repeat,
@@ -1039,6 +1045,23 @@ mod tests {
         // A file written before it went still loads.
         let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
         old["source_kind"] = "radio".into();
+        std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
+        assert_eq!(load(dir.path()), Some(saved_of("AB", 1)));
+    }
+
+    #[test]
+    fn muted_is_saved_and_old_files_load_unmuted() {
+        let dir = tempfile::tempdir().unwrap();
+        let muted = Saved {
+            muted: true,
+            ..saved_of("AB", 1)
+        };
+        save(dir.path(), &muted).unwrap();
+        assert_eq!(load(dir.path()), Some(muted));
+        // A file from before mute (still version 1) has no `muted`: it loads unmuted.
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        old.as_object_mut().unwrap().remove("muted").unwrap();
         std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
         assert_eq!(load(dir.path()), Some(saved_of("AB", 1)));
     }

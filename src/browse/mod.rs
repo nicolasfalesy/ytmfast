@@ -395,14 +395,34 @@ pub fn parse_lyrics(b: &Value) -> Option<(String, String)> {
 
 /// The like status of the song a `next` answer is for: the player overlay's like button.
 pub fn parse_like_status(next: &Value) -> Option<LikeStatus> {
+    like_button(next).map(|(_, status)| status)
+}
+
+/// The like status of `video_id` from a `next` answer that asked for it: the like button's,
+/// when the button is for that song. The button names its song (`target.videoId`); one that
+/// names another song (or something that is not a video id) says nothing about this one. One
+/// that names none is taken as the answer's own song, which is the one asked for.
+pub fn parse_like_for(next: &Value, video_id: &str) -> Option<LikeStatus> {
+    let (target, status) = like_button(next)?;
+    match target {
+        Some(t) if t != video_id || !crate::streams::is_video_id(t) => None,
+        _ => Some(status),
+    }
+}
+
+/// The overlay's like button: the song it names (if it names one) and its status.
+fn like_button(next: &Value) -> Option<(Option<&str>, LikeStatus)> {
     let actions = next.pointer("/playerOverlays/playerOverlayRenderer/actions")?;
     actions.as_array()?.iter().find_map(|a| {
-        match a.pointer("/likeButtonRenderer/likeStatus")?.as_str()? {
-            "LIKE" => Some(LikeStatus::Like),
-            "DISLIKE" => Some(LikeStatus::Dislike),
-            "INDIFFERENT" => Some(LikeStatus::Indifferent),
-            _ => None,
-        }
+        let button = a.get("likeButtonRenderer")?;
+        let status = match button.get("likeStatus")?.as_str()? {
+            "LIKE" => LikeStatus::Like,
+            "DISLIKE" => LikeStatus::Dislike,
+            "INDIFFERENT" => LikeStatus::Indifferent,
+            _ => return None,
+        };
+        let target = button.pointer("/target/videoId").and_then(Value::as_str);
+        Some((target, status))
     })
 }
 

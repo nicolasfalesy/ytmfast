@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::auth::{Session, SessionStore};
-use crate::browse::{Browser, MorePage, Page, SearchPage};
+use crate::browse::{Browser, LikeStatus, MorePage, Page, SearchPage};
 use crate::engine::QueueSource;
 use crate::error::Error;
 use crate::innertube::{MoreKind, NextPage, NextRequest, Tracking};
@@ -140,6 +140,14 @@ impl QueueSource for LazySession {
     async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
         self.get().await?.queue.next(req).await
     }
+
+    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+        self.get().await?.queue.like_status(video_id).await
+    }
+
+    async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
+        self.get().await?.queue.like(video_id, status).await
+    }
 }
 
 #[async_trait]
@@ -234,6 +242,14 @@ mod tests {
                 ..NextPage::default()
             })
         }
+        async fn like_status(&self, _: &str) -> Result<Option<LikeStatus>, Error> {
+            Ok(Some(LikeStatus::Dislike))
+        }
+        /// Refused with the session's first cookie value as the text, so a test can tell
+        /// which session the like went through.
+        async fn like(&self, _: &str, _: LikeStatus) -> Result<(), Error> {
+            Err(Error::Unavailable(self.0.clone()))
+        }
     }
 
     /// Answers every tracking request with the session's first cookie value as the visitor
@@ -301,6 +317,11 @@ mod tests {
             lazy.browse("FEmusic_home", None).await,
             Err(Error::SignedOut)
         );
+        assert_eq!(lazy.like_status("testvideo01").await, Err(Error::SignedOut));
+        assert_eq!(
+            lazy.like("testvideo01", LikeStatus::Like).await,
+            Err(Error::SignedOut)
+        );
         assert_eq!(builds.load(Ordering::SeqCst), 0);
 
         // The user imports one: the next resolve uses it, without a restart.
@@ -318,6 +339,15 @@ mod tests {
         // And the socket's browsing.
         let page = lazy.browse("FEmusic_home", None).await.unwrap();
         assert_eq!(page.header.title, "first");
+        // And the likes, through the queue source.
+        assert_eq!(
+            lazy.like_status("testvideo01").await,
+            Ok(Some(LikeStatus::Dislike))
+        );
+        assert_eq!(
+            lazy.like("testvideo01", LikeStatus::Like).await,
+            Err(Error::Unavailable("first".into()))
+        );
         // Built once, then kept: the store isn't read on every song.
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }

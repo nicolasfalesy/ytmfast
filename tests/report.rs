@@ -507,6 +507,13 @@ impl QueueSource for FakeSource {
         }
         Err(Error::Unavailable("YouTube sent no queue".into()))
     }
+    /// Unknown: the reports don't depend on it.
+    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
+        Ok(None)
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 struct EngineRig {

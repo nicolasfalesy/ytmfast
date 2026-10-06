@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use crate::audio::decode::loudness_gain;
 use crate::audio::fetch::{Relink, TrackBuffer};
 use crate::audio::player::{AudioEvent, AudioPlayer};
-use crate::browse::Endpoint;
+use crate::browse::{Endpoint, LikeStatus};
 use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
@@ -61,16 +61,31 @@ use url::Url;
 /// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
 /// production; a trait so the engine's tests can answer with their own pages. Used as
 /// `Arc<dyn QueueSource>`, hence async-trait (ruling R1).
+///
+/// Also the account's per-song calls that go with what plays: a song's like status, and
+/// liking it. The same `next` request, and the same session, as the queue.
 #[async_trait]
 pub trait QueueSource: Send + Sync {
     async fn next(&self, req: NextRequest) -> Result<NextPage, Error>;
+    /// The song's like status (`Innertube::like_status`); `Ok(None)` when unknown.
+    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error>;
+    /// Sets the song's like status (`Innertube::like`).
+    async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error>;
 }
 
+/// The inherent methods, not these.
 #[async_trait]
 impl QueueSource for Innertube {
     async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
-        // The inherent method, not this one.
         Innertube::next(self, req).await
+    }
+
+    async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+        Innertube::like_status(self, video_id).await
+    }
+
+    async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
+        Innertube::like(self, video_id, status).await
     }
 }
 
@@ -142,6 +157,20 @@ pub enum EngineCmd {
         play: Box<EngineCmd>,
         played: oneshot::Sender<bool>,
     },
+    /// Sets a song's like status: `video_id`'s, else the song the status shows. Answered in
+    /// `reply` once YouTube took it (or refused it); the request runs off the engine loop. On
+    /// success the song's status is known from then on (`Status::liked`, at once when it is
+    /// the song shown). A failure goes back in `reply` alone, never as an error event: it is
+    /// the asker's news. `BadRequest` when no song is named and none is shown (Review Focus
+    /// 4), or the id is malformed.
+    Like {
+        video_id: Option<String>,
+        status: LikeStatus,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Silences the output (its volume to 0) and keeps `Status::volume` for unmuting; `false`
+    /// puts that volume back. Setting the volume while muted (`Volume`, or a mixer) unmutes.
+    Mute(bool),
     Quit,
 }
 
@@ -235,10 +264,17 @@ pub struct Status {
     /// The current song's queue id.
     pub queue_id: Option<u64>,
     pub position: f64,
-    /// 0.0 to 1.0 (the socket turns it into a percent).
+    /// 0.0 to 1.0 (the socket turns it into a percent). While muted, the volume unmuting
+    /// goes back to (and what MPRIS shows: it has no mute of its own).
     pub volume: f32,
+    /// The output is silenced, with `volume` kept.
+    pub muted: bool,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// The like status of the song shown (`video_id`): `None` until known, from the queue's
+    /// `next` answer when it named the song, else a request of its own when the song starts
+    /// (ruling P1), or from a like.
+    pub liked: Option<LikeStatus>,
 }
 
 /// Starts a track's download. `TrackBuffer::start` in production; tests swap in one that
@@ -265,6 +301,10 @@ const PRELOAD_LEAD_SECS: f64 = 10.0;
 /// While playing, the state is saved every this many position ticks (30 s; Global
 /// Constraints), so a crash or a power loss loses at most that much of the song.
 const SAVE_EVERY_TICKS: u32 = 30;
+
+/// How many songs' like statuses are kept (the last learned), so a song played again (or
+/// gone back to) needs no new request.
+const LIKES_KEPT: usize = 100;
 
 /// How long a quit waits for its last save: long enough for any working disk, short enough
 /// that a hung one can't hold up `systemctl stop` (whose own limit is far longer).
@@ -335,7 +375,70 @@ struct Paged {
     queue_generation: u64,
     /// More radio songs for the end of the queue, rather than a play's whole queue.
     refill: bool,
+    /// The song the request named, which its answer's like status is for (`NextPage::like`).
+    video_id: Option<String>,
     result: Result<NextPage, Error>,
+}
+
+/// The like statuses learned lately, by video id: the last `LIKES_KEPT`. A small list, looked
+/// through in order: at 100 entries that is cheaper than hashing, and keeps the order to drop
+/// the oldest by.
+#[derive(Default)]
+struct Likes(std::collections::VecDeque<KnownLike>);
+
+struct KnownLike {
+    video_id: String,
+    status: LikeStatus,
+    /// Set by a like the user made here. YouTube's answers never replace it: one sent before
+    /// the like (a queue fetch already on its way) would put the old status back.
+    ours: bool,
+}
+
+impl Likes {
+    fn get(&self, video_id: &str) -> Option<LikeStatus> {
+        self.0
+            .iter()
+            .find(|k| k.video_id == video_id)
+            .map(|k| k.status)
+    }
+
+    /// Keeps `status` for `video_id`, newest last; false when an earlier like of the user's
+    /// stands instead (`KnownLike::ours`).
+    fn learn(&mut self, video_id: &str, status: LikeStatus, ours: bool) -> bool {
+        if let Some(at) = self.0.iter().position(|k| k.video_id == video_id) {
+            if self.0[at].ours && !ours {
+                return false;
+            }
+            self.0.remove(at);
+        }
+        self.0.push_back(KnownLike {
+            video_id: video_id.into(),
+            status,
+            ours,
+        });
+        if self.0.len() > LIKES_KEPT {
+            self.0.pop_front();
+        }
+        true
+    }
+}
+
+/// A like request's news, back from its task.
+enum LikeNews {
+    /// A song's status, asked for when it started; `generation` is `Engine::liked_generation`
+    /// then, and an answer for an older one is dropped.
+    Looked {
+        generation: u64,
+        video_id: String,
+        result: Result<Option<LikeStatus>, Error>,
+    },
+    /// A like, done or refused; `reply` is the asker's.
+    Set {
+        video_id: String,
+        status: LikeStatus,
+        result: Result<(), Error>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 /// A play's queue that is still being fetched.
@@ -353,6 +456,9 @@ struct PendingLoad {
     /// replaces the queue when it lands; these are put back (`Engine::keep_added`), so they
     /// aren't lost and the one playing keeps its queue id.
     added: HashMap<u64, AddAt>,
+    /// The song the request names (a lone song's radio): its answer carries that song's like
+    /// status, so the song asks for none of its own while it is on the way.
+    like_for: Option<String>,
 }
 
 /// The songs added while a play's list was on its way that are still in the queue, in play
@@ -458,6 +564,17 @@ pub struct Engine {
     report: Option<PlayReport>,
     /// Commands taken that pick what plays (see `EngineCmd::PlayEpoch`).
     play_epoch: u64,
+    /// Like statuses learned (queue answers, lookups, likes).
+    likes: Likes,
+    /// Bumped whenever the song shown changes: a lookup's answer for an older one is dropped.
+    liked_generation: u64,
+    /// The song shown already had its one lookup (or needs none): at most one request per
+    /// song start (ruling P1).
+    liked_asked: bool,
+    /// The running lookup, aborted when the song changes.
+    liked_lookup: Option<AbortHandle>,
+    like_news_tx: mpsc::UnboundedSender<LikeNews>,
+    like_news_rx: mpsc::UnboundedReceiver<LikeNews>,
 }
 
 impl Engine {
@@ -488,6 +605,7 @@ impl Engine {
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let (pages_tx, pages_rx) = mpsc::unbounded_channel();
         let (preloads_tx, preloads_rx) = mpsc::unbounded_channel();
+        let (like_news_tx, like_news_rx) = mpsc::unbounded_channel();
         let engine = Engine {
             resolver,
             source,
@@ -508,8 +626,10 @@ impl Engine {
                 queue_id: None,
                 position: 0.0,
                 volume: 1.0,
+                muted: false,
                 shuffle: false,
                 repeat: Repeat::Off,
+                liked: None,
             },
             generation: 0,
             queue_generation: 0,
@@ -547,6 +667,12 @@ impl Engine {
             reporter: None,
             report: None,
             play_epoch: 0,
+            likes: Likes::default(),
+            liked_generation: 0,
+            liked_asked: false,
+            liked_lookup: None,
+            like_news_tx,
+            like_news_rx,
         };
         (engine, cmd_tx, events)
     }
@@ -569,8 +695,11 @@ impl Engine {
         } else {
             1.0
         };
-        self.player.set_volume(volume);
+        // Muted stays muted: silent, with its volume kept for unmuting.
+        self.player
+            .set_volume(if saved.muted { 0.0 } else { volume });
         self.status.volume = volume;
+        self.status.muted = saved.muted;
         self.status.shuffle = self.queue.shuffle();
         self.status.repeat = self.queue.repeat();
         let Some(item) = self.queue.current().cloned() else {
@@ -582,6 +711,7 @@ impl Engine {
             0.0
         };
         self.status.video_id = Some(item.song.video_id.clone());
+        self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
         self.status.meta = song_meta(&item.song, None);
@@ -627,6 +757,7 @@ impl Engine {
                 Some(r) = self.resolved_rx.recv() => self.on_resolved(r),
                 Some(p) = self.pages_rx.recv() => self.on_page(p),
                 Some(p) = self.preloads_rx.recv() => self.on_preloaded(p),
+                Some(n) = self.like_news_rx.recv() => self.on_like_news(n),
                 Some(e) = audio.recv() => self.on_audio(e),
                 () = next_tick(&mut self.ticker) => self.on_tick(),
             }
@@ -656,6 +787,7 @@ impl Engine {
             self.resolving.take(),
             self.loading.take(),
             self.refilling.take(),
+            self.liked_lookup.take(),
             prefetch,
         ]
         .into_iter()
@@ -750,6 +882,12 @@ impl Engine {
                     return self.handle(*play);
                 }
             }
+            EngineCmd::Like {
+                video_id,
+                status,
+                reply,
+            } => self.like(video_id, status, reply),
+            EngineCmd::Mute(on) => self.mute(on),
             // Handled by `run`.
             EngineCmd::Quit => {}
         }
@@ -821,6 +959,7 @@ impl Engine {
             start,
             report_errors: playlist_id.is_some(),
             added: HashMap::new(),
+            like_for: request.video_id.clone(),
         });
         self.loading = Some(self.request(request, false));
     }
@@ -890,10 +1029,12 @@ impl Engine {
         let tx = self.pages_tx.clone();
         let queue_generation = self.queue_generation;
         let task = tokio::spawn(async move {
+            let video_id = req.video_id.clone();
             let result = source.next(req).await;
             let _ = tx.send(Paged {
                 queue_generation,
                 refill,
+                video_id,
                 result,
             });
         });
@@ -904,6 +1045,10 @@ impl Engine {
         if p.queue_generation != self.queue_generation {
             return;
         }
+        // The song the request named: its like status came with the queue (ruling P1).
+        if let (Some(id), Ok(NextPage { like: Some(s), .. })) = (&p.video_id, &p.result) {
+            self.learn_like(id, *s);
+        }
         if p.refill {
             self.refilling = None;
             self.on_refill(p.result);
@@ -912,6 +1057,11 @@ impl Engine {
             self.on_load(p.result);
         }
         self.check_preload();
+        // A song that started while its queue was on the way waited for the queue's answer
+        // to know its like status; without one there, it asks now.
+        if self.loaded && self.started {
+            self.want_liked();
+        }
     }
 
     /// A play's queue arrived (or failed).
@@ -1287,6 +1437,7 @@ impl Engine {
         };
         self.resolved_meta = None;
         self.status.video_id = Some(item.song.video_id.clone());
+        self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
         self.status.meta = song_meta(&item.song, None);
@@ -1298,6 +1449,7 @@ impl Engine {
     fn show_nothing(&mut self) {
         self.resolved_meta = None;
         self.status.video_id = None;
+        self.reset_liked();
         self.status.queue_id = None;
         self.status.album = None;
         self.status.meta = None;
@@ -1364,6 +1516,7 @@ impl Engine {
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
         self.status.video_id = Some(video_id.to_string());
+        self.reset_liked();
         self.status.position = start;
         self.emit_state();
         crate::trace::play(video_id);
@@ -1598,19 +1751,25 @@ impl Engine {
 
     /// The output's volume was changed in a mixer: the status shows it and it is saved, but
     /// it is not sent back to the output, which already has it (and would echo it back).
+    ///
+    /// While muted the output is at 0, so any change a mixer reports moved it off 0: the song
+    /// is heard again, so it is no longer muted, and the mixer's volume is the volume (even
+    /// one equal to the kept volume). The user touched the volume: the same rule as `volume`.
     fn mixer_volume(&mut self, v: f32) {
         if !v.is_finite() {
             return;
         }
         let v = v.clamp(0.0, 1.0);
-        if v == self.status.volume {
+        if v == self.status.volume && !self.status.muted {
             return;
         }
         self.status.volume = v;
+        self.status.muted = false;
         self.dirty = true;
         self.emit_state();
     }
 
+    /// Also unmutes: setting the volume while muted means the user wants to hear it.
     fn volume(&mut self, v: f32) {
         if v.is_nan() {
             return;
@@ -1618,8 +1777,162 @@ impl Engine {
         let v = v.clamp(0.0, 1.0);
         self.player.set_volume(v);
         self.status.volume = v;
+        self.status.muted = false;
         self.dirty = true;
         self.emit_state();
+    }
+
+    /// The output's volume goes to 0 (or back to `status.volume`); the volume itself is kept,
+    /// so unmuting needs nothing remembered elsewhere and a restart keeps both (`Saved`).
+    fn mute(&mut self, on: bool) {
+        if on == self.status.muted {
+            return;
+        }
+        self.player
+            .set_volume(if on { 0.0 } else { self.status.volume });
+        self.status.muted = on;
+        self.dirty = true;
+        self.emit_state();
+    }
+
+    /// The song shown changed: its like status is what is known of it (often nothing yet),
+    /// and an older song's lookup is dropped, running or answered.
+    fn reset_liked(&mut self) {
+        self.liked_generation += 1;
+        self.liked_asked = false;
+        if let Some(task) = self.liked_lookup.take() {
+            task.abort();
+        }
+        self.status.liked = self
+            .status
+            .video_id
+            .as_deref()
+            .and_then(|id| self.likes.get(id));
+    }
+
+    /// The song shown started (or its queue's answer came): its like status, if not known,
+    /// is asked for, once per start, in a task of its own (ruling P1). Not while the play's
+    /// own queue request names the song: its answer carries the status (`on_page`).
+    fn want_liked(&mut self) {
+        if self.status.liked.is_some() || self.liked_asked {
+            return;
+        }
+        let Some(id) = self.status.video_id.clone() else {
+            return;
+        };
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.like_for.as_deref() == Some(id.as_str()))
+        {
+            return;
+        }
+        self.liked_asked = true;
+        let source = self.source.clone();
+        let tx = self.like_news_tx.clone();
+        let generation = self.liked_generation;
+        let task = tokio::spawn(async move {
+            let result = source.like_status(&id).await;
+            let _ = tx.send(LikeNews::Looked {
+                generation,
+                video_id: id,
+                result,
+            });
+        });
+        self.liked_lookup = Some(task.abort_handle());
+    }
+
+    /// A like status from YouTube (a queue's answer, or a lookup): kept, and shown when it is
+    /// the shown song's.
+    fn learn_like(&mut self, video_id: &str, status: LikeStatus) {
+        if !self.likes.learn(video_id, status, false) {
+            return;
+        }
+        self.show_liked(video_id, status);
+    }
+
+    fn show_liked(&mut self, video_id: &str, status: LikeStatus) {
+        if self.status.video_id.as_deref() == Some(video_id) && self.status.liked != Some(status) {
+            self.status.liked = Some(status);
+            self.emit_state();
+        }
+    }
+
+    /// A like: sent from a task of its own, so the engine never waits on YouTube.
+    fn like(
+        &mut self,
+        video_id: Option<String>,
+        status: LikeStatus,
+        reply: oneshot::Sender<Result<(), Error>>,
+    ) {
+        // A like with nothing named likes the song shown; with none shown it would like
+        // nothing, which the asker should hear (Review Focus 4).
+        let Some(id) = video_id.or_else(|| self.status.video_id.clone()) else {
+            let _ = reply.send(Err(Error::BadRequest(
+                "nothing is playing: say which song (videoId)".into(),
+            )));
+            return;
+        };
+        if !crate::streams::is_video_id(&id) {
+            let _ = reply.send(Err(Error::BadRequest("not a video id".into())));
+            return;
+        }
+        let source = self.source.clone();
+        let tx = self.like_news_tx.clone();
+        tokio::spawn(async move {
+            let result = source.like(&id, status).await;
+            let _ = tx.send(LikeNews::Set {
+                video_id: id,
+                status,
+                result,
+                reply,
+            });
+        });
+    }
+
+    fn on_like_news(&mut self, news: LikeNews) {
+        match news {
+            LikeNews::Looked {
+                generation,
+                video_id,
+                result,
+            } => {
+                if generation != self.liked_generation {
+                    return;
+                }
+                self.liked_lookup = None;
+                match result {
+                    Ok(Some(status)) => self.learn_like(&video_id, status),
+                    // Unknown stays unknown (null) until the song starts again.
+                    Ok(None) => {}
+                    // The code only, and no error event: the song plays on, and the like
+                    // button just shows nothing.
+                    Err(e) => eprintln!("ytmfast: could not read the like status ({})", e.code()),
+                }
+            }
+            LikeNews::Set {
+                video_id,
+                status,
+                result,
+                reply,
+            } => {
+                if result.is_ok() {
+                    self.likes.learn(&video_id, status, true);
+                    if self.status.video_id.as_deref() == Some(video_id.as_str()) {
+                        // A lookup still on its way was sent before the like: drop it.
+                        self.liked_generation += 1;
+                        self.liked_asked = true;
+                        if let Some(task) = self.liked_lookup.take() {
+                            task.abort();
+                        }
+                    }
+                    // Shown before the reply goes out: a client that reads the status after
+                    // its "ok" sees the like.
+                    self.show_liked(&video_id, status);
+                }
+                let _ = reply.send(result);
+            }
+        }
     }
 
     fn on_audio(&mut self, event: AudioEvent) {
@@ -1655,6 +1968,7 @@ impl Engine {
                     self.set_playing();
                     self.emit_state();
                 }
+                self.want_liked();
                 // A song started with under 10 s left preloads the next at once.
                 self.maybe_preload(at);
             }
@@ -1804,6 +2118,7 @@ impl Engine {
         self.skip_cap = None;
         self.start_seconds = 0.0;
         self.status.video_id = Some(item.song.video_id.clone());
+        self.reset_liked();
         self.status.queue_id = Some(item.id);
         self.status.album = item.song.album.clone();
         self.resolved_meta = Some(source.meta.clone());
@@ -1819,6 +2134,7 @@ impl Engine {
         self.start_report(at);
         self.emit_queue();
         self.emit_state();
+        self.want_liked();
         self.maybe_refill();
         // A short song: the one after it is due at once.
         self.maybe_preload(at);
@@ -2119,6 +2435,7 @@ impl Engine {
             current_index: current.map_or(0, |c| c - range.start),
             position,
             volume: status.volume,
+            muted: status.muted,
             shuffle: status.shuffle,
             original_order,
             repeat: status.repeat,
@@ -2337,10 +2654,17 @@ mod tests {
 
     /// A queue source: answers by playlist id (or the continuation token), after an optional
     /// delay; anything else is "no queue". Records every request.
+    ///
+    /// Like statuses: by video id, after an optional delay; any other song is unknown at once.
+    /// Likes are taken (and recorded), unless `like_fails` says otherwise.
     #[derive(Default)]
     struct FakeSource {
         pages: HashMap<String, (Duration, Result<NextPage, Error>)>,
         requests: Mutex<Vec<NextRequest>>,
+        statuses: HashMap<String, (Duration, Result<Option<LikeStatus>, Error>)>,
+        lookups: Mutex<Vec<String>>,
+        liked: Mutex<Vec<(String, LikeStatus)>>,
+        like_fails: Mutex<Option<Error>>,
     }
 
     #[async_trait]
@@ -2356,11 +2680,38 @@ mod tests {
                 None => Err(Error::Unavailable("YouTube sent no queue".into())),
             }
         }
+
+        async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+            self.lookups.lock().unwrap().push(video_id.into());
+            match self.statuses.get(video_id) {
+                Some((delay, answer)) => {
+                    tokio::time::sleep(*delay).await;
+                    answer.clone()
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn like(&self, video_id: &str, status: LikeStatus) -> Result<(), Error> {
+            if let Some(e) = self.like_fails.lock().unwrap().clone() {
+                return Err(e);
+            }
+            self.liked.lock().unwrap().push((video_id.into(), status));
+            Ok(())
+        }
     }
 
     impl FakeSource {
         fn requests(&self) -> Vec<NextRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn lookups(&self) -> Vec<String> {
+            self.lookups.lock().unwrap().clone()
+        }
+
+        fn liked(&self) -> Vec<(String, LikeStatus)> {
+            self.liked.lock().unwrap().clone()
         }
     }
 
@@ -2368,6 +2719,8 @@ mod tests {
     struct Setup {
         /// Queue pages: (playlist id or continuation, delay in ms, answer).
         pages: Vec<(String, u64, Result<NextPage, Error>)>,
+        /// Like statuses: (video id, delay in ms, answer).
+        statuses: Vec<(String, u64, Result<Option<LikeStatus>, Error>)>,
         delays: Vec<(&'static str, u64)>,
         failures: Vec<(&'static str, Error)>,
         /// A sink that plays as fast as it can, instead of in real time.
@@ -2558,6 +2911,11 @@ mod tests {
                 .into_iter()
                 .map(|(key, ms, answer)| (key, (Duration::from_millis(ms), answer)))
                 .collect(),
+            statuses: setup
+                .statuses
+                .into_iter()
+                .map(|(id, ms, answer)| (id, (Duration::from_millis(ms), answer)))
+                .collect(),
             ..FakeSource::default()
         });
         let Built {
@@ -2724,6 +3082,7 @@ mod tests {
             items: songs.chars().map(song).collect(),
             continuation: continuation.map(String::from),
             playlist_id: None,
+            like: None,
         }
     }
 
@@ -5076,5 +5435,255 @@ mod tests {
                 assert!(crate::net::allowed_host(&u), "{s}");
             }
         }
+    }
+
+    // ---- Like, dislike and mute (step 3) ----
+
+    use LikeStatus::{Dislike, Like};
+
+    /// Sends a like and waits for its answer.
+    async fn like(r: &Rig, video_id: Option<&str>, status: LikeStatus) -> Result<(), Error> {
+        let (reply, answer) = oneshot::channel();
+        r.send(EngineCmd::Like {
+            video_id: video_id.map(String::from),
+            status,
+            reply,
+        })
+        .await;
+        answer.await.unwrap()
+    }
+
+    /// Events up to and including the first state that `want` holds for.
+    async fn until_state(r: &mut Rig, want: impl Fn(&Status) -> bool) -> Vec<EngineEvent> {
+        let mut seen = Vec::new();
+        loop {
+            let e = r.next().await;
+            let done = matches!(&e, EngineEvent::State(s) if want(s));
+            seen.push(e);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// Every event already sent and not yet read.
+    fn drain(r: &mut Rig) -> Vec<EngineEvent> {
+        std::iter::from_fn(|| r.events.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn like_by_video_id() {
+        // Review Focus 4: a song that isn't playing (a row in a list) is liked by its id,
+        // whether anything plays or not.
+        let mut r = rig(Setup::default()).await;
+        assert_eq!(like(&r, Some(&vid('B')), Like).await, Ok(()));
+        r.play(&vid('A')).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        assert_eq!(like(&r, Some(&vid('C')), Dislike).await, Ok(()));
+        assert_eq!(r.source.liked(), [(vid('B'), Like), (vid('C'), Dislike)]);
+        // Not the song playing: its status is untouched.
+        let s = r.status().await;
+        assert_eq!(s.video_id, Some(vid('A')));
+        assert_eq!(s.liked, None);
+        // A malformed id is refused before anything is sent.
+        assert!(matches!(
+            like(&r, Some("../x"), Like).await,
+            Err(Error::BadRequest(_))
+        ));
+        assert_eq!(r.source.liked().len(), 2);
+        no_errors(&drain(&mut r));
+    }
+
+    #[tokio::test]
+    async fn like_current_updates_status() {
+        let mut r = rig(Setup::default()).await;
+        r.play(&vid('A')).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        assert_eq!(like(&r, None, Like).await, Ok(()));
+        assert_eq!(r.source.liked(), [(vid('A'), Like)]);
+        // At once, as soon as YouTube took it: the status, and a state event for the widgets.
+        assert_eq!(r.status().await.liked, Some(Like));
+        until_state(&mut r, |s| s.liked == Some(Like)).await;
+        // A refused like changes nothing, and is the asker's news alone: no error event.
+        *r.source.like_fails.lock().unwrap() = Some(Error::SignedOut);
+        assert_eq!(like(&r, None, Dislike).await, Err(Error::SignedOut));
+        assert_eq!(r.status().await.liked, Some(Like));
+        no_errors(&drain(&mut r));
+    }
+
+    #[tokio::test]
+    async fn like_without_song_needs_id() {
+        let mut r = rig(Setup::default()).await;
+        assert!(matches!(
+            like(&r, None, Like).await,
+            Err(Error::BadRequest(_))
+        ));
+        assert!(r.source.liked().is_empty());
+        // Nothing broadcast: the refusal is the asker's alone.
+        assert!(drain(&mut r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn liked_comes_from_next_answer() {
+        // A song played by id: its radio's `next` names it, so that answer's like button is
+        // read, and no request of its own is made (ruling P1).
+        let mut radio = page("AB", None);
+        radio.like = Some(Dislike);
+        let mut r = rig(Setup {
+            pages: vec![(radio_of('A'), 0, Ok(radio))],
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('A'))
+                && s.state == PlayState::Playing
+                && s.liked == Some(Dislike)
+        })
+        .await;
+        assert!(r.source.lookups().is_empty());
+
+        // A list played from its start names no song: the song's status is asked for once,
+        // when it starts, and kept for it.
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "CD", None)],
+            statuses: vec![(vid('C'), 0, Ok(Some(Like)))],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('C')) && s.liked == Some(Like)
+        })
+        .await;
+        // The next song (gapless) has its own, unknown here: null.
+        let seen = r.until_song(&vid('D'), PlayState::Playing).await;
+        assert_eq!(states(&seen).last().unwrap().liked, None);
+        // Back to the first: known already, so no second request for it.
+        r.send(EngineCmd::Previous).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('C')) && s.liked == Some(Like)
+        })
+        .await;
+        r.until_song(&vid('C'), PlayState::Playing).await;
+        assert_eq!(r.source.lookups(), [vid('C'), vid('D')]);
+        // A song whose status stayed unknown is asked again when it starts again.
+        r.send(EngineCmd::Next).await;
+        r.until_song(&vid('D'), PlayState::Playing).await;
+        assert_eq!(r.source.lookups(), [vid('C'), vid('D'), vid('D')]);
+    }
+
+    #[tokio::test]
+    async fn a_late_like_status_is_dropped() {
+        // The first song's status comes back after the user moved on: it is not the new
+        // song's, and is dropped.
+        let mut r = rig(Setup {
+            statuses: vec![(vid('A'), 300, Ok(Some(Like)))],
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        r.play(&vid('B')).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let seen = drain(&mut r);
+        assert!(states(&seen).iter().all(|s| s.liked.is_none()), "{seen:?}");
+        let s = r.status().await;
+        assert_eq!(s.video_id, Some(vid('B')));
+        assert_eq!(s.liked, None);
+        assert_eq!(r.source.lookups(), [vid('A'), vid('B')]);
+        // Not kept for the first song either: played again, it asks again (and shows the
+        // answer to that).
+        r.play(&vid('A')).await;
+        until_state(&mut r, |s| {
+            s.video_id == Some(vid('A')) && s.liked == Some(Like)
+        })
+        .await;
+        assert_eq!(r.source.lookups(), [vid('A'), vid('B'), vid('A')]);
+    }
+
+    #[tokio::test]
+    async fn mute_keeps_volume_and_restores() {
+        let mut r = rig(Setup::default()).await;
+        r.send(EngineCmd::Volume(0.5)).await;
+        eventually("the output volume", || r.stats.volume() == 0.5).await;
+        r.send(EngineCmd::Mute(true)).await;
+        until_state(&mut r, |s| s.muted).await;
+        eventually("the output is silent", || r.stats.volume() == 0.0).await;
+        // The volume is kept, for unmuting (and MPRIS and the widgets show it).
+        let s = r.status().await;
+        assert!(s.muted);
+        assert_eq!(s.volume, 0.5);
+        r.send(EngineCmd::Mute(false)).await;
+        until_state(&mut r, |s| !s.muted).await;
+        eventually("the volume is back", || r.stats.volume() == 0.5).await;
+        assert_eq!(r.stats.volume_sets(), 3);
+        // While muted, setting the volume unmutes at the new volume: the user touched it.
+        r.send(EngineCmd::Mute(true)).await;
+        r.send(EngineCmd::Volume(0.7)).await;
+        until_state(&mut r, |s| !s.muted && s.volume == 0.7).await;
+        eventually("the new volume", || r.stats.volume() == 0.7).await;
+        // Muting twice is one mute.
+        r.send(EngineCmd::Mute(true)).await;
+        r.send(EngineCmd::Mute(true)).await;
+        r.send(EngineCmd::Mute(false)).await;
+        until_state(&mut r, |s| !s.muted).await;
+        eventually("the volume is back", || r.stats.volume() == 0.7).await;
+        assert_eq!(r.stats.volume_sets(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_mixer_change_while_muted_unmutes() {
+        let mut r = rig(Setup::default()).await;
+        r.send(EngineCmd::Volume(0.5)).await;
+        r.send(EngineCmd::Mute(true)).await;
+        eventually("the output is silent", || r.stats.volume() == 0.0).await;
+        // The user turns the stream up in a mixer: it is heard, so it is not muted any more,
+        // and the mixer's volume is the volume.
+        r.stats.mixer_volume(0.3);
+        until_state(&mut r, |s| !s.muted && s.volume == 0.3).await;
+        // Not sent back to the output, which already has it.
+        assert_eq!(r.stats.volume_sets(), 2);
+        // Even when the mixer puts it back at the volume it had.
+        r.send(EngineCmd::Mute(true)).await;
+        eventually("the output is silent", || r.stats.volume() == 0.0).await;
+        r.stats.mixer_volume(0.3);
+        until_state(&mut r, |s| !s.muted && s.volume == 0.3).await;
+        assert_eq!(r.stats.volume_sets(), 3);
+    }
+
+    #[tokio::test]
+    async fn mute_survives_a_restart() {
+        let (writer, saves) = recorder();
+        let r = rig(Setup {
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Volume(0.4)).await;
+        r.send(EngineCmd::Mute(true)).await;
+        eventually("a muted save", || {
+            saves
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|s| s.muted && s.volume == 0.4)
+        })
+        .await;
+        let saved = saves.lock().unwrap().last().cloned().unwrap();
+        // A new engine from that save: still silent, with the volume kept for unmuting.
+        let r = rig(Setup {
+            saved: Some(saved),
+            ..Setup::default()
+        })
+        .await;
+        let s = r.status().await;
+        assert!(s.muted);
+        assert_eq!(s.volume, 0.4);
+        eventually("the output is silent", || r.stats.volume() == 0.0).await;
+        r.send(EngineCmd::Mute(false)).await;
+        eventually("the volume is back", || r.stats.volume() == 0.4).await;
+        assert!(!r.status().await.muted);
     }
 }

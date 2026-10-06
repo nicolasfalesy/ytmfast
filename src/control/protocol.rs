@@ -11,7 +11,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::browse::{Endpoint, id_ok, token_ok};
+use crate::browse::{Endpoint, LikeStatus, id_ok, token_ok};
 use crate::engine::{EngineEvent, PlayState, QueueView, Status};
 use crate::innertube::{MoreKind, SongItem, check_query};
 use crate::queue::{AddAt, QueueItem, Repeat};
@@ -101,6 +101,17 @@ pub enum Request {
     Repeat {
         mode: Repeat,
     },
+    /// Sets a song's like status: `video_id`'s, else the song playing (`EngineCmd::Like`).
+    /// Answered once YouTube took it, from a task of its own like the browsing commands, to
+    /// the asking client only.
+    Like {
+        status: LikeStatus,
+        video_id: Option<String>,
+    },
+    /// Silences the output, keeping the volume for unmuting (`EngineCmd::Mute`).
+    Mute {
+        on: bool,
+    },
     Quit,
 }
 
@@ -185,6 +196,14 @@ impl Request {
             }
             Request::Shuffle { on } => ("shuffle", Some(json!({ "on": on }))),
             Request::Repeat { mode } => ("repeat", Some(json!({ "mode": repeat_name(*mode) }))),
+            Request::Like { status, video_id } => {
+                let mut args = json!({ "status": status });
+                if let Some(v) = video_id {
+                    args["videoId"] = json!(v);
+                }
+                ("like", Some(args))
+            }
+            Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -210,6 +229,7 @@ const BROWSE_ID_RULE: &str = "browseId must be 2 to 128 characters of A-Z, a-z, 
 const PARAMS_RULE: &str =
     "params must be up to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
 const TOKEN_RULE: &str = "token must be 1 to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
+const LIKE_STATUS_RULE: &str = "status must be \"like\", \"dislike\" or \"none\"";
 const QUERY_RULE: &str = "query must be text of 1 to 200 characters with no control characters";
 const ENDPOINT_RULE: &str = "endpoint must be a row's play: {\"watchEndpoint\": {videoId, playlistId, index, params}} or {\"watchPlaylistEndpoint\": {playlistId, params}}";
 /// An endpoint's ids follow the browse rule (`browse::id_ok`, as rows are cleaned with), not
@@ -385,6 +405,25 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 Some("one") => Repeat::One,
                 _ => return Err("mode must be \"off\", \"all\" or \"one\""),
             },
+        },
+        "like" => Request::Like {
+            status: match field(args, "status").and_then(Value::as_str) {
+                Some("like") => LikeStatus::Like,
+                Some("dislike") => LikeStatus::Dislike,
+                Some("none") => LikeStatus::Indifferent,
+                _ => return Err(LIKE_STATUS_RULE),
+            },
+            video_id: match field(args, "videoId") {
+                None => None,
+                Some(Value::String(s)) if is_video_id(s) => Some(s.clone()),
+                Some(_) => return Err(VIDEO_ID_RULE),
+            },
+        },
+        "mute" => Request::Mute {
+            on: args
+                .get("on")
+                .and_then(Value::as_bool)
+                .ok_or("on must be true or false")?,
         },
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
@@ -643,11 +682,15 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
         json!(meta.and_then(|m| m.thumbnail.as_ref())),
     );
     m.insert("position".into(), json!(seconds(status.position)));
+    // While muted, the volume unmuting goes back to: a slider keeps its place.
     m.insert("volume".into(), volume_to_percent(status.volume));
+    m.insert("muted".into(), json!(status.muted));
     m.insert("album".into(), json!(status.album));
     m.insert("queueId".into(), json!(status.queue_id));
     m.insert("shuffle".into(), json!(status.shuffle));
     m.insert("repeat".into(), json!(repeat_name(status.repeat)));
+    // "like", "dislike", "none", or null until known.
+    m.insert("liked".into(), json!(status.liked));
     m
 }
 
@@ -880,6 +923,20 @@ mod tests {
             Request::Repeat { mode: Repeat::Off },
             Request::Repeat { mode: Repeat::All },
             Request::Repeat { mode: Repeat::One },
+            Request::Like {
+                status: LikeStatus::Like,
+                video_id: None,
+            },
+            Request::Like {
+                status: LikeStatus::Dislike,
+                video_id: Some("dQw4w9WgXcQ".into()),
+            },
+            Request::Like {
+                status: LikeStatus::Indifferent,
+                video_id: None,
+            },
+            Request::Mute { on: true },
+            Request::Mute { on: false },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {
@@ -945,6 +1002,78 @@ mod tests {
             r#"{"id":5,"cmd":"play","args":{"startSeconds":-2}}"#,
         ] {
             assert_eq!(bad(line).id, Some(5), "{line}");
+        }
+    }
+
+    #[test]
+    fn like_and_mute_parse_from_the_wire() {
+        assert_eq!(
+            parse(r#"{"id":1,"cmd":"like","args":{"status":"like"}}"#),
+            Ok((
+                1,
+                Request::Like {
+                    status: LikeStatus::Like,
+                    video_id: None
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":2,"cmd":"like","args":{"status":"none","videoId":"dQw4w9WgXcQ"}}"#),
+            Ok((
+                2,
+                Request::Like {
+                    status: LikeStatus::Indifferent,
+                    video_id: Some("dQw4w9WgXcQ".into())
+                }
+            ))
+        );
+        // A null videoId is none: the song playing.
+        assert_eq!(
+            parse(r#"{"id":3,"cmd":"like","args":{"status":"dislike","videoId":null}}"#),
+            Ok((
+                3,
+                Request::Like {
+                    status: LikeStatus::Dislike,
+                    video_id: None
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":4,"cmd":"mute","args":{"on":true}}"#),
+            Ok((4, Request::Mute { on: true }))
+        );
+        for (line, message) in [
+            (r#"{"id":5,"cmd":"like"}"#, LIKE_STATUS_RULE),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"LIKE"}}"#,
+                LIKE_STATUS_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"indifferent"}}"#,
+                LIKE_STATUS_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"like","videoId":"../etc"}}"#,
+                VIDEO_ID_RULE,
+            ),
+            (
+                r#"{"id":5,"cmd":"like","args":{"status":"like","videoId":5}}"#,
+                VIDEO_ID_RULE,
+            ),
+            (r#"{"id":5,"cmd":"mute"}"#, "on must be true or false"),
+            (
+                r#"{"id":5,"cmd":"mute","args":{"on":"yes"}}"#,
+                "on must be true or false",
+            ),
+        ] {
+            assert_eq!(
+                bad(line),
+                BadRequest {
+                    id: Some(5),
+                    message: message.into()
+                },
+                "{line}"
+            );
         }
     }
 
@@ -1298,8 +1427,10 @@ mod tests {
             queue_id: Some(7),
             position: 1.234_567,
             volume: 0.8,
+            muted: true,
             shuffle: true,
             repeat: Repeat::All,
+            liked: Some(LikeStatus::Dislike),
         };
         let v: Value =
             serde_json::from_str(&event_line(&EngineEvent::State(status.clone()))).unwrap();
@@ -1308,7 +1439,8 @@ mod tests {
             json!({"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ",
                    "title": "Song", "artist": "Artist", "lengthSeconds": 213,
                    "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80,
-                   "album": "Album", "queueId": 7, "shuffle": true, "repeat": "all"})
+                   "muted": true, "album": "Album", "queueId": 7, "shuffle": true,
+                   "repeat": "all", "liked": "dislike"})
         );
         // The status reply is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1323,15 +1455,30 @@ mod tests {
             queue_id: None,
             position: 0.0,
             volume: 1.0,
+            muted: false,
             shuffle: false,
             repeat: Repeat::Off,
+            liked: None,
         };
         assert_eq!(
             Value::Object(status_data(&empty)),
             json!({"state": "stopped", "videoId": null, "title": null, "artist": null,
                    "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100,
-                   "album": null, "queueId": null, "shuffle": false, "repeat": "off"})
+                   "muted": false, "album": null, "queueId": null, "shuffle": false,
+                   "repeat": "off", "liked": null})
         );
+        // Each like status by its socket name.
+        for (liked, name) in [
+            (LikeStatus::Like, "like"),
+            (LikeStatus::Dislike, "dislike"),
+            (LikeStatus::Indifferent, "none"),
+        ] {
+            let s = Status {
+                liked: Some(liked),
+                ..empty.clone()
+            };
+            assert_eq!(status_data(&s)["liked"], name);
+        }
 
         let v: Value = serde_json::from_str(&event_line(&EngineEvent::Position {
             seconds: 42.5,

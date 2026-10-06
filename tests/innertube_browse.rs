@@ -28,6 +28,9 @@ const SEARCH_SONGS: &str = include_str!("fixtures/browse/search_songs.json");
 const SEARCH_SONGS_CONT: &str = include_str!("fixtures/browse/search_songs_cont.json");
 const NEXT_FOR_LYRICS: &str = include_str!("fixtures/browse/next_song_for_lyrics.json");
 const LYRICS: &str = include_str!("fixtures/browse/browse_lyrics.json");
+const NEXT_LIKED: &str = include_str!("fixtures/browse/next_liked_song.json");
+/// The song the `next_liked_song` fixture is for (its like button's target).
+const LIKED_ID: &str = "fakeV000783";
 
 /// The lyrics page id the `next_song_for_lyrics` fixture's Lyrics tab points at.
 const LYRICS_ID: &str = "MPLYtfake000803";
@@ -295,6 +298,39 @@ async fn like_endpoints() {
             "{status}"
         );
     }
+}
+
+#[tokio::test]
+async fn like_status_is_one_next_for_the_song() {
+    let rig = rig().await;
+    endpoint("next", json_answer(NEXT_LIKED))
+        .mount(&rig.server)
+        .await;
+    assert_eq!(
+        rig.api.like_status(LIKED_ID).await,
+        Ok(Some(LikeStatus::Like))
+    );
+    // The answer's button is for another song: nothing known about this one.
+    assert_eq!(rig.api.like_status("fakeV000001").await, Ok(None));
+    let reqs = requests(&rig).await;
+    assert_eq!(reqs.len(), 2);
+    // The queue's own body for one song.
+    let body = web_remix(&reqs[0], "next");
+    assert_eq!(keys(&body), ["isAudioOnly", "videoId"]);
+    assert_eq!(body["videoId"], LIKED_ID);
+    assert_eq!(body["isAudioOnly"], true);
+
+    // A bad id is refused before anything is sent; a refused session is signed out.
+    assert!(matches!(
+        rig.api.like_status("../x").await,
+        Err(Error::BadRequest(_))
+    ));
+    assert_eq!(requests(&rig).await.len(), 2);
+    let out = self::rig().await;
+    endpoint("next", ResponseTemplate::new(401))
+        .mount(&out.server)
+        .await;
+    assert_eq!(out.api.like_status(LIKED_ID).await, Err(Error::SignedOut));
 }
 
 #[tokio::test]

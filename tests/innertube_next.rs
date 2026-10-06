@@ -13,6 +13,7 @@ use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ytmfast::auth::{Cookie, MemoryStore, Session, SessionStore};
+use ytmfast::browse::LikeStatus;
 use ytmfast::error::Error;
 use ytmfast::innertube::{Innertube, NextPage, NextRequest, clean_artist, clients};
 
@@ -292,6 +293,48 @@ async fn parses_liked_byline_variants() {
     let upload = by_id("fakeV000113");
     assert_eq!(upload.artists, ["Text 149"]);
     assert_eq!(upload.album, None);
+}
+
+#[tokio::test]
+async fn a_song_s_queue_carries_its_like_status() {
+    // A queue asked for with a song: the answer's like button is that song's (ruling P1).
+    let mut answer: Value = serde_json::from_str(&queue_answer(json!([song(
+        "fakeV000001",
+        json!([plain("Artist")])
+    )])))
+    .unwrap();
+    let button = |target: &str, status: &str| {
+        json!({"playerOverlayRenderer": {"actions": [{"likeButtonRenderer": {
+            "target": {"videoId": target}, "likeStatus": status
+        }}]}})
+    };
+    answer["playerOverlays"] = button("fakeV000001", "LIKE");
+    let radio = |id: &str| NextRequest {
+        video_id: Some(id.into()),
+        playlist_id: Some(format!("RDAMVM{id}")),
+        ..NextRequest::default()
+    };
+    let text = answer.to_string();
+    let page = next_from(&text, radio("fakeV000001")).await.unwrap();
+    assert_eq!(page.like, Some(LikeStatus::Like));
+    // A playlist or a continuation names no song: whatever its button says is not used.
+    assert_eq!(next_from(&text, playlist("LM")).await.unwrap().like, None);
+    // A button for another song says nothing about the one asked for.
+    assert_eq!(
+        next_from(&text, radio("fakeV000002")).await.unwrap().like,
+        None
+    );
+    // No button: unknown.
+    answer["playerOverlays"] = json!({});
+    let page = next_from(&answer.to_string(), radio("fakeV000001"))
+        .await
+        .unwrap();
+    assert_eq!(page.like, None);
+    answer["playerOverlays"] = button("fakeV000001", "DISLIKE");
+    let page = next_from(&answer.to_string(), radio("fakeV000001"))
+        .await
+        .unwrap();
+    assert_eq!(page.like, Some(LikeStatus::Dislike));
 }
 
 #[tokio::test]

@@ -1,9 +1,9 @@
-//! The browsing requests: `browse` (a page), `search`, a list's next page, like / dislike, and
-//! lyrics. All go out as the music web client (`clients::WEB_REMIX`) to music.youtube.com, the
-//! same as `next`, through the one posting path (`Innertube::post`): the session's cookies and
-//! SAPISIDHASH, `Set-Cookie` rotations kept, the host allowlist, the 32 MiB read cap and the
-//! fixed-text error mapping. The answers become `crate::browse`'s small shapes at once; no raw
-//! YouTube JSON leaves this module.
+//! The browsing requests: `browse` (a page), `search`, a list's next page, like / dislike (and
+//! a song's like status), and lyrics. All go out as the music web client (`clients::WEB_REMIX`)
+//! to music.youtube.com, the same as `next`, through the one posting path (`Innertube::post`):
+//! the session's cookies and SAPISIDHASH, `Set-Cookie` rotations kept, the host allowlist, the
+//! 32 MiB read cap and the fixed-text error mapping. The answers become `crate::browse`'s small
+//! shapes at once; no raw YouTube JSON leaves this module.
 //!
 //! Every input is checked for shape before anything is sent (`Error::BadRequest`): ids with
 //! `browse::id_ok` / `streams::is_video_id`, `params` and tokens with `browse::token_ok`, the
@@ -114,6 +114,23 @@ impl Innertube {
             .await
             .map(drop)
             .inspect_err(|e| log_failure(endpoint, e))
+    }
+
+    /// A song's like status: the song's `next` (the queue's own body for one song, as the app
+    /// asks it), read for its like button (`browse::parse_like_for`). `Ok(None)` when the
+    /// answer has no button for the song. For a song whose queue fetch didn't name it (ruling
+    /// P1). Errors as for `browse`.
+    pub async fn like_status(&self, video_id: &str) -> Result<Option<LikeStatus>, Error> {
+        check_video_id(video_id)?;
+        let body = request_body(
+            &clients::WEB_REMIX,
+            &NextRequest {
+                video_id: Some(video_id.to_owned()),
+                ..NextRequest::default()
+            },
+        );
+        let next = self.post_value("next", &body).await?;
+        Ok(browse::parse_like_for(&next, video_id))
     }
 
     /// A song's lyrics as YouTube Music shows them, `(text, source)`: two requests, the song's

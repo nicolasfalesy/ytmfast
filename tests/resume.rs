@@ -245,6 +245,12 @@ impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
         panic!("a queue was fetched before any play")
     }
+    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        std::future::pending().await
+    }
 }
 
 #[tokio::test(start_paused = true)]

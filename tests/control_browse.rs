@@ -144,8 +144,10 @@ fn status() -> Status {
         queue_id: None,
         position: 0.0,
         volume: 1.0,
+        muted: false,
         shuffle: false,
         repeat: Repeat::Off,
+        liked: None,
     }
 }
 
@@ -956,6 +958,12 @@ impl Resolver for Hang {
 #[async_trait]
 impl QueueSource for Hang {
     async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
+    }
+    async fn like_status(&self, _: &str) -> Result<Option<ytmfast::browse::LikeStatus>, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
         std::future::pending().await
     }
 }

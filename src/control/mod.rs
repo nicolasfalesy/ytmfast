@@ -8,9 +8,10 @@
 //!   writer task fed through a bounded queue. A client whose queue fills (it stopped
 //!   reading) is dropped: nothing here ever waits on a client, so a stuck widget can't hold
 //!   up the engine or the other widgets.
-//! - A browsing request (`browse`, `search`, `more`, `playPage`) runs in a task of the
-//!   client's own, so a page that takes a while never holds up that client's other requests,
-//!   and its answer goes back to that client alone. At most `MAX_BROWSING` at once per client.
+//! - A browsing request (`browse`, `search`, `more`, `playPage`), and a `like`, runs in a task
+//!   of the client's own, so a request that waits on YouTube never holds up that client's
+//!   other requests, and its answer goes back to that client alone. At most `MAX_BROWSING` at
+//!   once per client.
 //!
 //! The listening socket comes from systemd (socket activation) when it passed one, else the
 //! daemon binds `$XDG_RUNTIME_DIR/ytmfast/socket` itself.
@@ -553,8 +554,8 @@ enum Handled {
     Reply(String),
     /// `quit`'s reply; the client closes once it is out, then the daemon quits.
     Quit(String),
-    /// A browsing request, answered from a task of its own (`answer`). For `playPage`, the
-    /// engine's play epoch when it came in (ruling P7).
+    /// A browsing request (or a `like`), answered from a task of its own (`answer`). For
+    /// `playPage`, the engine's play epoch when it came in (ruling P7).
     Browse(u64, Request, Option<u64>),
 }
 
@@ -596,7 +597,12 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
                 Err(_) => Handled::Reply(gone()),
             };
         }
-        request @ (Request::Browse { .. } | Request::Search { .. } | Request::More { .. }) => {
+        // A like waits on YouTube (the engine sends it from a task of its own): answered like
+        // a browse, so this client's other requests go on meanwhile.
+        request @ (Request::Browse { .. }
+        | Request::Search { .. }
+        | Request::More { .. }
+        | Request::Like { .. }) => {
             return Handled::Browse(id, request, None);
         }
         Request::Play {
@@ -650,6 +656,7 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
         Request::QueueMove { id, index } => EngineCmd::QueueMove { id, index },
         Request::Shuffle { on } => EngineCmd::Shuffle(on),
         Request::Repeat { mode } => EngineCmd::Repeat(mode),
+        Request::Mute { on } => EngineCmd::Mute(on),
     };
     // "ok" means the engine took the command; what came of it arrives as events.
     Handled::Reply(match shared.cmds.send(cmd).await {
@@ -668,6 +675,10 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
 /// (`epoch`): when the user picked something else to play while the page loaded, the page's
 /// play is dropped and the reply says `{"superseded": true}` (ruling P7).
 async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u64>) -> String {
+    // Through the engine, which knows the song playing and keeps its like status.
+    if let Request::Like { status, video_id } = request {
+        return like(&shared.cmds, id, status, video_id).await;
+    }
     let Some(browser) = shared.browser.clone() else {
         return protocol::error_reply(Some(id), "unavailable", "browsing is not available");
     };
@@ -713,6 +724,31 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
         ),
         Ok(line) => line,
         Err(e) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
+    }
+}
+
+/// A like's reply line: ok once YouTube took it. A failure is the asker's alone, with its code
+/// and fixed text, as for browsing; the engine never broadcasts it either.
+async fn like(
+    cmds: &mpsc::Sender<EngineCmd>,
+    id: u64,
+    status: browse::LikeStatus,
+    video_id: Option<String>,
+) -> String {
+    let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
+    let (reply, answer) = oneshot::channel();
+    let cmd = EngineCmd::Like {
+        video_id,
+        status,
+        reply,
+    };
+    if cmds.send(cmd).await.is_err() {
+        return gone();
+    }
+    match answer.await {
+        Ok(Ok(())) => protocol::ok_reply(id, json!({})),
+        Ok(Err(e)) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
+        Err(_) => gone(),
     }
 }
 

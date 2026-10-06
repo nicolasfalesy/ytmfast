@@ -4,8 +4,8 @@
 
 use serde_json::{Value, json};
 use ytmfast::browse::{
-    Endpoint, LikeStatus, parse_browse, parse_like_status, parse_lyrics, parse_lyrics_tab,
-    parse_more, parse_search,
+    Endpoint, LikeStatus, parse_browse, parse_like_for, parse_like_status, parse_lyrics,
+    parse_lyrics_tab, parse_more, parse_search,
 };
 
 fn fixture(name: &str) -> Value {
@@ -649,6 +649,33 @@ fn like_status_from_next_answer() {
         ]),
         json!(["like", "dislike", "none"])
     );
+}
+
+#[test]
+fn like_status_for_one_song() {
+    // The button names the song it is for: the status counts only for that song.
+    let liked = fixture("next_liked_song");
+    assert_eq!(
+        parse_like_for(&liked, "fakeV000783"),
+        Some(LikeStatus::Like)
+    );
+    assert_eq!(parse_like_for(&liked, "fakeV000790"), None);
+    assert_eq!(
+        parse_like_for(&fixture("next_not_liked_song"), "fakeV000790"),
+        Some(LikeStatus::Indifferent)
+    );
+    // A button that names no song is taken for the song asked about (the answer is for it).
+    let unnamed = json!({"playerOverlays": {"playerOverlayRenderer": {"actions": [
+        {"likeButtonRenderer": {"likeStatus": "DISLIKE"}}]}}});
+    assert_eq!(
+        parse_like_for(&unnamed, "abcdefghijk"),
+        Some(LikeStatus::Dislike)
+    );
+    // A target that is not a video id is no song at all.
+    let odd = json!({"playerOverlays": {"playerOverlayRenderer": {"actions": [
+        {"likeButtonRenderer": {"likeStatus": "LIKE", "target": {"videoId": "../x"}}}]}}});
+    assert_eq!(parse_like_for(&odd, "../x"), None);
+    assert_eq!(parse_like_for(&json!({}), "abcdefghijk"), None);
 }
 
 #[test]

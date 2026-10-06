@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::player::{RawText, RawThumbnails, widest_thumbnail};
 use super::{Innertube, clients};
+use crate::browse::{self, LikeStatus};
 use crate::error::Error;
 use crate::streams::is_video_id;
 
@@ -39,6 +40,12 @@ pub struct NextPage {
     pub continuation: Option<String>,
     /// The queue's own playlist id (`playlistPanelRenderer.playlistId`).
     pub playlist_id: Option<String>,
+    /// The like status of the song the request named (`NextRequest::video_id`), from the
+    /// answer's like button: the queue fetch already makes this request, so the engine needs
+    /// no second one for that song (ruling P1). `None` when the request named no song (a
+    /// playlist or a continuation, whose answer may be about some other song) or the answer
+    /// has no button for it.
+    pub like: Option<LikeStatus>,
 }
 
 /// One song in a queue. Serializable because the queue is saved across restarts and sent to
@@ -74,7 +81,7 @@ impl Innertube {
         let client = &clients::WEB_REMIX;
         let body = request_body(client, &req);
         let answer = self.post(client, "next", &body).await?;
-        parse(&answer)
+        parse(&answer, req.video_id.as_deref())
     }
 }
 
@@ -125,6 +132,9 @@ struct Raw {
     contents: Option<RawContents>,
     /// Where a continuation page puts its queue.
     continuation_contents: Option<RawContinuationContents>,
+    /// The player's buttons, the like button among them. Kept raw (it is small) and read by
+    /// `browse::parse_like_for`, the one reader of a like button.
+    player_overlays: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -318,11 +328,18 @@ impl RawBylineRun {
 }
 
 /// Parses a `next` answer: a first page or a continuation page.
-fn parse(answer: &[u8]) -> Result<NextPage, Error> {
+/// `video_id` is the song the request named, if any: the answer's like button is read for it.
+fn parse(answer: &[u8], video_id: Option<&str>) -> Result<NextPage, Error> {
     // Fixed text: serde_json's message can quote part of the answer.
     let raw: Raw = serde_json::from_slice(answer)
         .map_err(|_| Error::Internal("the next answer could not be read".into()))?;
 
+    let like = match (video_id, raw.player_overlays) {
+        (Some(id), Some(overlays)) => {
+            browse::parse_like_for(&json!({ "playerOverlays": overlays }), id)
+        }
+        _ => None,
+    };
     // A continuation answer can also carry `contents` (the tab headers), so its own queue
     // is looked at first.
     let panel = raw
@@ -371,6 +388,7 @@ fn parse(answer: &[u8]) -> Result<NextPage, Error> {
         items,
         continuation,
         playlist_id: panel.playlist_id,
+        like,
     })
 }
 
