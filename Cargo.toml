@@ -67,11 +67,13 @@ tokio = { version = "1.53.2", features = ["net", "io-util", "rt", "macros", "tim
 # A local HTTP server standing in for the InnerTube API.
 wiremock = "0.6.5"
 
-# Measured on this tree (release, cores 12-15, see the polish report): 22.56 MB -> 14.57 MB
+# Measured on this tree (release, cores 12-15, see the polish report): 22.56 MB -> 16.66 MB
 # on disk, idle PSS 5.99 -> 4.79 MB, start-to-socket unchanged (about 1.5-1.9 ms).
 [profile.release]
-# Symbols only: a panic still prints its message, but a backtrace shows no function names.
-strip = true
+# Debug info only; the symbol table stays, so a core dump from systemd-coredump and a panic
+# backtrace still name ytmfast's functions (the user diagnoses crashes from cores).
+# `strip = true` would save 2.1 MB more on disk (14.57 MB) and nothing in memory or start.
+strip = "debuginfo"
 # Fat over thin: 1.06 MB smaller and 0.6 MB less idle PSS, for about a minute more per
 # release build (clean 206 s against 147 s, a one-file rebuild 129 s against 69 s, on battery).
 lto = "fat"
