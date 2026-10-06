@@ -53,6 +53,16 @@ const MAX_PLAYLIST_ID: usize = 256;
 /// A `next` continuation token: opaque, base64-like, a few hundred bytes in practice.
 const MAX_CONTINUATION: usize = 16 * 1024;
 
+/// A loaded song's text fields (title, album, each artist, its playlist id): real ones are
+/// tens of bytes. Each is sent to every widget on every queue change, so a hand-edited file
+/// must not be able to make them huge.
+const MAX_TEXT: usize = 4 * 1024;
+/// A loaded song's artists: real bylines name a handful.
+const MAX_ARTISTS: usize = 20;
+
+/// A second to resume at, for a song whose length isn't known: a day is past any song.
+const MAX_POSITION_UNKNOWN_LENGTH: f64 = 24.0 * 60.0 * 60.0;
+
 /// Where the queue came from. Saved so a resumed queue keeps the same refill behaviour.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -283,6 +293,8 @@ fn sanitize(mut s: Saved) -> Saved {
         && (length == 0 || s.position < f64::from(length));
     if moved || !fine {
         s.position = 0.0;
+    } else if length == 0 {
+        s.position = s.position.min(MAX_POSITION_UNKNOWN_LENGTH);
     }
     s.volume = if s.volume.is_finite() {
         s.volume.clamp(0.0, 1.0)
@@ -296,14 +308,39 @@ fn sanitize(mut s: Saved) -> Saved {
     s.continuation = s
         .continuation
         .filter(|c| token_ok(c, MAX_CONTINUATION, b"%=+/."));
+
+    // The same cap as a save (`Engine::saved`): an old or hand-written file can't restore a
+    // queue the engine would never have saved (tens of thousands of songs fit under the read
+    // cap), which would then go to every widget on every queue change.
+    let range = window(s.queue.len(), s.current_index, MAX_ITEMS);
+    if range.len() < s.queue.len() {
+        s.queue.truncate(range.end);
+        s.queue.drain(..range.start);
+        s.current_index -= range.start;
+        s.original_order = s.original_order.map(|order| {
+            order
+                .into_iter()
+                .filter(|p| range.contains(p))
+                .map(|p| p - range.start)
+                .collect()
+        });
+    }
     s
 }
 
 /// A song as `next` would have let it through: a real video id, and a thumbnail (if any) on
 /// an allowed https host. The id goes into links and yt-dlp arguments, the thumbnail to the
-/// bar widgets, which load it.
+/// bar widgets, which load it. Text fields over `MAX_TEXT` (or over `MAX_ARTISTS` artists)
+/// drop the whole song, like a bad id: only a hand-edited file has them, and a song with a
+/// trimmed title would be a different song.
 fn song_ok(song: &SongItem) -> bool {
+    let text_ok = |t: &str| t.len() <= MAX_TEXT;
     is_video_id(&song.video_id)
+        && text_ok(&song.title)
+        && song.album.as_deref().is_none_or(text_ok)
+        && song.playlist_id.as_deref().is_none_or(text_ok)
+        && song.artists.len() <= MAX_ARTISTS
+        && song.artists.iter().all(|a| text_ok(a))
         && song
             .thumbnail
             .as_deref()
@@ -571,6 +608,26 @@ mod tests {
         assert_eq!(got.position, 42.5, "and keeps its second");
         // E, C, A in the old original order, as positions in the new queue.
         assert_eq!(got.original_order, Some(vec![2, 1, 0]));
+        // Over-long text, or too many artists, drops the song; long but sane is kept.
+        let mut s = saved_of("ABCD", 0);
+        s.queue[1].title = "t".repeat(MAX_TEXT + 1);
+        s.queue[2].artists = vec!["a".into(); MAX_ARTISTS + 1];
+        s.queue[3].album = Some("b".repeat(MAX_TEXT + 1));
+        s.queue[0].title = "t".repeat(MAX_TEXT);
+        s.queue[0].artists = vec!["a".repeat(MAX_TEXT); MAX_ARTISTS];
+        save(dir.path(), &s).unwrap();
+        let ids: Vec<String> = load(dir.path())
+            .unwrap()
+            .queue
+            .iter()
+            .map(|i| i.video_id.clone())
+            .collect();
+        assert_eq!(ids, [vid('A')]);
+        let mut s = saved_of("AB", 0);
+        s.queue[1].artists[0] = "a".repeat(MAX_TEXT + 1);
+        s.queue[0].playlist_id = Some("p".repeat(MAX_TEXT + 1));
+        save(dir.path(), &s).unwrap();
+        assert!(load(dir.path()).unwrap().queue.is_empty());
         // A song with no thumbnail at all is fine.
         let mut s = saved_of("A", 0);
         s.queue[0].thumbnail = None;
@@ -631,6 +688,38 @@ mod tests {
         s.original_order = Some(vec![1, 0]);
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()).unwrap().original_order, None);
+
+        // An old or hand-written file over the cap: 500 songs around the current one, the
+        // shuffled positions kept in step.
+        let mut s = Saved {
+            queue: (0..600).map(|i| song(&format!("{i:0>11}"))).collect(),
+            current_index: 550,
+            shuffle: true,
+            original_order: Some((0..600).rev().collect()),
+            ..saved_of("", 0)
+        };
+        s.position = 10.0;
+        save(dir.path(), &s).unwrap();
+        let got = load(dir.path()).unwrap();
+        assert_eq!(got.queue.len(), MAX_ITEMS);
+        assert_eq!(got.queue[0].video_id, format!("{:0>11}", 100));
+        assert_eq!(got.current_index, 450);
+        assert_eq!(
+            got.queue[got.current_index].video_id,
+            format!("{:0>11}", 550)
+        );
+        assert_eq!(got.position, 10.0);
+        assert_eq!(got.original_order, Some((0..500).rev().collect()));
+
+        // A song of unknown length: any second up to a day.
+        let mut s = saved_of("A", 0);
+        s.queue[0].length_seconds = 0;
+        s.position = 1e9;
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).unwrap().position, 86_400.0);
+        s.position = 5000.0;
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).unwrap().position, 5000.0);
 
         // NaN can't be written as JSON; a hand-edited huge number is clamped the same way.
         let mut v = serde_json::to_value(saved_of("A", 0)).unwrap();
