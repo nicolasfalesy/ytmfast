@@ -174,6 +174,36 @@ fn seek_lands_on_the_target() {
 }
 
 #[test]
+fn seek_after_the_end() {
+    // A seek once every frame was decoded: the user seeks back in a song's last moments, or
+    // in the gapless handover window, when its decoder has already run out.
+    for (name, mime) in [
+        ("sine440_48k.webm", OPUS_MIME),
+        ("sine440_44k.m4a", AAC_MIME),
+    ] {
+        let mut fresh = Decoder::open(fixture(name), mime).unwrap();
+        let want_at = fresh.seek(0.5).unwrap();
+        let want = decode_all(&mut fresh);
+        let mut dec = Decoder::open(fixture(name), mime).unwrap();
+        decode_all(&mut dec);
+        assert!(dec.next_frames().unwrap().is_none());
+        let at = dec.seek(0.5).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Exactly where, and exactly what, a decoder that never reached the end gives.
+        assert_eq!(at, want_at, "{name}");
+        let got = decode_all(&mut dec);
+        assert_eq!(got.len(), want.len(), "{name}: as many frames after");
+        // Opus is bit for bit the same; symphonia's AAC decoder keeps a trace of what it
+        // decoded before through its reset (under -65 dB, as after any seek).
+        let diff = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-3, "{name}: off by {diff}");
+    }
+}
+
+#[test]
 fn wrong_mime_is_refused() {
     let err = Decoder::open(fixture("sine440_48k.webm"), "video/mp4; codecs=\"avc1\"")
         .err()

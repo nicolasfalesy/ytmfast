@@ -13,11 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use url::Url;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ytmfast::auth::{Cookie, MemoryStore, Session};
 use ytmfast::error::Error;
 use ytmfast::innertube::{AudioFormat, Innertube};
+use ytmfast::report::ReportApi;
 use ytmfast::solver::{Answers, ChallengeKind, ChallengeSolver};
 use ytmfast::streams::ytdlp::{YtDlp, YtDlpCommand};
 use ytmfast::streams::{Resolver, Streams, pick_format};
@@ -470,6 +471,88 @@ async fn sts_reaches_the_player_request() {
     );
 }
 
+/// The music web client's `player` answer (the play reports' links), on the test server.
+async fn mount_tracking(server: &MockServer) {
+    let answer = json!({
+        "responseContext": {"visitorData": "CgtGYWtl"},
+        "playbackTracking": {"videostatsPlaybackUrl":
+            {"baseUrl": format!("{}/api/stats/playback?docid={VIDEO}", server.uri())}}
+    });
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/player"))
+        .and(header("x-youtube-client-name", "67"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        // Before the TV answer, which matches any `player` request.
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+fn script_fetches(requests: &[wiremock::Request]) -> (usize, usize) {
+    let count = |p: &str| {
+        requests
+            .iter()
+            .filter(|q| q.url.path().ends_with(p))
+            .count()
+    };
+    (count("/iframe_api"), count("/base.js"))
+}
+
+#[tokio::test]
+async fn tracking_reuses_the_resolves_player_script() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    mount_tracking(&r.server).await;
+    r.streams.resolve(VIDEO).await.unwrap();
+    let t = r.streams.tracking(VIDEO).await.unwrap();
+    assert_eq!(t.visitor_data.as_deref(), Some("CgtGYWtl"));
+    let requests = r.server.received_requests().await.unwrap();
+    // The player version and script were fetched once, by the resolve: the report reused
+    // its timestamp.
+    assert_eq!(script_fetches(&requests), (1, 1));
+    let music = requests
+        .iter()
+        .filter(|q| {
+            q.headers
+                .get("x-youtube-client-name")
+                .is_some_and(|v| v == "67")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(music.len(), 1);
+    let body: Value = serde_json::from_slice(&music[0].body).unwrap();
+    assert_eq!(body["context"]["client"]["clientName"], "WEB_REMIX");
+    assert_eq!(
+        body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"],
+        20725
+    );
+}
+
+#[tokio::test]
+async fn tracking_without_a_resolve_reads_the_cached_script() {
+    // A restarted engine (no remembered version): the script comes from the disk cache that
+    // an earlier resolve filled, so only the small version check goes out.
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    mount_tracking(&r.server).await;
+    r.streams.resolve(VIDEO).await.unwrap();
+    let restarted = r.restart();
+    restarted.tracking(VIDEO).await.unwrap();
+    let requests = r.server.received_requests().await.unwrap();
+    assert_eq!(script_fetches(&requests), (2, 1));
+    // A bad id is refused before any request.
+    assert!(restarted.tracking("../x").await.is_err());
+}
+
 #[tokio::test]
 async fn off_allowlist_cipher_url_is_refused() {
     let cipher = format!(
@@ -503,29 +586,6 @@ async fn odd_signature_param_is_refused() {
         "stream_failed"
     );
     assert!(r.solver.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn no_audio_format_is_unavailable() {
-    let mut a = answer(json!({}));
-    a["streamingData"]["adaptiveFormats"] = json!([]);
-    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
-    assert_eq!(
-        r.streams.resolve(VIDEO).await,
-        Err(Error::Unavailable("no audio format".into()))
-    );
-    // The song itself is the problem: yt-dlp isn't asked.
-    assert_eq!(r.ytdlp.calls(), 0);
-}
-
-#[tokio::test]
-async fn unplayable_is_unavailable() {
-    let a = json!({"playabilityStatus": {"status": "UNPLAYABLE", "reason": "Not in your country"}});
-    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
-    assert_eq!(
-        r.streams.resolve(VIDEO).await,
-        Err(Error::Unavailable("Not in your country".into()))
-    );
 }
 
 #[tokio::test]
@@ -643,17 +703,20 @@ async fn ytdlp_answer_is_checked() {
     }
 }
 
-// ---- what never falls back --------------------------------------------------------------
+// ---- what falls back, and what never does ----------------------------------------------
+
+/// A plain sign-in refusal: no bot check in its reason.
+fn signed_out_answer() -> Value {
+    json!({"playabilityStatus": {"status": "LOGIN_REQUIRED", "reason": "Please sign in"}})
+}
 
 #[tokio::test]
-async fn signed_out_never_falls_back_to_ytdlp() {
+async fn signed_out_still_never_falls_back() {
     // YouTube refused the session. yt-dlp would usually still get an anonymous, lower-quality
     // link a few seconds later, and the widget would never learn the user must sign in again.
     let expire = now() + 6 * 3600;
-    let login_required: Value =
-        serde_json::from_str(include_str!("fixtures/player_login_required.json")).unwrap();
     let r = rig(
-        Some(login_required),
+        Some(signed_out_answer()),
         FakeSolver::mapping(&[]),
         FakeYtDlp::answering(fallback_answer(expire)),
     )
@@ -668,20 +731,98 @@ async fn signed_out_never_falls_back_to_ytdlp() {
 }
 
 #[tokio::test]
-async fn unavailable_never_falls_back_to_ytdlp() {
+async fn bot_check_is_not_signed_out() {
+    // "Sign in to confirm you're not a bot" comes with LOGIN_REQUIRED, but the session is
+    // fine: it is a check on this client and address, which yt-dlp's clients may get past.
     let expire = now() + 6 * 3600;
-    let a = json!({"playabilityStatus": {"status": "UNPLAYABLE", "reason": "Not in your country"}});
+    let bot_check: Value =
+        serde_json::from_str(include_str!("fixtures/player_login_required.json")).unwrap();
     let r = rig(
-        Some(a),
+        Some(bot_check.clone()),
         FakeSolver::mapping(&[]),
         FakeYtDlp::answering(fallback_answer(expire)),
     )
     .await;
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.ytdlp.calls(), 1);
+
+    // When yt-dlp fails too, the own error is reported: stream_failed, never signed_out.
+    let r = rig(
+        Some(bot_check),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    let e = r.streams.resolve(VIDEO).await.unwrap_err();
+    assert_eq!(e.code(), "stream_failed", "{e}");
+    assert_eq!(r.ytdlp.calls(), 1);
+}
+
+#[tokio::test]
+async fn tv_only_refusal_falls_back_to_ytdlp() {
+    // The TV client refuses songs other clients play (it is the one client asked); yt-dlp
+    // asks others.
+    let expire = now() + 6 * 3600;
+    let a = json!({"playabilityStatus": {"status": "UNPLAYABLE", "reason": "Not in your country"}});
+    let r = rig(
+        Some(a.clone()),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.ytdlp.calls(), 1);
+
+    // Both refuse: YouTube's reason is what the user sees.
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
     assert_eq!(
         r.streams.resolve(VIDEO).await,
-        Err(Error::Unavailable("Not in your country".into()))
+        Err(Error::StreamFailed("Not in your country".into()))
     );
-    assert_eq!(r.ytdlp.calls(), 0);
+    assert_eq!(r.ytdlp.calls(), 1);
+}
+
+#[tokio::test]
+async fn no_audio_format_falls_back_to_ytdlp() {
+    let expire = now() + 6 * 3600;
+    let mut a = answer(json!({}));
+    a["streamingData"]["adaptiveFormats"] = json!([]);
+    let r = rig(
+        Some(a.clone()),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.ytdlp.calls(), 1);
+
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    assert_eq!(
+        r.streams.resolve(VIDEO).await,
+        Err(Error::StreamFailed("no audio format".into()))
+    );
+}
+
+#[tokio::test]
+async fn different_video_answer_falls_back_to_ytdlp() {
+    // YouTube sometimes answers with another video's data, a rare transient: yt-dlp asks again.
+    let expire = now() + 6 * 3600;
+    let mut a = answer(url_format(&stream_url(expire, "")));
+    a["videoDetails"]["videoId"] = json!("otherid0000");
+    let r = rig(
+        Some(a.clone()),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    assert_eq!(r.streams.resolve(VIDEO).await.unwrap().itag, 251);
+    assert_eq!(r.ytdlp.calls(), 1);
+
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    assert_eq!(
+        r.streams.resolve(VIDEO).await.unwrap_err().code(),
+        "stream_failed"
+    );
 }
 
 #[tokio::test]

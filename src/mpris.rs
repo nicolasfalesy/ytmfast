@@ -5,9 +5,10 @@
 //! - Method calls and property sets become `EngineCmd`s on the engine's channel, and count
 //!   as activity for the daemon's idle clock through the control hub (ruling R21). `Quit`
 //!   takes the socket's quit path, through the hub too.
-//! - One follower task keeps a copy of the engine's `Status` from its events and announces
-//!   what changed in one `PropertiesChanged` signal. Property reads answer from that copy, so
-//!   a widget polling `Position` never reaches the engine.
+//! - One follower task keeps a copy of the engine's `Status` and queue from its events and
+//!   announces what changed in one `PropertiesChanged` signal, and every seek's landing (from
+//!   any front end) as `Seeked`. Property reads answer from that copy, so a widget polling
+//!   `Position` never reaches the engine.
 //!
 //! Built on zbus directly (it is already in the tree through the keyring client) rather than
 //! the `mpris-server` crate: that crate only connects through the process-wide session-bus
@@ -27,8 +28,9 @@ use zbus::zvariant::{ObjectPath, Value};
 use zbus::{Connection, fdo, interface};
 
 use crate::control::Hub;
-use crate::engine::{EngineCmd, EngineEvent, PlayState, Status};
+use crate::engine::{EngineCmd, EngineEvent, PlayState, QueueView, Status};
 use crate::error::Error;
+use crate::queue::Repeat;
 
 /// The well-known name (Global Constraints).
 pub const BUS_NAME: &str = "org.mpris.MediaPlayer2.ytmfast";
@@ -74,6 +76,13 @@ impl Drop for Mpris {
     }
 }
 
+/// The follower's copy of the engine: what every property read answers from.
+#[derive(Debug, Clone)]
+struct View {
+    status: Status,
+    queue: QueueView,
+}
+
 /// Starts MPRIS on `bus`: takes the engine's current status, registers the two interfaces
 /// and the well-known name, and starts following `events`. Fails when the bus can't be
 /// reached or the name is taken (another ytmfast is running).
@@ -83,10 +92,10 @@ pub async fn serve(
     mut events: broadcast::Receiver<EngineEvent>,
     hub: Hub,
 ) -> Result<Mpris, Error> {
-    let status = fresh_status(&mut events, &cmds)
+    let view = fresh_view(&mut events, &cmds)
         .await
         .ok_or_else(|| Error::Internal("the engine stopped".into()))?;
-    let state = Arc::new(Mutex::new(status));
+    let state = Arc::new(Mutex::new(view));
     let player = Player {
         state: state.clone(),
         cmds: cmds.clone(),
@@ -152,17 +161,21 @@ fn bus_error(e: zbus::Error) -> Error {
     }
 }
 
-/// The engine's status, with every event already waiting dropped first: those are older
-/// than the answer, and applied after it they would roll the copy back.
-async fn fresh_status(
+/// The engine's status and queue, with every event already waiting dropped first: those
+/// are older than the answers, and applied after them they would roll the copy back.
+async fn fresh_view(
     events: &mut broadcast::Receiver<EngineEvent>,
     cmds: &mpsc::Sender<EngineCmd>,
-) -> Option<Status> {
+) -> Option<View> {
     while !matches!(
         events.try_recv(),
         Err(TryRecvError::Empty | TryRecvError::Closed)
     ) {}
-    query_status(cmds).await
+    let status = query_status(cmds).await?;
+    let (tx, rx) = oneshot::channel();
+    cmds.send(EngineCmd::QueueGet(tx)).await.ok()?;
+    let queue = rx.await.ok()?;
+    Some(View { status, queue })
 }
 
 async fn query_status(cmds: &mpsc::Sender<EngineCmd>) -> Option<Status> {
@@ -171,34 +184,56 @@ async fn query_status(cmds: &mpsc::Sender<EngineCmd>) -> Option<Status> {
     rx.await.ok()
 }
 
-/// Keeps the status copy in step with the engine, and announces changes.
+/// Keeps the copy in step with the engine, and announces changes.
 async fn follow(
     connection: Connection,
-    state: Arc<Mutex<Status>>,
+    state: Arc<Mutex<View>>,
     cmds: mpsc::Sender<EngineCmd>,
     mut events: broadcast::Receiver<EngineEvent>,
 ) {
     loop {
-        let status = match events.recv().await {
-            Ok(EngineEvent::State(s)) => s,
+        let update = match events.recv().await {
+            Ok(EngineEvent::State(s)) => Update::Status(s),
+            Ok(EngineEvent::Queue {
+                items,
+                current_id,
+                shuffle,
+                repeat,
+            }) => Update::Queue(QueueView {
+                items,
+                current_id,
+                shuffle,
+                repeat,
+            }),
             // Read on demand only: the spec says Position never comes as PropertiesChanged
-            // (clients count from the last read or `Seeked`).
-            Ok(EngineEvent::Position { seconds }) => {
-                lock(&state).position = seconds;
+            // (clients count from the last read or `Seeked`). A seek's own event is a jump
+            // they can't count to, wherever the seek came from (a socket client too), so it
+            // is announced; a tick never is.
+            Ok(EngineEvent::Position { seconds, seeked }) => {
+                lock(&state).status.position = seconds;
+                if seeked && let Ok(emitter) = SignalEmitter::new(&connection, OBJECT_PATH) {
+                    let _ = Player::seeked(&emitter, micros(seconds)).await;
+                }
                 continue;
             }
             Ok(EngineEvent::Error { .. }) => continue,
-            // Missed some events: ask for the whole state again (Task 8 carry).
-            Err(RecvError::Lagged(_)) => match fresh_status(&mut events, &cmds).await {
-                Some(s) => s,
+            // Missed some events: ask for the whole state and queue again.
+            Err(RecvError::Lagged(_)) => match fresh_view(&mut events, &cmds).await {
+                Some(v) => Update::All(v),
                 None => return,
             },
             Err(RecvError::Closed) => return,
         };
         let changed = {
             let mut current = lock(&state);
-            let changed = changes(&current, &status);
-            *current = status;
+            let mut next = current.clone();
+            match update {
+                Update::Status(s) => next.status = s,
+                Update::Queue(q) => next.queue = q,
+                Update::All(v) => next = v,
+            }
+            let changed = changes(&current, &next);
+            *current = next;
             changed
         };
         if changed.is_empty() {
@@ -217,24 +252,75 @@ async fn follow(
     }
 }
 
-/// The player properties that differ between two statuses, with their new values. All in
-/// one map, so a new song is one signal rather than one per property.
-fn changes(old: &Status, new: &Status) -> HashMap<&'static str, Value<'static>> {
+/// What one engine event changes in the copy.
+enum Update {
+    Status(Status),
+    Queue(QueueView),
+    /// After a lag: both, fresh.
+    All(View),
+}
+
+/// The player properties that differ between two views, with their new values. All in one
+/// map, so a new song is one signal rather than one per property.
+fn changes(old: &View, new: &View) -> HashMap<&'static str, Value<'static>> {
+    let (o, n) = (&old.status, &new.status);
     let mut changed = HashMap::new();
-    if playback_status(old.state) != playback_status(new.state) {
-        changed.insert("PlaybackStatus", Value::from(playback_status(new.state)));
+    if playback_status(o.state) != playback_status(n.state) {
+        changed.insert("PlaybackStatus", Value::from(playback_status(n.state)));
     }
-    if old.video_id != new.video_id || old.meta != new.meta {
-        changed.insert("Metadata", Value::from(metadata(new)));
+    if o.video_id != n.video_id || o.meta != n.meta || o.album != n.album {
+        changed.insert("Metadata", Value::from(metadata(n)));
     }
-    if old.volume != new.volume {
-        changed.insert("Volume", Value::from(f64::from(new.volume)));
+    if o.volume != n.volume {
+        changed.insert("Volume", Value::from(f64::from(n.volume)));
+    }
+    if o.shuffle != n.shuffle {
+        changed.insert("Shuffle", Value::from(n.shuffle));
+    }
+    if o.repeat != n.repeat {
+        changed.insert("LoopStatus", Value::from(loop_status(n.repeat)));
+    }
+    let (old_next, old_prev) = can_go(&old.queue);
+    let (new_next, new_prev) = can_go(&new.queue);
+    if old_next != new_next {
+        changed.insert("CanGoNext", Value::from(new_next));
+    }
+    if old_prev != new_prev {
+        changed.insert("CanGoPrevious", Value::from(new_prev));
     }
     changed
 }
 
-fn lock(state: &Mutex<Status>) -> std::sync::MutexGuard<'_, Status> {
-    // A panic while holding it can only have left a whole Status behind (every write is one
+/// Whether Next and Previous have somewhere to go: a song after (or before) the current one
+/// in play order, or Repeat All, which wraps. Repeat One doesn't count: a skip still moves
+/// on (it only repeats a song that ends by itself). Songs with none current: Next starts the
+/// first one. Previous on the first song would only restart it, which the spec's "no
+/// previous track" covers.
+pub fn can_go(queue: &QueueView) -> (bool, bool) {
+    if queue.items.is_empty() {
+        return (false, false);
+    }
+    let Some(at) = queue
+        .current_id
+        .and_then(|id| queue.items.iter().position(|i| i.id == id))
+    else {
+        return (true, false);
+    };
+    let wraps = queue.repeat == Repeat::All;
+    (wraps || at + 1 < queue.items.len(), wraps || at > 0)
+}
+
+/// MPRIS's names for the repeat modes.
+pub fn loop_status(repeat: Repeat) -> &'static str {
+    match repeat {
+        Repeat::Off => "None",
+        Repeat::One => "Track",
+        Repeat::All => "Playlist",
+    }
+}
+
+fn lock(state: &Mutex<View>) -> std::sync::MutexGuard<'_, View> {
+    // A panic while holding it can only have left a whole View behind (every write is one
     // assignment), so a poisoned lock is still safe to use.
     state.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -293,9 +379,13 @@ fn metadata(status: &Status) -> HashMap<String, Value<'static>> {
                 Value::from(i64::from(meta.length_seconds) * 1_000_000),
             );
         }
+        // The queue item's art when it has some (the engine puts it in `meta` first).
         if let Some(art) = &meta.thumbnail {
             m.insert("mpris:artUrl".into(), Value::from(art.clone()));
         }
+    }
+    if let Some(album) = status.album.as_ref().filter(|_| status.video_id.is_some()) {
+        m.insert("xesam:album".into(), Value::from(album.clone()));
     }
     m
 }
@@ -352,7 +442,7 @@ impl Root {
 
 /// `org.mpris.MediaPlayer2.Player`.
 struct Player {
-    state: Arc<Mutex<Status>>,
+    state: Arc<Mutex<View>>,
     cmds: mpsc::Sender<EngineCmd>,
     hub: Hub,
     /// Never read: only cloned (`resubscribe`) by a seek, to catch where the engine landed.
@@ -366,11 +456,13 @@ impl Player {
         self.cmds.send(cmd).await.map_err(|_| engine_gone())
     }
 
-    /// Seeks to `target` seconds, then emits `Seeked` with where the engine really landed
-    /// (it clamps to the song). The engine answers commands in order and announces a seek's
-    /// landing as a `Position` event while handling it, so once a `Status` asked after the
-    /// seek is answered, that event is already in a receiver made before the seek was sent.
-    async fn seek_to(&self, target: f64, emitter: &SignalEmitter<'_>) -> fdo::Result<()> {
+    /// Seeks to `target` seconds, and returns once the copy holds where the engine really
+    /// landed (it clamps to the song), so a `Position` read right after the call is right.
+    /// The engine answers commands in order and announces a seek's landing as a `Position`
+    /// event while handling it, so once a `Status` asked after the seek is answered, that
+    /// event is already in a receiver made before the seek was sent. `Seeked` itself comes
+    /// from the follower, which announces every seek's landing once, whoever asked.
+    async fn seek_to(&self, target: f64) -> fdo::Result<()> {
         let mut probe = self
             .probe
             .lock()
@@ -381,17 +473,19 @@ impl Player {
         let mut landed = None;
         loop {
             match probe.try_recv() {
-                Ok(EngineEvent::Position { seconds }) => landed = Some(seconds),
+                // Only the seek's own event: a tick that slipped in before it is not where
+                // the seek landed.
+                Ok(EngineEvent::Position {
+                    seconds,
+                    seeked: true,
+                }) => landed = Some(seconds),
                 Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
         // No landing: the engine ignored the seek (nothing loaded), so nothing moved.
         if let Some(at) = landed {
-            lock(&self.state).position = at;
-            Self::seeked(emitter, micros(at))
-                .await
-                .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+            lock(&self.state).status.position = at;
         }
         Ok(())
     }
@@ -403,14 +497,14 @@ fn engine_gone() -> fdo::Error {
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
-    /// No queue until step 2 (CanGoNext is false): does nothing.
-    fn next(&self) {
-        self.hub.touch();
+    /// The engine does nothing when there is no next song (CanGoNext is false then).
+    async fn next(&self) -> fdo::Result<()> {
+        self.send(EngineCmd::Next).await
     }
 
-    /// No queue until step 2 (CanGoPrevious is false): does nothing.
-    fn previous(&self) {
-        self.hub.touch();
+    /// Restarts the song when more than 3 s in, else plays the one before.
+    async fn previous(&self) -> fdo::Result<()> {
+        self.send(EngineCmd::Previous).await
     }
 
     async fn pause(&self) -> fdo::Result<()> {
@@ -431,32 +525,25 @@ impl Player {
     async fn play(&self) -> fdo::Result<()> {
         self.send(EngineCmd::Play {
             video_id: None,
+            playlist_id: None,
+            index: None,
             start_seconds: 0.0,
         })
         .await
     }
 
     /// Relative, in microseconds. Before the start means the start.
-    async fn seek(
-        &self,
-        offset: i64,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
-        let from = lock(&self.state).position;
+    async fn seek(&self, offset: i64) -> fdo::Result<()> {
+        let from = lock(&self.state).status.position;
         let target = (from + offset as f64 / 1e6).max(0.0);
-        self.seek_to(target, &emitter).await
+        self.seek_to(target).await
     }
 
     /// Absolute, in microseconds. The spec: ignored unless `track_id` is the current track
     /// and the position is within it.
-    async fn set_position(
-        &self,
-        track_id: ObjectPath<'_>,
-        position: i64,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<()> {
+    async fn set_position(&self, track_id: ObjectPath<'_>, position: i64) -> fdo::Result<()> {
         let (current, length) = {
-            let s = lock(&self.state);
+            let s = &lock(&self.state).status;
             let length = s
                 .meta
                 .as_ref()
@@ -465,11 +552,13 @@ impl Player {
             (s.video_id.clone(), length)
         };
         let ours = current.is_some() && track_id.as_str() == self::track_id(current.as_deref());
-        if !ours || position < 0 || length.is_some_and(|l| position > l) {
+        // Exactly the length counts as past the end: the engine takes a seek there as Next,
+        // and the spec's SetPosition never changes the track.
+        if !ours || position < 0 || length.is_some_and(|l| position >= l) {
             self.hub.touch();
             return Ok(());
         }
-        self.seek_to(position as f64 / 1e6, &emitter).await
+        self.seek_to(position as f64 / 1e6).await
     }
 
     /// No URI schemes are supported (SupportedUriSchemes is empty).
@@ -483,7 +572,45 @@ impl Player {
 
     #[zbus(property)]
     fn playback_status(&self) -> String {
-        playback_status(lock(&self.state).state).to_string()
+        playback_status(lock(&self.state).status.state).to_string()
+    }
+
+    #[zbus(property)]
+    fn loop_status(&self) -> String {
+        loop_status(lock(&self.state).status.repeat).to_string()
+    }
+
+    /// "None", "Track" or "Playlist" (the spec's three); anything else is refused. The copy
+    /// is updated at once, as for `Volume`.
+    #[zbus(property)]
+    async fn set_loop_status(&self, mode: String) -> fdo::Result<()> {
+        let repeat = match mode.as_str() {
+            "None" => Repeat::Off,
+            "Track" => Repeat::One,
+            "Playlist" => Repeat::All,
+            _ => {
+                self.hub.touch();
+                return Err(fdo::Error::InvalidArgs(
+                    "LoopStatus is None, Track or Playlist".into(),
+                ));
+            }
+        };
+        self.send(EngineCmd::Repeat(repeat)).await?;
+        lock(&self.state).status.repeat = repeat;
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn shuffle(&self) -> bool {
+        lock(&self.state).status.shuffle
+    }
+
+    /// The copy is updated at once, as for `Volume`.
+    #[zbus(property)]
+    async fn set_shuffle(&self, on: bool) -> fdo::Result<()> {
+        self.send(EngineCmd::Shuffle(on)).await?;
+        lock(&self.state).status.shuffle = on;
+        Ok(())
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
@@ -503,13 +630,13 @@ impl Player {
 
     #[zbus(property)]
     fn metadata(&self) -> HashMap<String, Value<'static>> {
-        metadata(&lock(&self.state))
+        metadata(&lock(&self.state).status)
     }
 
     /// Linear 0.0 to 1.0, the same scale as `EngineCmd::Volume`.
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        f64::from(lock(&self.state).volume)
+        f64::from(lock(&self.state).status.volume)
     }
 
     /// Clamped to 0.0..=1.0 as the engine does. The copy is updated at once: zbus announces
@@ -521,24 +648,24 @@ impl Player {
         }
         let v = volume.clamp(0.0, 1.0) as f32;
         self.send(EngineCmd::Volume(v)).await?;
-        lock(&self.state).volume = v;
+        lock(&self.state).status.volume = v;
         Ok(())
     }
 
     /// Microseconds, from the last position the engine reported.
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> i64 {
-        micros(lock(&self.state).position)
+        micros(lock(&self.state).status.position)
     }
 
-    #[zbus(property(emits_changed_signal = "const"))]
+    #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        false
+        can_go(&lock(&self.state).queue).0
     }
 
-    #[zbus(property(emits_changed_signal = "const"))]
+    #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        false
+        can_go(&lock(&self.state).queue).1
     }
 
     #[zbus(property(emits_changed_signal = "const"))]

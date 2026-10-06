@@ -8,10 +8,10 @@
 //! The audio thread writes into the ring and, when it is full, sleeps for as long as the
 //! missing room takes to play: no busy wait, and decoding stays at most 200 ms ahead.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use pw::properties::properties;
 use pw::spa;
 use pw::stream::{StreamFlags, StreamRc, StreamState};
 
-use crate::audio::sink::{LostNotify, Sink};
+use crate::audio::sink::{LostNotify, Sink, VolumeNotify};
 use crate::error::Error;
 
 /// The ring between the audio thread and PipeWire, in seconds of audio.
@@ -71,13 +71,48 @@ struct Shared {
     /// Set by `close` before it stops the stream: the Unconnected that follows is ours, not
     /// a loss to report.
     closing: AtomicBool,
+    /// The stream's volume as a slider value (f32 bits), as the PipeWire thread knows it:
+    /// ours once it has applied it, or a mixer's once it has seen it (`VolumeGate::readback`).
+    /// The sink reads it when it makes a new stream, so the new one starts at the user's
+    /// last volume, wherever it was set.
+    volume: AtomicU32,
+    /// The last of the sink's own volume changes (`PipeWireSink::volume_seq`) the PipeWire
+    /// thread has applied. Until it matches, a change of ours is still on its way and is
+    /// newer than whatever `volume` says.
+    volume_seq: AtomicU64,
+}
+
+impl Shared {
+    fn with_volume(volume: Volume) -> Shared {
+        Shared {
+            volume: AtomicU32::new(volume.slider.to_bits()),
+            volume_seq: AtomicU64::new(volume.seq),
+            ..Shared::default()
+        }
+    }
+}
+
+/// A volume of ours: the slider value (0..=1), and which of the sink's changes it is.
+#[derive(Debug, Clone, Copy)]
+struct Volume {
+    slider: f32,
+    seq: u64,
+}
+
+/// Who a stream tells about itself, from its PipeWire thread.
+#[derive(Clone, Default)]
+struct Watchers {
+    /// The stream was lost (`Sink::watch_lost`).
+    lost: Option<LostNotify>,
+    /// A mixer changed its volume (`Sink::watch_volume`).
+    volume: Option<VolumeNotify>,
 }
 
 /// Messages to the PipeWire main loop.
 enum Control {
     Active(bool),
-    /// PipeWire channel volume (already mapped from the slider value).
-    Volume(f32),
+    /// A volume of ours.
+    Volume(Volume),
     /// Drop what PipeWire has queued (the ring is emptied by the callback).
     Flush,
     Quit,
@@ -99,18 +134,22 @@ struct Output {
 /// How an `Output` is made: `Output::connect`, or a stand-in in tests (which must never
 /// reach the user's PipeWire).
 type Connect =
-    fn(rate: u32, volume: f32, paused: bool, notify: Option<LostNotify>) -> Result<Output, Error>;
+    fn(rate: u32, volume: Volume, paused: bool, watch: Watchers) -> Result<Output, Error>;
 
 /// PipeWire playback. Connects on the first `open`; a new rate reconnects (the rare switch
 /// between 48 kHz Opus and 44.1 kHz AAC), and so does a stream that failed.
 pub struct PipeWireSink {
     out: Option<Output>,
     connect: Connect,
-    /// The slider value (0..=1), re-applied to each new stream.
+    /// The slider value (0..=1), applied to each new stream: ours, or a mixer's once the
+    /// stream has reported it (`adopt_stream_volume`).
     volume: f32,
+    /// Bumped by each `set_volume`, so a mixer's volume read back from the stream can be told
+    /// apart from one of ours still on its way to it.
+    volume_seq: u64,
     paused: bool,
-    /// Passed to each new stream: told when it is lost (`Sink::watch_lost`).
-    notify: Option<LostNotify>,
+    /// Passed to each new stream.
+    watch: Watchers,
 }
 
 impl PipeWireSink {
@@ -119,8 +158,25 @@ impl PipeWireSink {
             out: None,
             connect: Output::connect,
             volume: 1.0,
+            volume_seq: 0,
             paused: false,
-            notify: None,
+            watch: Watchers::default(),
+        }
+    }
+
+    /// Takes the stream's volume as ours when the stream has applied every change of ours:
+    /// then any difference is a mixer's, which the user made last. Without this a new stream
+    /// (a rate change, a restart) would go back to the app's older volume.
+    fn adopt_stream_volume(&mut self) {
+        let Some(out) = &self.out else {
+            return;
+        };
+        if out.shared.volume_seq.load(Ordering::Acquire) != self.volume_seq {
+            return;
+        }
+        let v = f32::from_bits(out.shared.volume.load(Ordering::Acquire));
+        if v.is_finite() {
+            self.volume = v.clamp(0.0, 1.0);
         }
     }
 
@@ -189,14 +245,19 @@ impl Sink for PipeWireSink {
         {
             return Ok(());
         }
+        self.adopt_stream_volume();
         if let Some(old) = self.out.take() {
             old.close();
         }
+        let volume = Volume {
+            slider: self.volume,
+            seq: self.volume_seq,
+        };
         self.out = Some((self.connect)(
             rate,
-            channel_volume(self.volume),
+            volume,
             self.paused,
-            self.notify.clone(),
+            self.watch.clone(),
         )?);
         Ok(())
     }
@@ -245,7 +306,11 @@ impl Sink for PipeWireSink {
 
     fn set_volume(&mut self, v: f32) {
         self.volume = v.clamp(0.0, 1.0);
-        self.send(Control::Volume(channel_volume(self.volume)));
+        self.volume_seq += 1;
+        self.send(Control::Volume(Volume {
+            slider: self.volume,
+            seq: self.volume_seq,
+        }));
     }
 
     fn delay_frames(&self) -> u64 {
@@ -263,7 +328,11 @@ impl Sink for PipeWireSink {
     }
 
     fn watch_lost(&mut self, notify: LostNotify) {
-        self.notify = Some(notify);
+        self.watch.lost = Some(notify);
+    }
+
+    fn watch_volume(&mut self, notify: VolumeNotify) {
+        self.watch.volume = Some(notify);
     }
 }
 
@@ -358,15 +427,10 @@ impl<'a> StallWatch<'a> {
 }
 
 impl Output {
-    fn connect(
-        rate: u32,
-        volume: f32,
-        paused: bool,
-        notify: Option<LostNotify>,
-    ) -> Result<Output, Error> {
+    fn connect(rate: u32, volume: Volume, paused: bool, watch: Watchers) -> Result<Output, Error> {
         let capacity = ((RING_SECS * f64::from(rate)) as usize) * 2;
         let (producer, consumer) = rtrb::RingBuffer::new(capacity);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::with_volume(volume));
         let (control, inbox) = pw::channel::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -378,9 +442,9 @@ impl Output {
                 let _done = done_tx;
                 let setup = Setup {
                     rate,
-                    volume,
+                    volume: channel_volume(volume.slider),
                     paused,
-                    notify,
+                    watch,
                     consumer,
                     shared: thread_shared,
                     inbox,
@@ -458,9 +522,10 @@ impl Output {
 
 struct Setup {
     rate: u32,
+    /// PipeWire channel volume (already mapped from the slider value).
     volume: f32,
     paused: bool,
-    notify: Option<LostNotify>,
+    watch: Watchers,
     consumer: rtrb::Consumer<f32>,
     shared: Arc<Shared>,
     inbox: pw::channel::Receiver<Control>,
@@ -499,7 +564,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     // drop free the pw_core first, and then `_core`'s drop wrote into freed memory on every
     // close (AddressSanitizer: heap-use-after-free in libspa's list remove).
     let core_shared = setup.shared.clone();
-    let core_notify = setup.notify.clone();
+    let core_notify = setup.watch.lost.clone();
     let _core = core
         .add_listener_local()
         .error(move |id, _seq, _res, _message| {
@@ -538,19 +603,44 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
         .register()
         .map_err(no_pipewire)?;
 
-    let volume = Rc::new(Cell::new(setup.volume));
+    let volume = Rc::new(RefCell::new(VolumeGate::new(setup.volume)));
     let state_volume = volume.clone();
     let state_shared = setup.shared.clone();
+    let lost = setup.watch.lost.clone();
+    let param_volume = volume.clone();
+    let param_shared = setup.shared.clone();
+    let mixer = setup.watch.volume.clone();
+    // Both on this (main loop) thread, never the real-time one: `process` is the only
+    // callback PipeWire runs there.
     let _state = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |s, _, _, new| {
             if stream_gone(&new) {
-                mark_gone(&state_shared, &setup.notify);
-            } else if matches!(new, StreamState::Paused | StreamState::Streaming) {
-                // Controls only stick once the stream is negotiated: apply the volume then.
-                set_volume(s, state_volume.get());
-                if new == StreamState::Streaming {
-                    crate::trace::mark("stream running");
+                mark_gone(&state_shared, &lost);
+                return;
+            }
+            if let Some(v) = state_volume.borrow_mut().state(&new) {
+                set_volume(s, v);
+            }
+            if new == StreamState::Streaming {
+                crate::trace::mark("stream running");
+            }
+        })
+        // The stream's `Props` change when anyone sets them: us (the echo of `set_volume`),
+        // or a mixer. A mixer's channel volumes become the stream's volume from now on.
+        .param_changed(move |_, _, id, param| {
+            if id != spa::sys::SPA_PARAM_Props {
+                return;
+            }
+            let Some(channels) = param.and_then(|p| channel_volumes(p.as_bytes())) else {
+                return;
+            };
+            if let Some(slider) = param_volume.borrow_mut().readback(&channels) {
+                param_shared
+                    .volume
+                    .store(slider.to_bits(), Ordering::Release);
+                if let Some(tell) = &mixer {
+                    tell(slider);
                 }
             }
         })
@@ -570,13 +660,20 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
 
     let control_stream = stream.clone();
     let control_loop = mainloop.clone();
+    let shared_volume = setup.shared.clone();
     let _inbox = setup.inbox.attach(mainloop.loop_(), move |c| match c {
         Control::Active(on) => {
             let _ = control_stream.set_active(on);
         }
-        Control::Volume(v) => {
-            volume.set(v);
+        Control::Volume(ours) => {
+            let v = volume.borrow_mut().change(channel_volume(ours.slider));
             set_volume(&control_stream, v);
+            // The volume before the seq: a reader that sees the seq sees this volume (or a
+            // mixer's, set after it).
+            shared_volume
+                .volume
+                .store(ours.slider.to_bits(), Ordering::Release);
+            shared_volume.volume_seq.store(ours.seq, Ordering::Release);
         }
         Control::Flush => {
             let _ = control_stream.flush(false);
@@ -588,6 +685,87 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     mainloop.run();
     let _ = stream.disconnect();
     Ok(())
+}
+
+/// When the stream's volume goes to PipeWire: on every change of ours, and on state changes
+/// only until the stream first runs.
+///
+/// Until then a control set on the stream doesn't stay: it is connected (Paused) before it is
+/// linked, and linking sets up its ports again, which resets the volume to 1.0 (seen against
+/// a private daemon: tests/gapless.rs). So the volume is sent on every state up to the first
+/// Streaming, which comes after the link. After that, a state change is a pause or a resume:
+/// sending the volume again there would undo a change the user made in a mixer since (step 1
+/// parked Minor 5).
+struct VolumeGate {
+    /// PipeWire channel volume (already mapped from the slider value).
+    value: f32,
+    /// The stream has run once: its controls stay as set from now on.
+    settled: bool,
+}
+
+impl VolumeGate {
+    fn new(value: f32) -> VolumeGate {
+        VolumeGate {
+            value,
+            settled: false,
+        }
+    }
+
+    /// A new volume of ours: always sent.
+    fn change(&mut self, v: f32) -> f32 {
+        self.value = v;
+        v
+    }
+
+    /// The stream's channel volumes as PipeWire reports them: `Some(slider value)` when they
+    /// differ from ours, which makes them ours (a mixer changed them), else `None` (our own
+    /// change coming back, or nothing new). Ignored until the stream first runs: until then
+    /// a change is the link resetting it, not the user. Mixers show the loudest channel.
+    fn readback(&mut self, channels: &[f32]) -> Option<f32> {
+        if !self.settled {
+            return None;
+        }
+        let mut loudest: Option<f32> = None;
+        for &c in channels {
+            if !c.is_finite() {
+                return None;
+            }
+            loudest = Some(loudest.map_or(c, |l| l.max(c)));
+        }
+        let v = loudest?.max(0.0);
+        // Float noise from PipeWire's round trip is not a change.
+        if (v - self.value).abs() <= 1e-5 {
+            return None;
+        }
+        self.value = v;
+        Some(v.cbrt().min(1.0))
+    }
+
+    /// The stream's new state: what to send now, if anything.
+    fn state(&mut self, state: &StreamState) -> Option<f32> {
+        if self.settled || !matches!(state, StreamState::Paused | StreamState::Streaming) {
+            return None;
+        }
+        self.settled = *state == StreamState::Streaming;
+        Some(self.value)
+    }
+}
+
+/// `channelVolumes` from a `Props` param, if it has them.
+fn channel_volumes(param: &[u8]) -> Option<Vec<f32>> {
+    use spa::pod::{Value, ValueArray, deserialize::PodDeserializer};
+    let (_, value) = PodDeserializer::deserialize_any_from(param).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    object
+        .properties
+        .into_iter()
+        .find(|p| p.key == spa::sys::SPA_PROP_channelVolumes)
+        .and_then(|p| match p.value {
+            Value::ValueArray(ValueArray::Float(v)) => Some(v),
+            _ => None,
+        })
 }
 
 fn set_volume(stream: &pw::stream::Stream, v: f32) {
@@ -705,6 +883,7 @@ fn fill(consumer: &mut rtrb::Consumer<f32>, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn fill_copies_whole_frames_then_silence() {
@@ -744,6 +923,92 @@ mod tests {
     }
 
     #[test]
+    fn volume_applied_once_per_change() {
+        let mut v = VolumeGate::new(0.125);
+        assert_eq!(v.state(&StreamState::Connecting), None);
+        // Connected but not linked yet: the link will reset it, so it goes again until the
+        // stream first runs.
+        assert_eq!(v.state(&StreamState::Paused), Some(0.125));
+        assert_eq!(v.change(0.5), 0.5);
+        assert_eq!(v.state(&StreamState::Paused), Some(0.5));
+        assert_eq!(v.state(&StreamState::Streaming), Some(0.5));
+        // From then on, pause and resume leave it alone: a mixer may have changed it.
+        assert_eq!(v.state(&StreamState::Paused), None);
+        assert_eq!(v.state(&StreamState::Streaming), None);
+        // A change of ours still goes, once.
+        assert_eq!(v.change(0.25), 0.25);
+        assert_eq!(v.state(&StreamState::Paused), None);
+    }
+
+    /// A `Props` param holding `channelVolumes`, as PipeWire hands one to `param_changed`.
+    fn props_pod(volumes: &[f32]) -> Vec<u8> {
+        let object = spa::pod::Value::Object(spa::pod::Object {
+            type_: spa::sys::SPA_TYPE_OBJECT_Props,
+            id: spa::sys::SPA_PARAM_Props,
+            properties: vec![spa::pod::Property {
+                key: spa::sys::SPA_PROP_channelVolumes,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::ValueArray(spa::pod::ValueArray::Float(volumes.to_vec())),
+            }],
+        });
+        spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+            .unwrap()
+            .0
+            .into_inner()
+    }
+
+    #[test]
+    fn channel_volumes_from_a_props_param() {
+        assert_eq!(
+            channel_volumes(&props_pod(&[0.3, 0.2])),
+            Some(vec![0.3, 0.2])
+        );
+        // A param without them (here a format), or no param at all.
+        assert_eq!(channel_volumes(&format_pod(48_000).unwrap()), None);
+        assert_eq!(channel_volumes(b"not a pod"), None);
+    }
+
+    #[test]
+    fn a_mixer_volume_is_adopted_once_the_stream_runs() {
+        let mut v = VolumeGate::new(0.125);
+        // Before the stream first runs, a change is the link resetting it, not the user.
+        assert_eq!(v.readback(&[1.0, 1.0]), None);
+        v.state(&StreamState::Paused);
+        v.state(&StreamState::Streaming);
+        // Our own value coming back is no change (no loop between our set and the readback).
+        assert_eq!(v.readback(&[0.125, 0.125]), None);
+        // A mixer's: adopted, as the slider value (the cube root), from the loudest channel.
+        let slider = v.readback(&[0.064, 0.027]).unwrap();
+        assert!((slider - 0.4).abs() < 1e-5, "{slider}");
+        // It is the gate's value now: it coming back again is no change either.
+        assert_eq!(v.readback(&[0.064, 0.064]), None);
+        assert_eq!(v.readback(&[]), None);
+        assert_eq!(v.readback(&[f32::NAN, 0.5]), None);
+    }
+
+    #[test]
+    fn a_new_stream_takes_the_mixer_volume() {
+        // A rate change (or a restart) makes a new stream: it gets the user's last volume,
+        // the one a mixer set, not the app's older one.
+        let mut sink = PipeWireSink::new();
+        sink.connect = fake_connect;
+        sink.set_volume(0.5);
+        sink.open(48_000, 2).unwrap();
+        assert_eq!(VOLUMES.with(|v| v.take()), [0.5]);
+        // The PipeWire thread saw a mixer turn it to 0.4.
+        let shared = sink.out.as_ref().unwrap().shared.clone();
+        shared.volume.store(0.4f32.to_bits(), Ordering::Release);
+        sink.open(44_100, 2).unwrap();
+        assert_eq!(VOLUMES.with(|v| v.take()), [0.4]);
+        // A change of ours that the stream hasn't applied yet is newer than any readback.
+        sink.set_volume(0.7);
+        let shared = sink.out.as_ref().unwrap().shared.clone();
+        shared.volume.store(0.2f32.to_bits(), Ordering::Release);
+        sink.open(48_000, 2).unwrap();
+        assert_eq!(VOLUMES.with(|v| v.take()), [0.7]);
+    }
+
+    #[test]
     fn volume_is_cubic() {
         assert_eq!(channel_volume(1.0), 1.0);
         assert_eq!(channel_volume(0.0), 0.0);
@@ -753,23 +1018,30 @@ mod tests {
     // Connections made by `fake_connect`, per test thread (tests run in parallel).
     thread_local! {
         static CONNECTS: Cell<u32> = const { Cell::new(0) };
+        /// The slider volume each connection was made with.
+        static VOLUMES: Cell<Vec<f32>> = const { Cell::new(Vec::new()) };
     }
 
     /// An `Output` with no PipeWire behind it: nothing reads its ring or its control channel.
     fn fake_connect(
         rate: u32,
-        _volume: f32,
+        volume: Volume,
         _paused: bool,
-        _notify: Option<LostNotify>,
+        _watch: Watchers,
     ) -> Result<Output, Error> {
         CONNECTS.with(|c| c.set(c.get() + 1));
+        VOLUMES.with(|v| {
+            let mut all = v.take();
+            all.push(volume.slider);
+            v.set(all);
+        });
         let (producer, _consumer) = rtrb::RingBuffer::new(16);
         let (control, _inbox) = pw::channel::channel();
         Ok(Output {
             rate,
             producer,
             capacity: 16,
-            shared: Arc::new(Shared::default()),
+            shared: Arc::new(Shared::with_volume(volume)),
             control,
             thread: None,
             done: None,

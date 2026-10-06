@@ -190,7 +190,10 @@ Radio; media keys; messages as notifications when the panel is closed; idle quit
   or a Try again button. Nothing fails silently.
 - If the own-code stream path fails, yt-dlp is tried. If both fail, it skips to the next song after showing
   `stream_failed` for that song.
-- A song YouTube marks unplayable gives `unavailable` and is skipped.
+- A song the TV client refuses (unplayable, the "not a bot" check, no audio, an answer for another video) is
+  tried with yt-dlp too, since yt-dlp asks other clients; if both fail it is `stream_failed` with YouTube's
+  reason, and is skipped. Only a plain sign-in refusal skips yt-dlp, as `signed_out`, so the user learns the
+  session needs importing again.
 - Network loss pauses with `network` and retries with backoff (1, 2, 4, 8, max 30 s) while the user still
   wants playback.
 - Logs go to the journal. Session values, links with signatures, and personal data are never logged.
@@ -214,7 +217,7 @@ Radio; media keys; messages as notifications when the panel is closed; idle quit
   yt-dlp; yt-dlp fallback.
 - **Live checks:** with speakers checked muted first: first sound, pause and resume, seek, gapless across two
   album tracks, link expiry, idle quit, resume after a restart, a play appearing in history, media keys.
-- **Widget:** QML tests with a fake engine socket; the nested Hyprland test rig for the panel.
+- **Widget:** QML tests with a fake engine socket; a nested compositor session for checking the panel.
 - **Numbers (README):** RAM (PSS), CPU over 5 minutes of playback, power draw on battery over 5 minutes,
   time from play to first sound, and processes while idle. Each for `pear-desktop` (measured first) and for
   ytmfast.
@@ -226,8 +229,8 @@ Radio; media keys; messages as notifications when the panel is closed; idle quit
    control socket (`play`, `pause`, `seek`, `status`), MPRIS. Measure against the `pear-desktop` baseline.
 2. **Queue:** queue, radio, resume, loudness, report.
 3. **Browsing:** browse, search, like, lyrics.
-4. **Widget:** the backend switch, tests, rig check, publish. Then `pear-desktop` comes off the author's
-   machine, with a rollback kept.
+4. **Widget:** the backend switch, tests, a check in a nested compositor, publish. Then the user's
+   `pear-desktop` can be removed, with a rollback kept.
 
 ## Risks
 

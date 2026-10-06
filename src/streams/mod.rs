@@ -5,9 +5,10 @@
 //! (itag 774 Opus, else 141 AAC, else the highest-bitrate other audio), solve the link's
 //! challenges (the `n` parameter, and the signature of a `signatureCipher`) in one solver
 //! call, and assemble the link. If a step fails for a reason yt-dlp might get past (the solver,
-//! the link, the network), yt-dlp is asked instead (`ytdlp`); if that fails too, the own-code
-//! error is reported. A rejected session (`signed_out`) or a song YouTube won't play
-//! (`unavailable`) is reported at once, without yt-dlp: see `falls_back`.
+//! the link, the network, or the TV client refusing the song), yt-dlp is asked instead
+//! (`ytdlp`); if that fails too, the own-code error is reported. A rejected session
+//! (`signed_out`) or a bad video id (`unavailable`) is reported at once, without yt-dlp: see
+//! `falls_back`.
 //!
 //! Links are cached per video until 30 minutes before their `expire` time.
 
@@ -28,6 +29,7 @@ use crate::auth::Session;
 use crate::error::Error;
 use crate::innertube::{AudioFormat, Innertube, PlayerResponse, Tracking, clients};
 use crate::net;
+use crate::report::ReportApi;
 use crate::solver::{ChallengeKind, ChallengeSolver, player_js};
 use crate::trace;
 use ytdlp::YtDlp;
@@ -220,8 +222,10 @@ impl Streams {
         let (player_id, sts, mut code) = self.current_player(fresh).await?;
         let answer = self.api.player(video_id, sts).await?;
         trace::mark("player request answered");
+        // `StreamFailed`, not `Unavailable`: the TV answer can lack formats that yt-dlp's
+        // clients get (ruling S4).
         let format = pick_format(&answer.formats)
-            .ok_or_else(|| Error::Unavailable("no audio format".into()))?;
+            .ok_or_else(|| Error::StreamFailed("no audio format".into()))?;
         let link = Link::of(format)?;
 
         // Both kinds in one solver call: one `jsc` run, one pass over the player.
@@ -339,6 +343,31 @@ impl Streams {
         *self.player.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((id.clone(), sts, Instant::now()));
         Ok((id, sts, Some(code)))
+    }
+
+    /// The current signature timestamp, for the play reports: the one the last resolve used
+    /// while it is fresh (no request at all, the usual case: the song was resolved moments
+    /// ago), else read from the current player script, which comes from the disk cache when
+    /// a resolve already fetched it, so `base.js` is never downloaded twice. Unlike
+    /// `current_player`, a version the solver failed on is fine here (only its timestamp is
+    /// needed), and nothing is remembered: after a failure `fetch` cleared the memo on
+    /// purpose, so the next resolve asks for the current version.
+    async fn current_sts(&self) -> Result<u32, Error> {
+        let memo = self
+            .player
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((_, sts, at)) = memo
+            && at.elapsed() < PLAYER_ID_TTL
+        {
+            return Ok(sts);
+        }
+        let id = player_js::current_player_id_at(&self.http, &self.web_base).await?;
+        let code = self.player_code(&id).await?;
+        player_js::sts(&code).ok_or_else(|| {
+            Error::StreamFailed("the player script has no signature timestamp".into())
+        })
     }
 
     /// `StreamFailed` when the solver failed on player `id` less than `FAILED_PLAYER_RETRY`
@@ -463,11 +492,29 @@ impl Resolver for Streams {
     }
 }
 
+/// The play reports go through the resolver because it holds the current player script's
+/// signature timestamp (the music web `player` request needs it, ledger "T7 spike result")
+/// and the session's `Innertube`.
+#[async_trait]
+impl ReportApi for Streams {
+    async fn tracking(&self, video_id: &str) -> Result<Tracking, Error> {
+        check_video_id(video_id)?;
+        let sts = self.current_sts().await?;
+        self.api.play_tracking(video_id, sts).await
+    }
+
+    async fn ping(&self, url: Url, visitor_data: Option<String>) -> Result<(), Error> {
+        self.api.ping(&url, visitor_data.as_deref()).await
+    }
+}
+
 /// Whether an own-code failure is worth asking yt-dlp about. Not `SignedOut`: yt-dlp would
 /// usually get an anonymous link anyway (lower quality, about 4 s later), and the user would
-/// never learn the session needs importing again. Not `Unavailable`: YouTube said the song
-/// can't be played, which yt-dlp can't change. Everything else (the solver, an odd link, the
-/// network, our own faults) may be ours alone, so yt-dlp gets a try.
+/// never learn the session needs importing again. Not `Unavailable`: on this path that is
+/// only a bad video id, which yt-dlp can't change. Everything else may be ours or the TV
+/// client's alone (the solver, an odd link, the network, our own faults, and since ruling S4
+/// a TV refusal, the bot check, an answer with no audio or for another video), so yt-dlp
+/// gets a try.
 fn falls_back(e: &Error) -> bool {
     !matches!(e, Error::SignedOut | Error::Unavailable(_))
 }

@@ -18,8 +18,10 @@ use tokio::time::Instant;
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::control::{self, Exit, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
 use ytmfast::error::Error;
+use ytmfast::innertube::{NextPage, NextRequest, SongItem};
+use ytmfast::queue::{AddAt, QueueItem, Repeat};
 use ytmfast::streams::{Resolver, Stream};
 
 const SONG: &str = "dQw4w9WgXcQ";
@@ -37,6 +39,13 @@ impl Resolver for Hang {
     }
     async fn resolve_fresh(&self, id: &str) -> Result<Stream, Error> {
         self.resolve(id).await
+    }
+}
+
+#[async_trait]
+impl QueueSource for Hang {
+    async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
     }
 }
 
@@ -69,7 +78,7 @@ fn daemon(on_ac: bool) -> Daemon {
     let power = power(on_ac);
     let (listener, path) = listener(dir.path());
     let player = AudioPlayer::spawn(Box::new(NullSink::new()));
-    let (engine, cmds, events) = Engine::new(Arc::new(Hang), player);
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Hang), player);
     let options = Options {
         power_supply_root: power.path().to_path_buf(),
         ..Options::default()
@@ -90,8 +99,8 @@ fn daemon(on_ac: bool) -> Daemon {
     }
 }
 
-/// A fake engine side: answers `Status` with `status`, passes every other command to the
-/// test, and stops on `Quit`.
+/// A fake engine side: answers `Status` with `status` and `QueueGet` with `fake_queue()`,
+/// passes every other command to the test, and stops on `Quit`.
 struct FakeEngine {
     path: PathBuf,
     events: broadcast::Sender<EngineEvent>,
@@ -115,6 +124,18 @@ fn fake_engine(status: Status) -> FakeEngine {
                 EngineCmd::Status(reply) => {
                     let _ = reply.send(status.clone());
                 }
+                EngineCmd::QueueGet(reply) => {
+                    let _ = reply.send(fake_queue());
+                }
+                // Always fits; the test sees the songs (with a sender nobody waits on).
+                EngineCmd::QueueAdd { songs, at, added } => {
+                    let _ = added.send(true);
+                    let _ = seen_tx.send(EngineCmd::QueueAdd {
+                        songs,
+                        at,
+                        added: tokio::sync::oneshot::channel().0,
+                    });
+                }
                 EngineCmd::Quit => return,
                 other => {
                     let _ = seen_tx.send(other);
@@ -137,13 +158,52 @@ fn fake_engine(status: Status) -> FakeEngine {
     }
 }
 
+fn full_song(id: &str) -> SongItem {
+    SongItem {
+        video_id: id.into(),
+        title: "Song".into(),
+        artists: vec!["A".into(), "B".into()],
+        album: Some("Album".into()),
+        thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
+        length_seconds: 213,
+        playlist_id: None,
+    }
+}
+
+/// What the fake engine answers `QueueGet` with.
+fn fake_queue() -> QueueView {
+    QueueView {
+        items: vec![
+            QueueItem {
+                id: 3,
+                song: full_song(SONG),
+            },
+            QueueItem {
+                id: 9,
+                song: SongItem {
+                    video_id: "AAAAAAAAAAA".into(),
+                    ..SongItem::default()
+                },
+            },
+        ]
+        .into(),
+        current_id: Some(3),
+        shuffle: true,
+        repeat: Repeat::One,
+    }
+}
+
 fn paused_status(id: &str) -> Status {
     Status {
         state: PlayState::Paused,
         video_id: Some(id.into()),
         meta: None,
+        album: None,
+        queue_id: None,
         position: 1.5,
         volume: 0.5,
+        shuffle: false,
+        repeat: Repeat::Off,
     }
 }
 
@@ -212,9 +272,18 @@ impl Client {
         }
     }
 
-    /// Reads until the server closes the connection.
+    /// Reads until the server closes the connection. Lines are not parsed: a client dropped
+    /// mid-write gets a cut-off last line.
     async fn until_closed(&mut self) {
-        while self.next().await.is_some() {}
+        loop {
+            let _hold = hold_clock();
+            let line = tokio::time::timeout(WAIT, self.lines.next_line())
+                .await
+                .expect("no line in time");
+            if !matches!(line, Ok(Some(_))) {
+                return;
+            }
+        }
     }
 }
 
@@ -443,7 +512,7 @@ async fn commands_reach_the_engine_with_volume_as_a_fraction() {
     f.serve.abort();
 }
 
-/// Task 8 carry: a client that fell behind the engine's events gets a fresh `state`
+/// A client that fell behind the engine's events gets a fresh `state`
 /// instead of being dropped.
 #[tokio::test]
 async fn lagged_client_gets_a_fresh_state() {
@@ -455,6 +524,7 @@ async fn lagged_client_gets_a_fresh_state() {
     for i in 0..200 {
         let _ = f.events.send(EngineEvent::Position {
             seconds: f64::from(i),
+            seeked: false,
         });
     }
     let v = c.event("state").await;
@@ -492,6 +562,7 @@ async fn client_that_stops_reading_is_dropped() {
     for i in 0..50_000 {
         let _ = f.events.send(EngineEvent::Position {
             seconds: f64::from(i),
+            seeked: false,
         });
         if i % 16 == 0 {
             tokio::task::yield_now().await;
@@ -501,6 +572,42 @@ async fn client_that_stops_reading_is_dropped() {
     // The stuck one: its kernel buffer and queue filled, so the server hung up. Reading now
     // drains what was sent and then ends.
     tokio::time::timeout(Duration::from_secs(30), stuck.until_closed())
+        .await
+        .expect("the stuck client was never dropped");
+    f.serve.abort();
+}
+
+/// A client that stops reading is dropped once 4 MiB of lines wait for it, long before 256
+/// lines when they are big: 256 full queue events would be close to 100 MB held for one
+/// stuck client.
+#[tokio::test]
+async fn client_that_stops_reading_big_lines_is_dropped_by_bytes() {
+    let f = fake_engine(paused_status(SONG));
+    let mut stuck = connect(&f.path).await;
+    stuck.send(r#"{"id":1,"cmd":"status"}"#).await;
+    stuck.reply(1).await;
+    // A full queue with long titles: each event line is about 375 KB.
+    let items: Arc<[QueueItem]> = (0..1000)
+        .map(|i| QueueItem {
+            id: i + 1,
+            song: SongItem {
+                video_id: SONG.into(),
+                title: "t".repeat(250),
+                ..SongItem::default()
+            },
+        })
+        .collect();
+    // 30 of them, about 11 MB: well under 256 lines, well over 4 MiB.
+    for _ in 0..30 {
+        let _ = f.events.send(EngineEvent::Queue {
+            items: items.clone(),
+            current_id: Some(1),
+            shuffle: false,
+            repeat: Repeat::Off,
+        });
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(10), stuck.until_closed())
         .await
         .expect("the stuck client was never dropped");
     f.serve.abort();
@@ -538,4 +645,332 @@ async fn engine_gone_while_playing_ends_the_daemon() {
         .expect("the hub never noticed the engine was gone")
         .unwrap();
     assert_eq!(exit, Exit::EngineGone);
+}
+
+/// Every queue command, in its wire form, reaches the engine as the matching command.
+#[tokio::test]
+async fn queue_commands_reach_the_engine() {
+    let mut f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    let lines = [
+        r#"{"id":1,"cmd":"next"}"#.to_string(),
+        r#"{"id":2,"cmd":"previous"}"#.into(),
+        format!(
+            r#"{{"id":3,"cmd":"queue.add","args":{{"at":"next","songs":[{{"videoId":"{SONG}",
+            "title":"Song","artists":["A","B"],"album":"Album",
+            "thumbnail":"https://i.ytimg.com/vi/x/hqdefault.jpg","lengthSeconds":213}}]}}}}"#
+        )
+        .replace('\n', ""),
+        r#"{"id":4,"cmd":"queue.add","args":{"videoIds":["AAAAAAAAAAA","BBBBBBBBBBB"],"at":"end"}}"#.into(),
+        r#"{"id":5,"cmd":"queue.remove","args":{"queueId":4}}"#.into(),
+        r#"{"id":6,"cmd":"queue.jump","args":{"queueId":18446744073709551615}}"#.into(),
+        r#"{"id":7,"cmd":"queue.move","args":{"queueId":2,"index":0}}"#.into(),
+        r#"{"id":8,"cmd":"shuffle","args":{"on":true}}"#.into(),
+        r#"{"id":9,"cmd":"repeat","args":{"mode":"all"}}"#.into(),
+        r#"{"id":10,"cmd":"play","args":{"playlistId":"OLAK5uy_x-Y","index":2}}"#.into(),
+        format!(
+            r#"{{"id":11,"cmd":"play","args":{{"videoId":"{SONG}","playlistId":"RDAMVM{SONG}"}}}}"#
+        ),
+    ];
+    for line in &lines {
+        c.send(line).await;
+    }
+    for id in 1..=lines.len() as u64 {
+        assert_eq!(
+            c.reply(id).await,
+            json!({"id": id, "ok": true, "data": {}}),
+            "{id}"
+        );
+    }
+    let mut got = Vec::new();
+    for _ in 0..lines.len() {
+        got.push(f.commands.try_recv().unwrap());
+    }
+    assert!(matches!(got[0], EngineCmd::Next));
+    assert!(matches!(got[1], EngineCmd::Previous));
+    match &got[2] {
+        EngineCmd::QueueAdd { songs, at, .. } => {
+            assert_eq!(songs, &vec![full_song(SONG)]);
+            assert_eq!(*at, AddAt::Next);
+        }
+        other => panic!("{other:?}"),
+    }
+    match &got[3] {
+        EngineCmd::QueueAdd { songs, at, .. } => {
+            let ids: Vec<&str> = songs.iter().map(|s| s.video_id.as_str()).collect();
+            assert_eq!(ids, ["AAAAAAAAAAA", "BBBBBBBBBBB"]);
+            assert!(
+                songs
+                    .iter()
+                    .all(|s| s.title.is_empty() && s.album.is_none())
+            );
+            assert_eq!(*at, AddAt::End);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(got[4], EngineCmd::QueueRemove(4)));
+    assert!(matches!(got[5], EngineCmd::QueueJump(u64::MAX)));
+    assert!(matches!(got[6], EngineCmd::QueueMove { id: 2, index: 0 }));
+    assert!(matches!(got[7], EngineCmd::Shuffle(true)));
+    assert!(matches!(got[8], EngineCmd::Repeat(Repeat::All)));
+    match &got[9] {
+        EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some(p),
+            index: Some(2),
+            start_seconds,
+        } => {
+            assert_eq!(p, "OLAK5uy_x-Y");
+            assert_eq!(*start_seconds, 0.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    match &got[10] {
+        EngineCmd::Play {
+            video_id: Some(v),
+            playlist_id: Some(p),
+            index: None,
+            ..
+        } => assert_eq!((v.as_str(), p.as_str()), (SONG, &*format!("RDAMVM{SONG}"))),
+        other => panic!("{other:?}"),
+    }
+    // Bad input never reaches the engine.
+    c.send(r#"{"id":20,"cmd":"queue.add","args":{"videoIds":["../etc/pass"]}}"#)
+        .await;
+    c.send(r#"{"id":21,"cmd":"repeat","args":{"mode":"Playlist"}}"#)
+        .await;
+    for id in [20, 21] {
+        assert_eq!(c.reply(id).await["error"]["code"], "bad_request");
+    }
+    assert!(f.commands.try_recv().is_err());
+    f.serve.abort();
+}
+
+#[tokio::test]
+async fn queue_get_replies_with_the_queue() {
+    let f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    c.send(r#"{"id":1,"cmd":"queue.get"}"#).await;
+    assert_eq!(
+        c.reply(1).await,
+        json!({"id": 1, "ok": true, "data": {
+            "currentId": 3, "shuffle": true, "repeat": "one",
+            "items": [
+                {"queueId": 3, "videoId": SONG, "title": "Song", "artists": ["A", "B"],
+                 "album": "Album", "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
+                 "lengthSeconds": 213},
+                {"queueId": 9, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
+                 "album": null, "thumbnail": null, "lengthSeconds": null}]}})
+    );
+    f.serve.abort();
+}
+
+/// A client that fell behind may have missed a queue change too: it gets a fresh queue
+/// along with the fresh state.
+#[tokio::test]
+async fn lagged_client_gets_a_fresh_queue() {
+    let f = fake_engine(paused_status(SONG));
+    let mut c = connect(&f.path).await;
+    c.send(r#"{"id":1,"cmd":"status"}"#).await;
+    c.reply(1).await;
+    for i in 0..200 {
+        let _ = f.events.send(EngineEvent::Position {
+            seconds: f64::from(i),
+            seeked: false,
+        });
+    }
+    let q = c.event("queue").await;
+    assert_eq!(q["currentId"], 3);
+    assert_eq!(q["items"].as_array().unwrap().len(), 2);
+    f.serve.abort();
+}
+
+/// The queue end to end on the real engine (its songs never load: the resolver hangs, so a
+/// jumped-to song stays buffering): every queue command round trips, and both clients see
+/// every `queue` event.
+#[tokio::test]
+async fn queue_round_trips_and_events_reach_both_clients() {
+    let d = daemon(true);
+    let mut a = connect(&d.path).await;
+    let mut b = connect(&d.path).await;
+    for c in [&mut a, &mut b] {
+        c.send(r#"{"id":1,"cmd":"status"}"#).await;
+        c.reply(1).await;
+    }
+    let full = serde_json::to_string(&json!({"id": 2, "cmd": "queue.add", "args": {"songs": [
+        {"videoId": SONG, "title": "Song", "artists": ["A", "B"], "album": "Album",
+         "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg", "lengthSeconds": 213}]}}))
+    .unwrap();
+    a.send(&full).await;
+    a.send(r#"{"id":3,"cmd":"queue.add","args":{"videoIds":["AAAAAAAAAAA","BBBBBBBBBBB"]}}"#)
+        .await;
+    // The sender's replies and events interleave: keep the queue events while waiting.
+    let mut a_queues = Vec::new();
+    let mut replies = 0;
+    while replies < 2 || a_queues.len() < 2 {
+        let v = a.next().await.unwrap();
+        if v["event"] == "queue" {
+            a_queues.push(v);
+        } else if v.get("id").is_some() {
+            assert_eq!(v["ok"], true, "{v}");
+            replies += 1;
+        }
+    }
+
+    // Both clients get both queue events; the second has all three songs, in order.
+    let mut b_queues = Vec::new();
+    for _ in 0..2 {
+        b_queues.push(b.event("queue").await);
+    }
+    assert_eq!(a_queues, b_queues);
+    assert_eq!(a_queues[0]["items"].as_array().unwrap().len(), 1);
+    let mut last = Value::Null;
+    for q in [&a_queues[1], &b_queues[1]] {
+        last = q.clone();
+        let ids: Vec<&str> = last["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["videoId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [SONG, "AAAAAAAAAAA", "BBBBBBBBBBB"]);
+        assert_eq!(last["items"][0]["album"], "Album");
+        assert_eq!(last["items"][1]["title"], Value::Null);
+    }
+    let qid = |v: &Value, i: usize| v["items"][i]["queueId"].as_u64().unwrap();
+    let (first, second, third) = (qid(&last, 0), qid(&last, 1), qid(&last, 2));
+    assert!(first >= 1 && first < second && second < third, "{last}");
+
+    // queue.get answers the same queue.
+    a.send(r#"{"id":4,"cmd":"queue.get"}"#).await;
+    let got = a.reply(4).await;
+    assert_eq!(got["data"]["items"], last["items"]);
+
+    // Jump: the song shows at once from its queue item, album and queue id included.
+    a.send(&format!(
+        r#"{{"id":5,"cmd":"queue.jump","args":{{"queueId":{first}}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(5).await["ok"], true);
+    let s = loop {
+        let s = a.event("state").await;
+        if s["queueId"] == first {
+            break s;
+        }
+    };
+    assert_eq!(s["videoId"], SONG);
+    assert_eq!(s["title"], "Song");
+    assert_eq!(s["album"], "Album");
+    assert_eq!(s["artist"], "A, B");
+
+    // Move the last song to the front.
+    a.send(&format!(
+        r#"{{"id":6,"cmd":"queue.move","args":{{"queueId":{third},"index":0}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(6).await["ok"], true);
+    let q = b.event("queue").await;
+    let q = if q["items"][0]["queueId"] == third {
+        q
+    } else {
+        // b may still hold the jump's queue event.
+        b.event("queue").await
+    };
+    assert_eq!(qid(&q, 0), third, "{q}");
+
+    // Shuffle and repeat show in both the queue event and the state.
+    a.send(r#"{"id":7,"cmd":"shuffle","args":{"on":true}}"#)
+        .await;
+    assert_eq!(a.reply(7).await["ok"], true);
+    a.send(r#"{"id":8,"cmd":"repeat","args":{"mode":"all"}}"#)
+        .await;
+    assert_eq!(a.reply(8).await["ok"], true);
+    a.send(r#"{"id":9,"cmd":"status"}"#).await;
+    let s = a.reply(9).await;
+    assert_eq!(s["data"]["shuffle"], true);
+    assert_eq!(s["data"]["repeat"], "all");
+    a.send(r#"{"id":10,"cmd":"queue.get"}"#).await;
+    let q = a.reply(10).await;
+    assert_eq!(q["data"]["shuffle"], true);
+    assert_eq!(q["data"]["repeat"], "all");
+    assert_eq!(q["data"]["currentId"], first);
+
+    // Next moves off the current song; Previous (under 3 s in) comes back to it.
+    a.send(r#"{"id":11,"cmd":"next"}"#).await;
+    assert_eq!(a.reply(11).await["ok"], true);
+    let s = loop {
+        let s = a.event("state").await;
+        if s["queueId"] != first {
+            break s;
+        }
+    };
+    assert_ne!(s["queueId"], Value::Null);
+    a.send(r#"{"id":12,"cmd":"previous"}"#).await;
+    assert_eq!(a.reply(12).await["ok"], true);
+    loop {
+        if a.event("state").await["queueId"] == first {
+            break;
+        }
+    }
+
+    // Remove: gone from the queue.
+    a.send(&format!(
+        r#"{{"id":13,"cmd":"queue.remove","args":{{"queueId":{second}}}}}"#
+    ))
+    .await;
+    assert_eq!(a.reply(13).await["ok"], true);
+    a.send(r#"{"id":14,"cmd":"queue.get"}"#).await;
+    let q = a.reply(14).await;
+    let ids: Vec<u64> = q["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["queueId"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&second));
+
+    // An id that isn't in the queue: taken, and the engine says why it did nothing.
+    a.send(r#"{"id":15,"cmd":"queue.jump","args":{"queueId":999999}}"#)
+        .await;
+    assert_eq!(a.reply(15).await["ok"], true);
+    let e = a.event("error").await;
+    assert!(!e["message"].as_str().unwrap().is_empty());
+}
+
+/// The live queue holds at most 1,000 songs (ruling S15): an add that would pass it is
+/// refused whole, with a `bad_request`, and the queue is left as it was.
+#[tokio::test]
+async fn an_add_past_the_queue_cap_is_refused() {
+    let d = daemon(true);
+    let mut c = connect(&d.path).await;
+    let ids = |prefix: char, n: usize| -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i:010}")).collect()
+    };
+    for (id, batch) in [(1, ids('a', 500)), (2, ids('b', 499))] {
+        let line = json!({"id": id, "cmd": "queue.add", "args": {"videoIds": batch}});
+        c.send(&line.to_string()).await;
+        assert_eq!(c.reply(id).await["ok"], true);
+    }
+    // Two more would pass 1,000: refused whole.
+    let line = json!({"id": 3, "cmd": "queue.add", "args": {"videoIds": ids('c', 2)}});
+    c.send(&line.to_string()).await;
+    assert_eq!(
+        c.reply(3).await,
+        json!({"id": 3, "ok": false,
+               "error": {"code": "bad_request", "message": "the queue is full"}})
+    );
+    // One more fits exactly.
+    let line = json!({"id": 4, "cmd": "queue.add", "args": {"videoIds": ids('d', 1)}});
+    c.send(&line.to_string()).await;
+    assert_eq!(c.reply(4).await["ok"], true);
+    c.send(r#"{"id":5,"cmd":"queue.get"}"#).await;
+    let q = c.reply(5).await;
+    let items = q["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1000);
+    assert!(
+        items
+            .iter()
+            .all(|i| !i["videoId"].as_str().unwrap().starts_with('c'))
+    );
 }

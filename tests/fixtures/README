@@ -14,3 +14,14 @@ sine440_44k_frag.m4a  the same AAC, as fragmented MP4 with no stated length (mvh
   ffmpeg -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 -ac 2 \
     -c:a aac -b:a 128k -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
     -movflags +frag_keyframe+empty_moov+default_base_moof -frag_duration 500000 sine440_44k_frag.m4a
+
+tone_a_48k.webm, tone_b_48k.webm  3 s each, a 440 Hz and a 660 Hz sine, stereo, Opus 64 kb/s in
+  WebM (the gapless tests: two songs at the same rate, told apart by their samples):
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=3 -ac 2 \
+    -c:a libopus -b:a 64k -map_metadata -1 -fflags +bitexact -flags:a +bitexact tone_a_48k.webm
+  (tone_b_48k.webm: the same with frequency=660)
+
+tone_c_44k.m4a  3 s of an 880 Hz sine, stereo, AAC-LC 96 kb/s in MP4 (the rate change):
+  ffmpeg -f lavfi -i sine=frequency=880:sample_rate=44100:duration=3 -ac 2 \
+    -c:a aac -b:a 96k -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
+    -movflags +faststart tone_c_44k.m4a

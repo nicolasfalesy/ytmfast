@@ -17,6 +17,10 @@ pub struct ClientInfo {
     pub origin: &'static str,
     /// The host the API requests go to.
     pub api_host: &'static str,
+    /// Whether requests carry `X-Goog-AuthUser: 0`. The music web client sends it with a
+    /// signed-in session; the TV client never has, and step 1's working TV requests are kept
+    /// exactly as they were.
+    pub sends_auth_user: bool,
 }
 
 /// The TV client, used for `player`: with the session it gave the Premium formats (itag 774)
@@ -29,10 +33,11 @@ pub const TV: ClientInfo = ClientInfo {
     user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
     origin: "https://www.youtube.com",
     api_host: "www.youtube.com",
+    sends_auth_user: false,
 };
 
-/// The YouTube Music web client, for the browse/search/next requests of later steps. yt-dlp
-/// sends a desktop Chrome user agent with it; this is one from its current range.
+/// The YouTube Music web client, for `next` (the queue) and the browse/search requests of later
+/// steps. yt-dlp sends a desktop Chrome user agent with it; this is one from its current range.
 pub const WEB_REMIX: ClientInfo = ClientInfo {
     name: "WEB_REMIX",
     version: "1.20260707.12.00",
@@ -40,6 +45,7 @@ pub const WEB_REMIX: ClientInfo = ClientInfo {
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     origin: "https://music.youtube.com",
     api_host: "music.youtube.com",
+    sends_auth_user: true,
 };
 
 /// Every client, so tests can check each one against the host allowlist.

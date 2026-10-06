@@ -2,32 +2,44 @@
 //!
 //! A request is `{"id": u64, "cmd": str, "args": {...}?}`. A reply carries the request's id
 //! and either `"ok": true, "data": {...}` or `"ok": false, "error": {"code", "message"}`. An
-//! event has no id: `{"event": "state" | "position" | "error", ...}`. Field names are
-//! camelCase. `docs/protocol.md` is the reader's version of this file.
+//! event has no id: `{"event": "state" | "position" | "queue" | "error", ...}`. Field names
+//! are camelCase. `docs/protocol.md` is the reader's version of this file.
 //!
 //! Parsing goes through `serde_json::Value` by hand rather than a derive, so each bad field
 //! gets its own plain message in the `bad_request` reply.
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
+use url::Url;
 
-use crate::engine::{EngineEvent, PlayState, Status};
+use crate::engine::{EngineEvent, PlayState, QueueView, Status};
+use crate::innertube::SongItem;
+use crate::queue::{AddAt, QueueItem, Repeat};
+use crate::state::{MAX_ARTISTS, MAX_TEXT, is_playlist_id};
+use crate::streams::is_video_id;
 
 /// The longest line the socket takes, newline not counted. A longer one closes the
 /// connection: nothing legitimate comes close, and it bounds what one client can make the
 /// engine hold.
 pub const MAX_LINE: usize = 1024 * 1024;
 
+/// The most songs one `queue.add` takes: the size of the queue the engine saves, so one
+/// add can't push a whole saved queue out.
+pub const MAX_ADD: usize = 500;
+
 /// The error code for a request the engine can't take as written. Protocol only: it is
 /// never an `Error` (see the ledger's pre-flight scan).
 pub const BAD_REQUEST: &str = "bad_request";
 
-/// The step 1 commands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Status,
-    /// No id: resume, or play the last song again.
+    /// See `EngineCmd::Play`: no ids resumes, or plays the last song again. `index` only
+    /// comes with `playlist_id`.
     Play {
         video_id: Option<String>,
+        playlist_id: Option<String>,
+        index: Option<usize>,
         start_seconds: f64,
     },
     Pause,
@@ -38,6 +50,30 @@ pub enum Request {
     /// 0 to 100.
     Volume {
         percent: f64,
+    },
+    Next,
+    Previous,
+    QueueGet,
+    /// 1 to `MAX_ADD` songs, each checked (see `parse_song`).
+    QueueAdd {
+        songs: Vec<SongItem>,
+        at: AddAt,
+    },
+    QueueRemove {
+        id: u64,
+    },
+    QueueJump {
+        id: u64,
+    },
+    QueueMove {
+        id: u64,
+        index: usize,
+    },
+    Shuffle {
+        on: bool,
+    },
+    Repeat {
+        mode: Repeat,
     },
     Quit,
 }
@@ -56,11 +92,19 @@ impl Request {
             Request::Status => ("status", None),
             Request::Play {
                 video_id,
+                playlist_id,
+                index,
                 start_seconds,
             } => {
                 let mut args = Map::new();
                 if let Some(v) = video_id {
                     args.insert("videoId".into(), json!(v));
+                }
+                if let Some(p) = playlist_id {
+                    args.insert("playlistId".into(), json!(p));
+                }
+                if let Some(i) = index {
+                    args.insert("index".into(), json!(i));
                 }
                 args.insert("startSeconds".into(), json!(start_seconds));
                 ("play", Some(Value::Object(args)))
@@ -69,6 +113,35 @@ impl Request {
             Request::Toggle => ("toggle", None),
             Request::Seek { seconds } => ("seek", Some(json!({ "seconds": seconds }))),
             Request::Volume { percent } => ("volume", Some(json!({ "percent": percent }))),
+            Request::Next => ("next", None),
+            Request::Previous => ("previous", None),
+            Request::QueueGet => ("queue.get", None),
+            Request::QueueAdd { songs, at } => {
+                let songs: Vec<Value> = songs
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "videoId": s.video_id,
+                            "title": s.title,
+                            "artists": s.artists,
+                            "album": s.album,
+                            "thumbnail": s.thumbnail,
+                            "lengthSeconds": s.length_seconds,
+                        })
+                    })
+                    .collect();
+                (
+                    "queue.add",
+                    Some(json!({ "songs": songs, "at": add_at_name(*at) })),
+                )
+            }
+            Request::QueueRemove { id } => ("queue.remove", Some(json!({ "queueId": id }))),
+            Request::QueueJump { id } => ("queue.jump", Some(json!({ "queueId": id }))),
+            Request::QueueMove { id, index } => {
+                ("queue.move", Some(json!({ "queueId": id, "index": index })))
+            }
+            Request::Shuffle { on } => ("shuffle", Some(json!({ "on": on }))),
+            Request::Repeat { mode } => ("repeat", Some(json!({ "mode": repeat_name(*mode) }))),
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -78,6 +151,8 @@ impl Request {
         line(msg)
     }
 }
+
+const VIDEO_ID_RULE: &str = "videoId must be 11 characters of A-Z, a-z, 0-9, _ and -";
 
 /// Reads one request line (without its newline).
 pub fn parse_request(text: &[u8]) -> Result<(u64, Request), BadRequest> {
@@ -93,38 +168,69 @@ pub fn parse_request(text: &[u8]) -> Result<(u64, Request), BadRequest> {
         .get("id")
         .and_then(Value::as_u64)
         .ok_or_else(|| bad(None, "id must be a whole number from 0 up"))?;
-    let bad = |message: &str| bad(Some(id), message);
     let cmd = msg
         .get("cmd")
         .and_then(Value::as_str)
-        .ok_or_else(|| bad("cmd must be a string"))?;
+        .ok_or_else(|| bad(Some(id), "cmd must be a string"))?;
     let empty = Map::new();
     let args = match msg.get("args") {
         None | Some(Value::Null) => &empty,
         Some(Value::Object(a)) => a,
-        Some(_) => return Err(bad("args must be an object")),
+        Some(_) => return Err(bad(Some(id), "args must be an object")),
     };
-    let request = match cmd {
+    let request = parse_command(cmd, args).map_err(|m| bad(Some(id), m))?;
+    Ok((id, request))
+}
+
+/// A field that may be missing or null.
+fn field<'a>(args: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
+    args.get(name).filter(|v| !v.is_null())
+}
+
+fn queue_id(args: &Map<String, Value>) -> Result<u64, &'static str> {
+    args.get("queueId")
+        .and_then(Value::as_u64)
+        .ok_or("queueId must be a whole number from 0 up")
+}
+
+/// A whole number from 0 up that fits an index.
+fn index_of(v: &Value) -> Option<usize> {
+    v.as_u64().and_then(|i| usize::try_from(i).ok())
+}
+
+fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'static str> {
+    Ok(match cmd {
         "status" => Request::Status,
         "play" => {
-            let video_id = match args.get("videoId") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if crate::streams::is_video_id(s) => Some(s.clone()),
+            let video_id = match field(args, "videoId") {
+                None => None,
+                Some(Value::String(s)) if is_video_id(s) => Some(s.clone()),
+                Some(_) => return Err(VIDEO_ID_RULE),
+            };
+            let playlist_id = match field(args, "playlistId") {
+                None => None,
+                Some(Value::String(s)) if is_playlist_id(s) => Some(s.clone()),
                 Some(_) => {
-                    return Err(bad(
-                        "videoId must be 11 characters of A-Z, a-z, 0-9, _ and -",
-                    ));
+                    return Err("playlistId must be 1 to 256 characters of A-Z, a-z, 0-9, _ and -");
                 }
             };
-            let start_seconds = match args.get("startSeconds") {
-                None | Some(Value::Null) => 0.0,
+            let index = match field(args, "index") {
+                None => None,
+                // Without a list, an index would be quietly ignored: say so instead.
+                Some(_) if playlist_id.is_none() => return Err("index needs a playlistId"),
+                Some(v) => Some(index_of(v).ok_or("index must be a whole number from 0 up")?),
+            };
+            let start_seconds = match field(args, "startSeconds") {
+                None => 0.0,
                 Some(v) => v
                     .as_f64()
                     .filter(|s| s.is_finite() && *s >= 0.0)
-                    .ok_or_else(|| bad("startSeconds must be a number from 0 up"))?,
+                    .ok_or("startSeconds must be a number from 0 up")?,
             };
             Request::Play {
                 video_id,
+                playlist_id,
+                index,
                 start_seconds,
             }
         }
@@ -136,19 +242,150 @@ pub fn parse_request(text: &[u8]) -> Result<(u64, Request), BadRequest> {
                 .get("seconds")
                 .and_then(Value::as_f64)
                 .filter(|s| s.is_finite())
-                .ok_or_else(|| bad("seconds must be a number"))?,
+                .ok_or("seconds must be a number")?,
         },
         "volume" => Request::Volume {
             percent: args
                 .get("percent")
                 .and_then(Value::as_f64)
                 .filter(|p| (0.0..=100.0).contains(p))
-                .ok_or_else(|| bad("percent must be a number from 0 to 100"))?,
+                .ok_or("percent must be a number from 0 to 100")?,
+        },
+        "next" => Request::Next,
+        "previous" => Request::Previous,
+        "queue.get" => Request::QueueGet,
+        "queue.add" => parse_add(args)?,
+        "queue.remove" => Request::QueueRemove {
+            id: queue_id(args)?,
+        },
+        "queue.jump" => Request::QueueJump {
+            id: queue_id(args)?,
+        },
+        "queue.move" => Request::QueueMove {
+            id: queue_id(args)?,
+            index: args
+                .get("index")
+                .and_then(index_of)
+                .ok_or("index must be a whole number from 0 up")?,
+        },
+        "shuffle" => Request::Shuffle {
+            on: args
+                .get("on")
+                .and_then(Value::as_bool)
+                .ok_or("on must be true or false")?,
+        },
+        "repeat" => Request::Repeat {
+            mode: match args.get("mode").and_then(Value::as_str) {
+                Some("off") => Repeat::Off,
+                Some("all") => Repeat::All,
+                Some("one") => Repeat::One,
+                _ => return Err("mode must be \"off\", \"all\" or \"one\""),
+            },
         },
         "quit" => Request::Quit,
-        _ => return Err(bad("unknown command")),
+        _ => return Err("unknown command"),
+    })
+}
+
+/// `queue.add`: `songs` (objects with details) or `videoIds` (bare ids, whose details the
+/// engine fills in when they play), not both; `at` is `"next"` or `"end"` (the default).
+fn parse_add(args: &Map<String, Value>) -> Result<Request, &'static str> {
+    const COUNT: &str = "queue.add takes 1 to 500 songs";
+    let songs = match (field(args, "songs"), field(args, "videoIds")) {
+        (Some(_), Some(_)) => return Err("give songs or videoIds, not both"),
+        (None, None) => return Err("queue.add needs songs or videoIds"),
+        (Some(Value::Array(list)), None) => {
+            if list.is_empty() || list.len() > MAX_ADD {
+                return Err(COUNT);
+            }
+            list.iter().map(parse_song).collect::<Result<_, _>>()?
+        }
+        (None, Some(Value::Array(list))) => {
+            if list.is_empty() || list.len() > MAX_ADD {
+                return Err(COUNT);
+            }
+            list.iter()
+                .map(|v| match v.as_str() {
+                    Some(id) if is_video_id(id) => Ok(SongItem {
+                        video_id: id.into(),
+                        ..SongItem::default()
+                    }),
+                    _ => Err(VIDEO_ID_RULE),
+                })
+                .collect::<Result<_, _>>()?
+        }
+        (Some(_), None) => return Err("songs must be a list"),
+        (None, Some(_)) => return Err("videoIds must be a list"),
     };
-    Ok((id, request))
+    let at = match field(args, "at") {
+        None => AddAt::End,
+        Some(v) => match v.as_str() {
+            Some("next") => AddAt::Next,
+            Some("end") => AddAt::End,
+            _ => return Err("at must be \"next\" or \"end\""),
+        },
+    };
+    Ok(Request::QueueAdd { songs, at })
+}
+
+/// One `queue.add` song. Only `videoId` is needed. Text over `MAX_TEXT` bytes (or over
+/// `MAX_ARTISTS` artists) is refused rather than cut, as the state file does: a song with a
+/// trimmed title would be a different song. A thumbnail the engine would not fetch from
+/// (not https on an allowed host) is dropped instead: the song itself is still good, and the
+/// widgets load art from it.
+fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
+    const TEXT: &str = "title, album and each artist must be text of at most 4 KiB";
+    let Value::Object(song) = v else {
+        return Err("each song must be an object");
+    };
+    let video_id = match song.get("videoId") {
+        Some(Value::String(s)) if is_video_id(s) => s.clone(),
+        _ => return Err(VIDEO_ID_RULE),
+    };
+    let text = |name: &str| -> Result<Option<String>, &'static str> {
+        match field(song, name) {
+            None => Ok(None),
+            Some(Value::String(s)) if s.len() <= MAX_TEXT => Ok(Some(s.clone())),
+            Some(_) => Err(TEXT),
+        }
+    };
+    let title = text("title")?.unwrap_or_default();
+    let album = text("album")?;
+    let artists = match field(song, "artists") {
+        None => Vec::new(),
+        Some(Value::Array(list)) if list.len() <= MAX_ARTISTS => list
+            .iter()
+            .map(|a| match a {
+                Value::String(s) if s.len() <= MAX_TEXT => Ok(s.clone()),
+                _ => Err(TEXT),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("artists must be a list of at most 20 names"),
+    };
+    let thumbnail = match field(song, "thumbnail") {
+        None => None,
+        Some(Value::String(s)) => Some(s)
+            .filter(|s| s.len() <= MAX_TEXT)
+            .filter(|s| Url::parse(s).is_ok_and(|u| crate::net::allowed_host(&u)))
+            .cloned(),
+        Some(_) => return Err("thumbnail must be a link"),
+    };
+    let length_seconds = match field(song, "lengthSeconds") {
+        None => 0,
+        Some(v) => v
+            .as_u64()
+            .and_then(|s| u32::try_from(s).ok())
+            .ok_or("lengthSeconds must be a whole number from 0 up")?,
+    };
+    Ok(SongItem {
+        video_id,
+        title,
+        artists,
+        album,
+        thumbnail,
+        length_seconds,
+        playlist_id: None,
+    })
 }
 
 /// `{"id", "ok": true, "data"}`.
@@ -191,8 +428,23 @@ pub fn state_name(state: PlayState) -> &'static str {
     }
 }
 
+pub fn repeat_name(repeat: Repeat) -> &'static str {
+    match repeat {
+        Repeat::Off => "off",
+        Repeat::All => "all",
+        Repeat::One => "one",
+    }
+}
+
+fn add_at_name(at: AddAt) -> &'static str {
+    match at {
+        AddAt::Next => "next",
+        AddAt::End => "end",
+    }
+}
+
 /// The `status` reply's data: a `state` event's fields without `"event"`. Song details are
-/// null until the song's link is resolved.
+/// null until the song's link is resolved (or its queue item has them).
 pub fn status_data(status: &Status) -> Map<String, Value> {
     let meta = status.meta.as_ref();
     let mut m = Map::new();
@@ -211,7 +463,82 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
     );
     m.insert("position".into(), json!(seconds(status.position)));
     m.insert("volume".into(), volume_to_percent(status.volume));
+    m.insert("album".into(), json!(status.album));
+    m.insert("queueId".into(), json!(status.queue_id));
+    m.insert("shuffle".into(), json!(status.shuffle));
+    m.insert("repeat".into(), json!(repeat_name(status.repeat)));
     m
+}
+
+/// One queue item on the wire. Borrowed and serialized straight to text: a queue of up to 1,000
+/// songs (`queue::MAX_ITEMS`) goes out on every queue change, to every client, and a `Value` tree
+/// of it first would copy every string once more.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireItem<'a> {
+    queue_id: u64,
+    video_id: &'a str,
+    /// Null for a bare id (its details come when it plays), like a state's title.
+    title: Option<&'a str>,
+    artists: &'a [String],
+    album: Option<&'a str>,
+    thumbnail: Option<&'a str>,
+    /// Null when unknown (0), as in a state.
+    length_seconds: Option<u32>,
+}
+
+/// The `queue` event's fields; `event` is left out for the `queue.get` reply.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireQueue<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'static str>,
+    items: Vec<WireItem<'a>>,
+    current_id: Option<u64>,
+    shuffle: bool,
+    repeat: &'static str,
+}
+
+impl<'a> WireQueue<'a> {
+    fn new(
+        event: Option<&'static str>,
+        items: &'a [QueueItem],
+        current_id: Option<u64>,
+        shuffle: bool,
+        repeat: Repeat,
+    ) -> Self {
+        WireQueue {
+            event,
+            items: items
+                .iter()
+                .map(|i| WireItem {
+                    queue_id: i.id,
+                    video_id: &i.song.video_id,
+                    title: Some(i.song.title.as_str()).filter(|t| !t.is_empty()),
+                    artists: &i.song.artists,
+                    album: i.song.album.as_deref(),
+                    thumbnail: i.song.thumbnail.as_deref(),
+                    length_seconds: Some(i.song.length_seconds).filter(|s| *s > 0),
+                })
+                .collect(),
+            current_id,
+            shuffle,
+            repeat: repeat_name(repeat),
+        }
+    }
+}
+
+/// The `queue.get` reply's data: a `queue` event's fields without `"event"`.
+pub fn queue_data(view: &QueueView) -> Value {
+    let wire = WireQueue::new(
+        None,
+        &view.items,
+        view.current_id,
+        view.shuffle,
+        view.repeat,
+    );
+    // Plain strings, numbers and bools: serializing them can't fail.
+    serde_json::to_value(wire).expect("a queue serializes")
 }
 
 /// An engine event as a line.
@@ -223,8 +550,21 @@ pub fn event_line(event: &EngineEvent) -> String {
             m.extend(status_data(status));
             line(Value::Object(m))
         }
-        EngineEvent::Position { seconds: s } => {
-            line(json!({ "event": "position", "seconds": seconds(*s) }))
+        EngineEvent::Position { seconds: s, seeked } => line(json!({
+            "event": "position",
+            "seconds": seconds(*s),
+            "seeked": seeked,
+        })),
+        EngineEvent::Queue {
+            items,
+            current_id,
+            shuffle,
+            repeat,
+        } => {
+            let wire = WireQueue::new(Some("queue"), items, *current_id, *shuffle, *repeat);
+            let mut s = serde_json::to_string(&wire).expect("a queue serializes");
+            s.push('\n');
+            s
         }
         EngineEvent::Error { code, message } => line(json!({
             "event": "error",
@@ -249,6 +589,7 @@ fn line(v: Value) -> String {
 mod tests {
     use super::*;
     use crate::streams::TrackMeta;
+    use std::sync::Arc;
 
     fn parse(s: &str) -> Result<(u64, Request), BadRequest> {
         parse_request(s.as_bytes())
@@ -258,22 +599,70 @@ mod tests {
         parse(s).unwrap_err()
     }
 
+    fn song(id: &str) -> SongItem {
+        SongItem {
+            video_id: id.into(),
+            title: "Song".into(),
+            artists: vec!["A".into(), "B".into()],
+            album: Some("Album".into()),
+            thumbnail: Some("https://lh3.googleusercontent.com/x=w544-h544".into()),
+            length_seconds: 213,
+            playlist_id: None,
+        }
+    }
+
+    fn bare(id: &str) -> SongItem {
+        SongItem {
+            video_id: id.into(),
+            ..SongItem::default()
+        }
+    }
+
     #[test]
     fn protocol_roundtrip() {
         let all = [
             Request::Status,
             Request::Play {
                 video_id: Some("dQw4w9WgXcQ".into()),
+                playlist_id: None,
+                index: None,
                 start_seconds: 12.5,
             },
             Request::Play {
                 video_id: None,
+                playlist_id: None,
+                index: None,
+                start_seconds: 0.0,
+            },
+            Request::Play {
+                video_id: None,
+                playlist_id: Some("OLAK5uy_abc-DEF".into()),
+                index: Some(3),
                 start_seconds: 0.0,
             },
             Request::Pause,
             Request::Toggle,
             Request::Seek { seconds: 42.5 },
             Request::Volume { percent: 55.0 },
+            Request::Next,
+            Request::Previous,
+            Request::QueueGet,
+            Request::QueueAdd {
+                songs: vec![song("dQw4w9WgXcQ"), bare("AAAAAAAAAAA")],
+                at: AddAt::Next,
+            },
+            Request::QueueAdd {
+                songs: vec![song("BBBBBBBBBBB")],
+                at: AddAt::End,
+            },
+            Request::QueueRemove { id: 4 },
+            Request::QueueJump { id: u64::MAX },
+            Request::QueueMove { id: 2, index: 0 },
+            Request::Shuffle { on: true },
+            Request::Shuffle { on: false },
+            Request::Repeat { mode: Repeat::Off },
+            Request::Repeat { mode: Repeat::All },
+            Request::Repeat { mode: Repeat::One },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {
@@ -300,6 +689,8 @@ mod tests {
                 2,
                 Request::Play {
                     video_id: Some("dQw4w9WgXcQ".into()),
+                    playlist_id: None,
+                    index: None,
                     start_seconds: 0.0
                 }
             ))
@@ -341,6 +732,290 @@ mod tests {
     }
 
     #[test]
+    fn queue_requests_parse_from_the_wire() {
+        assert_eq!(
+            parse(
+                r#"{"id":1,"cmd":"queue.add","args":{"at":"next","songs":[
+                    {"videoId":"dQw4w9WgXcQ","title":"Song","artists":["A","B"],"album":"Album",
+                     "thumbnail":"https://lh3.googleusercontent.com/x=w544-h544","lengthSeconds":213}]}}"#
+            ),
+            Ok((
+                1,
+                Request::QueueAdd {
+                    songs: vec![song("dQw4w9WgXcQ")],
+                    at: AddAt::Next
+                }
+            ))
+        );
+        // Bare ids: the engine fills their details when they play. `at` defaults to the end.
+        assert_eq!(
+            parse(
+                r#"{"id":2,"cmd":"queue.add","args":{"videoIds":["dQw4w9WgXcQ","AAAAAAAAAAA"]}}"#
+            ),
+            Ok((
+                2,
+                Request::QueueAdd {
+                    songs: vec![bare("dQw4w9WgXcQ"), bare("AAAAAAAAAAA")],
+                    at: AddAt::End
+                }
+            ))
+        );
+        // Only the id is needed in a song; nulls are the same as missing.
+        assert_eq!(
+            parse(
+                r#"{"id":3,"cmd":"queue.add","args":{"songs":[{"videoId":"dQw4w9WgXcQ",
+                   "title":null,"artists":null,"album":null,"thumbnail":null,"lengthSeconds":null}]}}"#
+            ),
+            Ok((
+                3,
+                Request::QueueAdd {
+                    songs: vec![bare("dQw4w9WgXcQ")],
+                    at: AddAt::End
+                }
+            ))
+        );
+        // A thumbnail off the allowlist (or not https) is dropped, not refused: the song is
+        // still good, and the widgets never fetch from a host the engine wouldn't.
+        for thumb in [
+            "http://i.ytimg.com/x.jpg",
+            "https://evil.example/x.jpg",
+            "not a url",
+            &format!("https://i.ytimg.com/{}", "x".repeat(MAX_TEXT)),
+        ] {
+            let line = json!({"id": 4, "cmd": "queue.add",
+                "args": {"songs": [{"videoId": "dQw4w9WgXcQ", "thumbnail": thumb}]}})
+            .to_string();
+            match parse(&line) {
+                Ok((4, Request::QueueAdd { songs, .. })) => {
+                    assert_eq!(songs[0].thumbnail, None, "{thumb}")
+                }
+                other => panic!("{thumb}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            parse(r#"{"id":5,"cmd":"queue.move","args":{"queueId":7,"index":0}}"#),
+            Ok((5, Request::QueueMove { id: 7, index: 0 }))
+        );
+        assert_eq!(
+            parse(r#"{"id":6,"cmd":"repeat","args":{"mode":"one"}}"#),
+            Ok((6, Request::Repeat { mode: Repeat::One }))
+        );
+        assert_eq!(
+            parse(r#"{"id":7,"cmd":"play","args":{"playlistId":"LM"}}"#),
+            Ok((
+                7,
+                Request::Play {
+                    video_id: None,
+                    playlist_id: Some("LM".into()),
+                    index: None,
+                    start_seconds: 0.0
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn bad_queue_requests_say_what_is_wrong() {
+        let ok_song = json!({"videoId": "dQw4w9WgXcQ"});
+        let many: Vec<Value> = (0..=MAX_ADD).map(|_| ok_song.clone()).collect();
+        let many_ids: Vec<Value> = (0..=MAX_ADD).map(|_| json!("dQw4w9WgXcQ")).collect();
+        let long = "x".repeat(MAX_TEXT + 1);
+        let too_many_artists: Vec<String> = vec!["a".into(); MAX_ARTISTS + 1];
+        for (args, cmd) in [
+            (json!({}), "queue.add"),
+            (json!({"songs": []}), "queue.add"),
+            (json!({"videoIds": []}), "queue.add"),
+            (json!({"songs": many}), "queue.add"),
+            (json!({"videoIds": many_ids}), "queue.add"),
+            (
+                json!({"songs": [ok_song.clone()], "videoIds": ["dQw4w9WgXcQ"]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [ok_song.clone()], "at": "first"}),
+                "queue.add",
+            ),
+            (json!({"songs": "dQw4w9WgXcQ"}), "queue.add"),
+            (json!({"songs": [{"title": "no id"}]}), "queue.add"),
+            (json!({"songs": [{"videoId": "../etc/pass"}]}), "queue.add"),
+            (json!({"videoIds": ["short"]}), "queue.add"),
+            (json!({"videoIds": [5]}), "queue.add"),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "title": long}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "album": long}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "artists": [long]}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "artists": too_many_artists}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "artists": "A"}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "title": 5}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "lengthSeconds": -1}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "lengthSeconds": 1.5}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "lengthSeconds": 1u64 << 33}]}),
+                "queue.add",
+            ),
+            (
+                json!({"songs": [{"videoId": "dQw4w9WgXcQ", "thumbnail": 5}]}),
+                "queue.add",
+            ),
+            (json!({}), "queue.remove"),
+            (json!({"queueId": -1}), "queue.remove"),
+            (json!({"queueId": "1"}), "queue.jump"),
+            (json!({"queueId": 1.5}), "queue.jump"),
+            (json!({"queueId": 1}), "queue.move"),
+            (json!({"queueId": 1, "index": -1}), "queue.move"),
+            (json!({"index": 0}), "queue.move"),
+            (json!({}), "shuffle"),
+            (json!({"on": "yes"}), "shuffle"),
+            (json!({"on": 1}), "shuffle"),
+            (json!({}), "repeat"),
+            (json!({"mode": "Track"}), "repeat"),
+            (json!({"mode": true}), "repeat"),
+            (json!({"playlistId": ""}), "play"),
+            (json!({"playlistId": "a/b"}), "play"),
+            (json!({"playlistId": "x".repeat(257)}), "play"),
+            (json!({"playlistId": 5}), "play"),
+            (json!({"playlistId": "LM", "index": -1}), "play"),
+            (json!({"playlistId": "LM", "index": 1.5}), "play"),
+            // An index only means something in a list.
+            (json!({"index": 2}), "play"),
+        ] {
+            let line = json!({"id": 9, "cmd": cmd, "args": args}).to_string();
+            let b = bad(&line);
+            assert_eq!(b.id, Some(9), "{line}");
+            assert!(!b.message.is_empty(), "{line}");
+        }
+        // The caps themselves are fine.
+        let max: Vec<Value> = (0..MAX_ADD).map(|_| ok_song.clone()).collect();
+        let line = json!({"id": 1, "cmd": "queue.add", "args": {"songs": max}}).to_string();
+        assert!(parse(&line).is_ok());
+        let edge = json!({"videoId": "dQw4w9WgXcQ", "title": "t".repeat(MAX_TEXT),
+            "album": "a".repeat(MAX_TEXT), "artists": vec!["r".repeat(MAX_TEXT); MAX_ARTISTS],
+            "lengthSeconds": u32::MAX});
+        let line = json!({"id": 1, "cmd": "queue.add", "args": {"songs": [edge]}}).to_string();
+        assert!(parse(&line).is_ok());
+        let line = json!({"id": 1, "cmd": "play", "args": {"playlistId": "x".repeat(256)}});
+        assert!(parse(&line.to_string()).is_ok());
+    }
+
+    fn item(id: u64, song: SongItem) -> QueueItem {
+        QueueItem { id, song }
+    }
+
+    #[test]
+    fn queue_event_and_reply_shape() {
+        let items: Arc<[QueueItem]> =
+            vec![item(1, song("dQw4w9WgXcQ")), item(2, bare("AAAAAAAAAAA"))].into();
+        let event = EngineEvent::Queue {
+            items: items.clone(),
+            current_id: Some(2),
+            shuffle: true,
+            repeat: Repeat::All,
+        };
+        let v: Value = serde_json::from_str(&event_line(&event)).unwrap();
+        assert_eq!(
+            v,
+            json!({"event": "queue", "currentId": 2, "shuffle": true, "repeat": "all",
+                   "items": [
+                       {"queueId": 1, "videoId": "dQw4w9WgXcQ", "title": "Song",
+                        "artists": ["A", "B"], "album": "Album",
+                        "thumbnail": "https://lh3.googleusercontent.com/x=w544-h544",
+                        "lengthSeconds": 213},
+                       // A bare id: details are null until the song plays.
+                       {"queueId": 2, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
+                        "album": null, "thumbnail": null, "lengthSeconds": null}]})
+        );
+        // `queue.get`'s data is the same without "event".
+        let mut data = v.as_object().unwrap().clone();
+        data.remove("event");
+        assert_eq!(
+            queue_data(&QueueView {
+                items,
+                current_id: Some(2),
+                shuffle: true,
+                repeat: Repeat::All
+            }),
+            Value::Object(data)
+        );
+        let empty = EngineEvent::Queue {
+            items: Vec::new().into(),
+            current_id: None,
+            shuffle: false,
+            repeat: Repeat::One,
+        };
+        let v: Value = serde_json::from_str(&event_line(&empty)).unwrap();
+        assert_eq!(
+            v,
+            json!({"event": "queue", "items": [], "currentId": null, "shuffle": false,
+                   "repeat": "one"})
+        );
+    }
+
+    /// The biggest queue the engine holds (`queue::MAX_ITEMS`, 1,000 songs; ruling S15), with
+    /// real-sized fields: one event line. Prints its size and how long it takes to build, for
+    /// the task report; asserts it stays well under the socket's 1 MiB line cap, which widgets
+    /// reading with the same cap rely on.
+    #[test]
+    fn a_full_queue_event_is_well_under_a_line() {
+        let items: Arc<[QueueItem]> = (0..crate::queue::MAX_ITEMS as u64)
+            .map(|i| {
+                item(
+                    i + 1,
+                    SongItem {
+                        video_id: format!("{:011}", i),
+                        title: "A Song Title Of Typical Length (Remastered)".into(),
+                        artists: vec!["First Artist".into(), "Second Artist".into()],
+                        album: Some("An Album Name Of Typical Length".into()),
+                        thumbnail: Some(format!(
+                            "https://lh3.googleusercontent.com/{}=w544-h544-l90-rj",
+                            "x".repeat(110)
+                        )),
+                        length_seconds: 245,
+                        playlist_id: Some("OLAK5uy_abcdefghijklmnopqrstuvwxyz0123456".into()),
+                    },
+                )
+            })
+            .collect();
+        let event = EngineEvent::Queue {
+            items,
+            current_id: Some(250),
+            shuffle: false,
+            repeat: Repeat::Off,
+        };
+        let start = std::time::Instant::now();
+        let rounds = 20;
+        let mut bytes = 0;
+        for _ in 0..rounds {
+            bytes = event_line(&event).len();
+        }
+        let each = start.elapsed() / rounds;
+        println!("1,000-song queue event: {bytes} bytes, {each:?} to build");
+        assert!(bytes < MAX_LINE / 2, "{bytes}");
+    }
+
+    #[test]
     fn replies_have_the_spec_shape() {
         let v: Value = serde_json::from_str(&ok_reply(7, json!({}))).unwrap();
         assert_eq!(v, json!({"id": 7, "ok": true, "data": {}}));
@@ -374,8 +1049,12 @@ mod tests {
                 length_seconds: 213,
                 thumbnail: Some("https://i.ytimg.com/x.jpg".into()),
             }),
+            album: Some("Album".into()),
+            queue_id: Some(7),
             position: 1.234_567,
             volume: 0.8,
+            shuffle: true,
+            repeat: Repeat::All,
         };
         let v: Value =
             serde_json::from_str(&event_line(&EngineEvent::State(status.clone()))).unwrap();
@@ -383,7 +1062,8 @@ mod tests {
             v,
             json!({"event": "state", "state": "playing", "videoId": "dQw4w9WgXcQ",
                    "title": "Song", "artist": "Artist", "lengthSeconds": 213,
-                   "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80})
+                   "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80,
+                   "album": "Album", "queueId": 7, "shuffle": true, "repeat": "all"})
         );
         // The status reply is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -394,18 +1074,38 @@ mod tests {
             state: PlayState::Stopped,
             video_id: None,
             meta: None,
+            album: None,
+            queue_id: None,
             position: 0.0,
             volume: 1.0,
+            shuffle: false,
+            repeat: Repeat::Off,
         };
         assert_eq!(
             Value::Object(status_data(&empty)),
             json!({"state": "stopped", "videoId": null, "title": null, "artist": null,
-                   "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100})
+                   "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100,
+                   "album": null, "queueId": null, "shuffle": false, "repeat": "off"})
         );
 
-        let v: Value =
-            serde_json::from_str(&event_line(&EngineEvent::Position { seconds: 42.5 })).unwrap();
-        assert_eq!(v, json!({"event": "position", "seconds": 42.5}));
+        let v: Value = serde_json::from_str(&event_line(&EngineEvent::Position {
+            seconds: 42.5,
+            seeked: false,
+        }))
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"event": "position", "seconds": 42.5, "seeked": false})
+        );
+        let v: Value = serde_json::from_str(&event_line(&EngineEvent::Position {
+            seconds: 3.0,
+            seeked: true,
+        }))
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"event": "position", "seconds": 3.0, "seeked": true})
+        );
         let v: Value = serde_json::from_str(&event_line(&EngineEvent::Error {
             code: "network",
             message: "network error: timed out".into(),

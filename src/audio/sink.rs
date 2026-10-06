@@ -11,6 +11,11 @@ use crate::error::Error;
 /// thread passes one that wakes it, so a paused song (which never writes) learns at once.
 pub type LostNotify = Arc<dyn Fn() + Send + Sync>;
 
+/// Called, from whatever thread notices, with the new volume (the slider value, 0.0 to 1.0)
+/// when something outside the app changed the output's volume: a mixer, a desktop volume
+/// popup. Never for a change made through `Sink::set_volume`.
+pub type VolumeNotify = Arc<dyn Fn(f32) + Send + Sync>;
+
 /// An audio output. Owned by the audio thread, so `&mut self` everywhere.
 pub trait Sink: Send {
     /// Prepares the output for interleaved `f32` audio at `rate` with `channels` channels.
@@ -38,6 +43,11 @@ pub trait Sink: Send {
     fn watch_lost(&mut self, notify: LostNotify) {
         let _ = notify;
     }
+    /// Calls `notify` each time the output's volume is changed from outside the app. An
+    /// output no one else can change ignores it.
+    fn watch_volume(&mut self, notify: VolumeNotify) {
+        let _ = notify;
+    }
 }
 
 /// What a `NullSink` saw. Shared, so a test keeps reading it after the sink moves to the
@@ -51,10 +61,27 @@ pub struct NullStats {
     /// f32 bits.
     volume: AtomicU32,
     rate: AtomicU32,
+    /// Realtime: nanoseconds the pretend buffer sat empty while playing, between two pieces
+    /// of audio (a gap a listener would hear).
+    silence_ns: AtomicU64,
     /// Set by `lose_output`, cleared by the next `open`.
     lost: AtomicBool,
     /// Told when `lose_output` loses the output.
     watcher: Watcher,
+    /// Told when `mixer_volume` changes the volume.
+    volume_watcher: VolumeWatcher,
+    /// `set_volume` calls.
+    volume_sets: AtomicU64,
+}
+
+/// `NullStats`' volume watcher, in a type of its own so the stats stay `Debug`.
+#[derive(Default)]
+struct VolumeWatcher(Mutex<Option<VolumeNotify>>);
+
+impl std::fmt::Debug for VolumeWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VolumeWatcher")
+    }
 }
 
 /// `NullStats`' watcher, in a type of its own so the stats stay `Debug`.
@@ -88,6 +115,33 @@ impl NullStats {
     pub fn rate(&self) -> u32 {
         self.rate.load(Ordering::SeqCst)
     }
+    /// Realtime: how long the output ran dry while playing, after audio and before more
+    /// came (the gaps a listener would hear). Not counted: before the first audio, after a
+    /// flush, after the last audio, and while paused.
+    pub fn silence(&self) -> Duration {
+        Duration::from_nanos(self.silence_ns.load(Ordering::SeqCst))
+    }
+
+    /// How many times the sink's `set_volume` was called.
+    pub fn volume_sets(&self) -> u64 {
+        self.volume_sets.load(Ordering::SeqCst)
+    }
+
+    /// Plays a mixer turning the output to `v`: the volume changes and the watcher is told,
+    /// as a `PipeWireSink` does when its stream's volume is changed from outside.
+    pub fn mixer_volume(&self, v: f32) {
+        self.volume.store(v.to_bits(), Ordering::SeqCst);
+        let watcher = self
+            .volume_watcher
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(notify) = watcher {
+            notify(v);
+        }
+    }
+
     /// Plays a sound server restart: the sink acts like a `PipeWireSink` whose stream died
     /// (writes fail, `lost` is true) until it is opened again.
     pub fn lose_output(&self) {
@@ -125,6 +179,11 @@ pub struct NullSink {
     queued: u64,
     since: Instant,
     paused: bool,
+    /// Realtime: audio was written since the last flush, so running dry is a gap...
+    primed: bool,
+    /// ...once more audio follows: dry time not yet counted, in seconds. A song's end (no
+    /// more audio, then a pause) is not a gap.
+    dry: f64,
 }
 
 impl NullSink {
@@ -155,6 +214,8 @@ impl NullSink {
             queued: 0,
             since: Instant::now(),
             paused: false,
+            primed: false,
+            dry: 0.0,
         }
     }
 
@@ -172,6 +233,14 @@ impl NullSink {
     }
 
     fn settle(&mut self) {
+        if self.primed && !self.paused && self.rate > 0 {
+            // Played past what was queued: the buffer ran dry for the difference.
+            let dry =
+                self.since.elapsed().as_secs_f64() - self.queued as f64 / f64::from(self.rate);
+            if dry > 0.0 {
+                self.dry += dry;
+            }
+        }
         self.queued = self.fill_now();
         self.since = Instant::now();
     }
@@ -188,6 +257,8 @@ impl Sink for NullSink {
         if rate == 0 || channels == 0 {
             return Err(Error::Internal("bad output format".into()));
         }
+        // Account for the old rate's buffer (and any dry time) before the rate changes.
+        self.settle();
         self.rate = rate;
         self.channels = channels;
         self.stats.rate.store(rate, Ordering::SeqCst);
@@ -224,6 +295,13 @@ impl Sink for NullSink {
                 ));
             }
             self.queued += n;
+            self.primed = true;
+            if self.dry > 0.0 {
+                self.stats
+                    .silence_ns
+                    .fetch_add((self.dry * 1e9) as u64, Ordering::SeqCst);
+                self.dry = 0.0;
+            }
         }
         self.stats.frames.fetch_add(n, Ordering::SeqCst);
         self.stats.writes.fetch_add(1, Ordering::SeqCst);
@@ -237,6 +315,8 @@ impl Sink for NullSink {
     }
 
     fn flush(&mut self) {
+        self.primed = false;
+        self.dry = 0.0;
         self.queued = 0;
         self.since = Instant::now();
         self.stats.flushes.fetch_add(1, Ordering::SeqCst);
@@ -244,6 +324,7 @@ impl Sink for NullSink {
 
     fn set_volume(&mut self, v: f32) {
         self.stats.volume.store(v.to_bits(), Ordering::SeqCst);
+        self.stats.volume_sets.fetch_add(1, Ordering::SeqCst);
     }
 
     fn delay_frames(&self) -> u64 {
@@ -261,6 +342,15 @@ impl Sink for NullSink {
         *self
             .stats
             .watcher
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(notify);
+    }
+
+    fn watch_volume(&mut self, notify: VolumeNotify) {
+        *self
+            .stats
+            .volume_watcher
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(notify);
@@ -318,6 +408,36 @@ mod tests {
             2,
             "a new output can be lost again"
         );
+    }
+
+    #[test]
+    fn realtime_counts_silence_while_dry() {
+        let mut s = NullSink::realtime();
+        let stats = s.stats();
+        s.open(48_000, 2).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // Before the first audio: not a gap.
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert_eq!(stats.silence(), Duration::ZERO);
+        // 20 ms queued, then 60 ms without a write: dry for about 40 ms.
+        std::thread::sleep(Duration::from_millis(60));
+        s.write(&[0.0; 960 * 2]).unwrap();
+        let dry = stats.silence();
+        assert!(
+            dry >= Duration::from_millis(35) && dry <= Duration::from_millis(60),
+            "{dry:?}"
+        );
+        // Paused: nothing plays, so nothing runs dry.
+        s.pause(true);
+        std::thread::sleep(Duration::from_millis(60));
+        s.pause(false);
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert!(stats.silence() - dry < Duration::from_millis(5));
+        // A flush (a seek, a stop) ends the audio on purpose: the wait after it isn't a gap.
+        s.flush();
+        std::thread::sleep(Duration::from_millis(40));
+        s.write(&[0.0; 960 * 2]).unwrap();
+        assert!(stats.silence() - dry < Duration::from_millis(5));
     }
 
     #[test]

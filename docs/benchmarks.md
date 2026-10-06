@@ -57,6 +57,22 @@ Stream link resolution, same song, signed in:
 | Own code, a new YouTube player version (one cold solve, once per version, about weekly) | 3 to 5.5 s |
 | yt-dlp fallback | 3.9 s |
 
+## ytmfast step 2 (the queue), 2026-10-06, on AC power
+
+Same method and song as step 1. A play now also fetches the song's radio queue, sends play reports, and
+preloads the next song for gapless playback; the 300 s window covers the song's end, the handover and the start
+of the next song.
+
+| Measure | Median | Range |
+|---|---|---|
+| RAM (PSS) | 45.5 MB | 45.1 to 46.2 MB |
+| Processes | 1 (8 threads) | |
+| CPU while playing | 0.68% of one core | 0.65 to 0.68% |
+| Time to first sound (from closed) | 0.74 s | 0.66 to 0.89 s |
+
+The extra 14 MB over step 1 is probably mostly the preloaded next song (its whole download is held in memory, about
+7 MB for a 4-minute song) and the queue; this was not broken down further.
+
 ## Power (CPU package energy), 2026-10-05, on AC power
 
 Measured with the processor's own energy counter (Intel RAPL, `intel-rapl:0` package) over 240 s of playback after

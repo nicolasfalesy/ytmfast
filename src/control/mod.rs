@@ -22,6 +22,7 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -32,7 +33,7 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 
-use crate::engine::{Engine, EngineCmd, EngineEvent, Status};
+use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
 use crate::mpris;
 use idle::IdlePolicy;
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
@@ -45,6 +46,12 @@ pub const SOCKET_NAME: &str = "socket";
 /// above the engine's 64-event buffer: a lagged client gets those 64 plus a fresh state in
 /// one go, before its writer has had a turn, and that must not count as stuck.
 const OUT_QUEUE: usize = 256;
+
+/// Bytes of lines that may wait for one client (queued, or in the write under way), as well
+/// as `OUT_QUEUE` lines. A queue event can be about 375 KB (1,000 songs), so 256 of them
+/// would hold close to 100 MB for one client that stopped reading; 4 MiB is still about ten
+/// full queue events of slack for a slow but live one.
+const OUT_BYTES: usize = 4 << 20;
 
 /// How long a closing client gets to take what is already queued for it (a reply sent just
 /// before the client half-closed, or the `quit` reply).
@@ -261,7 +268,7 @@ async fn serve_with(
                 let now_playing = match event {
                     Ok(EngineEvent::State(s)) => idle::is_playing(s.state),
                     Ok(_) => continue,
-                    // Missed some states: ask for the current one (Task 8 carry).
+                    // Missed some states: ask for the current one.
                     Err(RecvError::Lagged(_)) => match query_status(&shared.cmds).await {
                         Some(s) => idle::is_playing(s.state),
                         None => return Exit::EngineGone,
@@ -317,6 +324,28 @@ async fn query_status(cmds: &mpsc::Sender<EngineCmd>) -> Option<Status> {
     rx.await.ok()
 }
 
+async fn query_queue(cmds: &mpsc::Sender<EngineCmd>) -> Option<QueueView> {
+    let (tx, rx) = oneshot::channel();
+    cmds.send(EngineCmd::QueueGet(tx)).await.ok()?;
+    rx.await.ok()
+}
+
+/// What a client that fell behind may have missed: the state, and the queue (a missed
+/// queue event would leave a widget's list wrong until the next change). One line each.
+async fn catch_up(cmds: &mpsc::Sender<EngineCmd>) -> Option<[String; 2]> {
+    let status = query_status(cmds).await?;
+    let queue = query_queue(cmds).await?;
+    Some([
+        protocol::event_line(&EngineEvent::State(status)),
+        protocol::event_line(&EngineEvent::Queue {
+            items: queue.items,
+            current_id: queue.current_id,
+            shuffle: queue.shuffle,
+            repeat: queue.repeat,
+        }),
+    ])
+}
+
 /// How a client's connection ends.
 enum Close {
     /// Let the writer send what is queued first (up to `FLUSH_WAIT`).
@@ -328,8 +357,12 @@ enum Close {
 /// One client: reads its requests and forwards engine events into its writer's queue.
 async fn client(stream: UnixStream, shared: Arc<Shared>) {
     let (read_half, write_half) = stream.into_split();
-    let (out, out_rx) = mpsc::channel::<String>(OUT_QUEUE);
-    let mut writer = tokio::spawn(write_lines(write_half, out_rx));
+    let (tx, out_rx) = mpsc::channel::<String>(OUT_QUEUE);
+    let out = Outbox {
+        tx,
+        bytes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut writer = tokio::spawn(write_lines(write_half, out_rx, out.bytes.clone()));
     let mut events = shared.events.subscribe();
     let mut lines = LineReader::new(read_half);
     let mut quit = false;
@@ -359,18 +392,20 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                 Err(_) => break Close::Now,
             },
             event = events.recv() => {
-                let line = match event {
-                    Ok(e) => protocol::event_line(&e),
-                    // It missed some events: a fresh state covers them (Task 8 carry).
-                    Err(RecvError::Lagged(_)) => match query_status(&shared.cmds).await {
-                        Some(s) => protocol::event_line(&EngineEvent::State(s)),
+                // A big queue goes through the same bounded queue as everything else: a
+                // client that stopped reading is still dropped, never waited on.
+                let pushed = match event {
+                    Ok(e) => push(&out, protocol::event_line(&e)),
+                    // It missed some events: a fresh state and queue cover them.
+                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds).await {
+                        Some(lines) => lines.into_iter().all(|l| push(&out, l)),
                         None => break Close::Flush,
                     },
                     // Can't happen while the hub's `shared.events` sender lives; kept so a
                     // closed channel ends the client rather than spinning.
                     Err(RecvError::Closed) => break Close::Flush,
                 };
-                if !push(&out, line) {
+                if !pushed {
                     break Close::Now;
                 }
             }
@@ -393,10 +428,39 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     }
 }
 
-/// Queues a line for the writer; false when the queue is full or the writer is gone, and
-/// the client should be dropped.
-fn push(out: &mpsc::Sender<String>, line: String) -> bool {
-    out.try_send(line).is_ok()
+/// One client's outgoing lines, capped by count (the channel) and by bytes.
+struct Outbox {
+    tx: mpsc::Sender<String>,
+    /// Bytes pushed and not yet written; the writer takes them off once written.
+    bytes: Arc<AtomicUsize>,
+}
+
+/// Queues a line for the writer; false when the queue is full (`OUT_QUEUE` lines or
+/// `OUT_BYTES` bytes) or the writer is gone, and the client should be dropped.
+fn push(out: &Outbox, line: String) -> bool {
+    let n = line.len();
+    // Reserve the bytes, or refuse. A plain compare-exchange loop rather than `fetch_update`,
+    // which newer Rust deprecates (renamed `try_update`, missing from older ones): this builds
+    // warning-free on both. An empty outbox always takes the line, so one line over the cap
+    // (none should be) can't drop every client; the next line then waits for it.
+    let mut b = out.bytes.load(Ordering::Acquire);
+    loop {
+        if b != 0 && b + n > OUT_BYTES {
+            return false;
+        }
+        match out
+            .bytes
+            .compare_exchange_weak(b, b + n, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(now) => b = now,
+        }
+    }
+    if out.tx.try_send(line).is_err() {
+        out.bytes.fetch_sub(n, Ordering::AcqRel);
+        return false;
+    }
+    true
 }
 
 /// One request: its reply line, and whether it was `quit`.
@@ -420,18 +484,54 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
             };
             return (reply, false);
         }
+        Request::QueueGet => {
+            let reply = match query_queue(&shared.cmds).await {
+                Some(q) => protocol::ok_reply(id, protocol::queue_data(&q)),
+                None => gone(),
+            };
+            return (reply, false);
+        }
         Request::Quit => return (protocol::ok_reply(id, json!({})), true),
         Request::Play {
             video_id,
+            playlist_id,
+            index,
             start_seconds,
         } => EngineCmd::Play {
             video_id,
+            playlist_id,
+            index,
             start_seconds,
         },
         Request::Pause => EngineCmd::Pause,
         Request::Toggle => EngineCmd::Toggle,
         Request::Seek { seconds } => EngineCmd::Seek(seconds),
         Request::Volume { percent } => EngineCmd::Volume(protocol::percent_to_volume(percent)),
+        Request::Next => EngineCmd::Next,
+        Request::Previous => EngineCmd::Previous,
+        // Answered by the engine, which alone knows whether the songs fit (ruling S15).
+        Request::QueueAdd { songs, at } => {
+            let (added, ok) = oneshot::channel();
+            if shared
+                .cmds
+                .send(EngineCmd::QueueAdd { songs, at, added })
+                .await
+                .is_err()
+            {
+                return (gone(), false);
+            }
+            let reply = match ok.await {
+                Ok(true) => protocol::ok_reply(id, json!({})),
+                Ok(false) => protocol::error_reply(Some(id), BAD_REQUEST, "the queue is full"),
+                Err(_) => gone(),
+            };
+            return (reply, false);
+        }
+        Request::QueueRemove { id } => EngineCmd::QueueRemove(id),
+        Request::QueueJump { id } => EngineCmd::QueueJump(id),
+        Request::QueueMove { id, index } => EngineCmd::QueueMove { id, index },
+        Request::Shuffle { on } => EngineCmd::Shuffle(on),
+        Request::Repeat { mode } => EngineCmd::Repeat(mode),
     };
     // "ok" means the engine took the command; what came of it arrives as events.
     match shared.cmds.send(cmd).await {
@@ -441,8 +541,14 @@ async fn handle(shared: &Shared, text: &[u8]) -> (String, bool) {
 }
 
 /// Writes queued lines until the queue closes or the socket fails. Takes whatever else is
-/// already queued along with each line, so a burst goes out in one write.
-async fn write_lines<W: AsyncWrite + Unpin>(mut socket: W, mut queue: mpsc::Receiver<String>) {
+/// already queued along with each line, so a burst goes out in one write. `bytes` drops by
+/// what was written only once it is written: a batch stuck in a write still counts against
+/// the client's `OUT_BYTES`.
+async fn write_lines<W: AsyncWrite + Unpin>(
+    mut socket: W,
+    mut queue: mpsc::Receiver<String>,
+    bytes: Arc<AtomicUsize>,
+) {
     let mut buf = Vec::new();
     while let Some(line) = queue.recv().await {
         buf.clear();
@@ -453,6 +559,7 @@ async fn write_lines<W: AsyncWrite + Unpin>(mut socket: W, mut queue: mpsc::Rece
         if socket.write_all(&buf).await.is_err() {
             return;
         }
+        bytes.fetch_sub(buf.len(), Ordering::AcqRel);
     }
     let _ = socket.shutdown().await;
 }
@@ -768,6 +875,30 @@ mod tests {
         std::fs::write(&path, "keep me").unwrap();
         assert!(bind_socket(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn an_empty_outbox_takes_one_oversized_line() {
+        // One line over the byte cap (none should be, but a cap must not make a line that
+        // big drop every client) goes out when nothing else waits; the next one waits for it.
+        let (tx, _rx) = mpsc::channel::<String>(OUT_QUEUE);
+        let out = Outbox {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(push(&out, "x".repeat(OUT_BYTES + 1)));
+        assert!(!push(&out, "y".into()));
+        assert_eq!(out.bytes.load(Ordering::Acquire), OUT_BYTES + 1);
+        // Under the cap, lines go in until the next would pass it.
+        let (tx, _rx) = mpsc::channel::<String>(OUT_QUEUE);
+        let out = Outbox {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(push(&out, "a".repeat(OUT_BYTES - 1)));
+        assert!(push(&out, "b".into()));
+        assert!(!push(&out, "c".into()));
+        assert_eq!(out.bytes.load(Ordering::Acquire), OUT_BYTES);
     }
 
     #[tokio::test]

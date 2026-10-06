@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use url::Url;
 use ytmfast::audio::decode::loudness_gain;
 use ytmfast::audio::fetch::{Relink, TrackBuffer};
 use ytmfast::audio::player::{AudioEvent, AudioPlayer};
@@ -19,10 +18,12 @@ use ytmfast::auth::{KeyringStore, Session, SessionStore, chromium, sidhash};
 use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
-use ytmfast::innertube::{API_BASE, Innertube, clients};
+use ytmfast::innertube::{Innertube, clients};
 use ytmfast::paths;
+use ytmfast::report::Reporter;
 use ytmfast::solver::Solver;
-use ytmfast::streams::lazy::{self, LazyResolver};
+use ytmfast::state;
+use ytmfast::streams::lazy::{self, LazySession};
 use ytmfast::streams::ytdlp::{self, YtDlpCommand};
 use ytmfast::streams::{Resolver, Streams, TrackMeta};
 
@@ -260,33 +261,34 @@ fn describe(e: Error) -> String {
     format!("{e} [{}]", e.code())
 }
 
-/// The real resolver over the session in the login keyring. The keyring is read on the first
-/// resolve, not here (`LazyResolver`): the daemon answers its socket and signals at once, a
-/// missing session is reported per play (usually `signed_out`, as an error event the widget
-/// shows) instead of the daemon refusing to start, and a session imported later is picked
-/// up. A message when a folder is missing.
-fn resolver() -> Result<Arc<dyn Resolver>, String> {
+/// The real resolver and queue source over the session in the login keyring. The keyring is
+/// read on the first resolve or queue request, not here (`LazySession`): the daemon answers
+/// its socket and signals at once, a missing session is reported per play (usually
+/// `signed_out`, as an error event the widget shows) instead of the daemon refusing to start,
+/// and a session imported later is picked up. A message when a folder is missing.
+fn backend() -> Result<Arc<LazySession>, String> {
     let store: Arc<dyn SessionStore> = Arc::new(KeyringStore::new());
-    let base = Url::parse(API_BASE).map_err(|_| "bad API address".to_string())?;
     let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
     let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
     let api_store = store.clone();
     let build: lazy::Build = Box::new(move |session| {
         let session = Arc::new(Mutex::new(session));
-        let api = Arc::new(Innertube::new(
-            session.clone(),
-            api_store.clone(),
-            base.clone(),
-        ));
-        Arc::new(Streams::new(
-            api,
+        let api = Arc::new(Innertube::production(session.clone(), api_store.clone()));
+        let resolver = Arc::new(Streams::new(
+            api.clone(),
             session,
             Arc::new(Solver::new(cache.clone())),
             Arc::new(YtDlpCommand::new(runtime_dir.clone())),
             cache.clone(),
-        ))
+        ));
+        // One `Innertube` (so one session) for links, queues and play reports.
+        lazy::Loaded {
+            resolver: resolver.clone(),
+            queue: api,
+            reports: resolver,
+        }
     });
-    Ok(Arc::new(LazyResolver::new(store, build)))
+    Ok(Arc::new(LazySession::new(store, build)))
 }
 
 /// Runs the engine behind the control socket until `quit` or idle.
@@ -364,14 +366,32 @@ async fn serve(
     if let Ok(dir) = paths::runtime_dir() {
         ytdlp::sweep_stale(&dir);
     }
-    let resolver = resolver()?;
+    let backend = backend()?;
     let sink: Box<dyn Sink> = if null_sink {
         Box::new(NullSink::realtime())
     } else {
         Box::new(PipeWireSink::new())
     };
     let player = AudioPlayer::spawn(sink);
-    let (engine, cmds, events) = Engine::new(resolver, player);
+    let (mut engine, cmds, events) = Engine::new(backend.clone(), backend.clone(), player);
+    // Every song heard counts in the account's YouTube Music history, as with the official
+    // player (its pings go through the same lazily loaded session).
+    engine.report_with(Reporter::new(backend));
+    // The queue, song and second from before the restart (paused: resume never plays by
+    // itself), and saving from now on. Without a state folder the engine still plays; it
+    // just starts fresh each time.
+    match paths::state_dir() {
+        Ok(dir) => {
+            if let Some(saved) = state::load(&dir) {
+                engine.restore(saved);
+            }
+            engine.save_with(state::Writer::spawn(dir));
+        }
+        Err(e) => eprintln!(
+            "ytmfast: no state folder ({:?}); the queue won't survive a restart",
+            e.kind()
+        ),
+    }
     // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
     // session bus it logs one line and the socket carries on alone.
     let options = control::Options {
@@ -382,7 +402,7 @@ async fn serve(
 }
 
 async fn play_track(args: PlayArgs) -> Result<(), String> {
-    let resolver = resolver()?;
+    let resolver: Arc<dyn Resolver> = backend()?;
 
     ytmfast::trace::play(&args.video_id);
     let stream = resolver.resolve(&args.video_id).await.map_err(describe)?;
@@ -457,9 +477,11 @@ fn wait_for_end(events: &Receiver<AudioEvent>, seconds: Option<f64>) -> Result<(
             AudioEvent::Ended => return Ok(()),
             AudioEvent::Error(e) => return Err(e.to_string()),
             AudioEvent::Loading
+            | AudioEvent::Advanced(_)
             | AudioEvent::Started
             | AudioEvent::Paused
-            | AudioEvent::Resumed => {}
+            | AudioEvent::Resumed
+            | AudioEvent::VolumeChanged(_) => {}
         }
     }
 }

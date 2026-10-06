@@ -1,0 +1,1741 @@
+{
+ "contents": {
+  "singleColumnMusicWatchNextResultsRenderer": {
+   "tabbedRenderer": {
+    "watchNextTabbedResultsRenderer": {
+     "tabs": [
+      {
+       "tabRenderer": {
+        "title": "Text 1",
+        "content": {
+         "musicQueueRenderer": {}
+        }
+       }
+      }
+     ]
+    }
+   }
+  }
+ },
+ "continuationContents": {
+  "playlistPanelContinuation": {
+   "contents": [
+    {
+     "playlistPanelVideoWrapperRenderer": {
+      "primaryRenderer": {
+       "playlistPanelVideoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Text 83"
+          }
+         ]
+        },
+        "longBylineText": {
+         "runs": [
+          {
+           "text": "Text 49",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "UCfakeB0034",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 49",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "MPREb_fakeB0035",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 50"
+          }
+         ]
+        },
+        "thumbnail": {
+         "thumbnails": [
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 60,
+           "height": 60
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 120,
+           "height": 120
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 180,
+           "height": 180
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 226,
+           "height": 226
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 302,
+           "height": 302
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 544,
+           "height": 544
+          }
+         ]
+        },
+        "lengthText": {
+         "runs": [
+          {
+           "text": "2:44"
+          }
+         ]
+        },
+        "selected": false,
+        "navigationEndpoint": {
+         "watchEndpoint": {
+          "videoId": "fakeV000060",
+          "playlistId": "RDAMVMfakeP0018",
+          "index": 50,
+          "params": "faketoken"
+         }
+        },
+        "videoId": "fakeV000060",
+        "shortBylineText": {
+         "runs": [
+          {
+           "text": "Text 49"
+          }
+         ]
+        }
+       }
+      },
+      "counterpart": [
+       {
+        "counterpartRenderer": {
+         "playlistPanelVideoRenderer": {
+          "title": {
+           "runs": [
+            {
+             "text": "Text 84"
+            }
+           ]
+          },
+          "longBylineText": {
+           "runs": [
+            {
+             "text": "Text 49",
+             "navigationEndpoint": {
+              "browseEndpoint": {
+               "browseId": "UCfakeB0061",
+               "browseEndpointContextSupportedConfigs": {
+                "browseEndpointContextMusicConfig": {
+                 "pageType": "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                }
+               }
+              }
+             }
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 85"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 86"
+            }
+           ]
+          },
+          "thumbnail": {
+           "thumbnails": [
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 400,
+             "height": 225
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 800,
+             "height": 450
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 853,
+             "height": 479
+            }
+           ]
+          },
+          "lengthText": {
+           "runs": [
+            {
+             "text": "2:42"
+            }
+           ]
+          },
+          "selected": false,
+          "navigationEndpoint": {
+           "watchEndpoint": {
+            "videoId": "fakeV000062",
+            "playlistId": "RDAMVMfakeP0018",
+            "params": "faketoken"
+           }
+          },
+          "videoId": "fakeV000062",
+          "shortBylineText": {
+           "runs": [
+            {
+             "text": "Text 49"
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "playlistPanelVideoWrapperRenderer": {
+      "primaryRenderer": {
+       "playlistPanelVideoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Text 87"
+          }
+         ]
+        },
+        "longBylineText": {
+         "runs": [
+          {
+           "text": "Text 88",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "UCfakeB0063",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 89",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "MPREb_fakeB0064",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 90"
+          }
+         ]
+        },
+        "thumbnail": {
+         "thumbnails": [
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 60,
+           "height": 60
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 120,
+           "height": 120
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 180,
+           "height": 180
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 226,
+           "height": 226
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 302,
+           "height": 302
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 544,
+           "height": 544
+          }
+         ]
+        },
+        "lengthText": {
+         "runs": [
+          {
+           "text": "3:50"
+          }
+         ]
+        },
+        "selected": false,
+        "navigationEndpoint": {
+         "watchEndpoint": {
+          "videoId": "fakeV000065",
+          "playlistId": "RDAMVMfakeP0018",
+          "index": 51,
+          "params": "faketoken"
+         }
+        },
+        "videoId": "fakeV000065",
+        "shortBylineText": {
+         "runs": [
+          {
+           "text": "Text 88"
+          }
+         ]
+        }
+       }
+      },
+      "counterpart": [
+       {
+        "counterpartRenderer": {
+         "playlistPanelVideoRenderer": {
+          "title": {
+           "runs": [
+            {
+             "text": "Text 91"
+            }
+           ]
+          },
+          "longBylineText": {
+           "runs": [
+            {
+             "text": "Text 88"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 92"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 93"
+            }
+           ]
+          },
+          "thumbnail": {
+           "thumbnails": [
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 400,
+             "height": 225
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 800,
+             "height": 450
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 853,
+             "height": 479
+            }
+           ]
+          },
+          "lengthText": {
+           "runs": [
+            {
+             "text": "4:19"
+            }
+           ]
+          },
+          "selected": false,
+          "navigationEndpoint": {
+           "watchEndpoint": {
+            "videoId": "fakeV000066",
+            "playlistId": "RDAMVMfakeP0018",
+            "params": "faketoken"
+           }
+          },
+          "videoId": "fakeV000066",
+          "shortBylineText": {
+           "runs": [
+            {
+             "text": "Text 88"
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 94"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 95",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0067",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 94",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0068",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 61"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "3:33"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000069",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 52,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000069",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 95"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 96"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 33",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0023",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 34",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0024",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 5"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "3:06"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000070",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 53,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000070",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 33"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 97"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 23",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0015",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 97",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0071",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 98"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "4:15"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000072",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 54,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000072",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 23"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 99"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 100",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0073",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 101",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0074",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 102"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "3:04"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000075",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 55,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000075",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 100"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoWrapperRenderer": {
+      "primaryRenderer": {
+       "playlistPanelVideoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Text 103"
+          }
+         ]
+        },
+        "longBylineText": {
+         "runs": [
+          {
+           "text": "Text 104",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "UCfakeB0076",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 103",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "MPREb_fakeB0077",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 102"
+          }
+         ]
+        },
+        "thumbnail": {
+         "thumbnails": [
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 60,
+           "height": 60
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 120,
+           "height": 120
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 180,
+           "height": 180
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 226,
+           "height": 226
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 302,
+           "height": 302
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 544,
+           "height": 544
+          }
+         ]
+        },
+        "lengthText": {
+         "runs": [
+          {
+           "text": "2:29"
+          }
+         ]
+        },
+        "selected": false,
+        "navigationEndpoint": {
+         "watchEndpoint": {
+          "videoId": "fakeV000078",
+          "playlistId": "RDAMVMfakeP0018",
+          "index": 56,
+          "params": "faketoken"
+         }
+        },
+        "videoId": "fakeV000078",
+        "shortBylineText": {
+         "runs": [
+          {
+           "text": "Text 104"
+          }
+         ]
+        }
+       }
+      },
+      "counterpart": [
+       {
+        "counterpartRenderer": {
+         "playlistPanelVideoRenderer": {
+          "title": {
+           "runs": [
+            {
+             "text": "Text 103"
+            }
+           ]
+          },
+          "longBylineText": {
+           "runs": [
+            {
+             "text": "Text 104"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 105"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 106"
+            }
+           ]
+          },
+          "thumbnail": {
+           "thumbnails": [
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 400,
+             "height": 225
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 800,
+             "height": 450
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 853,
+             "height": 479
+            }
+           ]
+          },
+          "lengthText": {
+           "runs": [
+            {
+             "text": "2:28"
+            }
+           ]
+          },
+          "selected": false,
+          "navigationEndpoint": {
+           "watchEndpoint": {
+            "videoId": "fakeV000079",
+            "playlistId": "RDAMVMfakeP0018",
+            "params": "faketoken"
+           }
+          },
+          "videoId": "fakeV000079",
+          "shortBylineText": {
+           "runs": [
+            {
+             "text": "Text 104"
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "playlistPanelVideoWrapperRenderer": {
+      "primaryRenderer": {
+       "playlistPanelVideoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Text 107"
+          }
+         ]
+        },
+        "longBylineText": {
+         "runs": [
+          {
+           "text": "Text 108",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "UCfakeB0080",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 109",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "MPREb_fakeB0081",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 29"
+          }
+         ]
+        },
+        "thumbnail": {
+         "thumbnails": [
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 60,
+           "height": 60
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 120,
+           "height": 120
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 180,
+           "height": 180
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 226,
+           "height": 226
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 302,
+           "height": 302
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 544,
+           "height": 544
+          }
+         ]
+        },
+        "lengthText": {
+         "runs": [
+          {
+           "text": "2:26"
+          }
+         ]
+        },
+        "selected": false,
+        "navigationEndpoint": {
+         "watchEndpoint": {
+          "videoId": "fakeV000082",
+          "playlistId": "RDAMVMfakeP0018",
+          "index": 57,
+          "params": "faketoken"
+         }
+        },
+        "videoId": "fakeV000082",
+        "shortBylineText": {
+         "runs": [
+          {
+           "text": "Text 108"
+          }
+         ]
+        }
+       }
+      },
+      "counterpart": [
+       {
+        "counterpartRenderer": {
+         "playlistPanelVideoRenderer": {
+          "title": {
+           "runs": [
+            {
+             "text": "Text 107"
+            }
+           ]
+          },
+          "longBylineText": {
+           "runs": [
+            {
+             "text": "Text 108"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 110"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 111"
+            }
+           ]
+          },
+          "thumbnail": {
+           "thumbnails": [
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 400,
+             "height": 225
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 800,
+             "height": 450
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 853,
+             "height": 479
+            }
+           ]
+          },
+          "lengthText": {
+           "runs": [
+            {
+             "text": "2:30"
+            }
+           ]
+          },
+          "selected": false,
+          "navigationEndpoint": {
+           "watchEndpoint": {
+            "videoId": "fakeV000083",
+            "playlistId": "RDAMVMfakeP0018",
+            "params": "faketoken"
+           }
+          },
+          "videoId": "fakeV000083",
+          "shortBylineText": {
+           "runs": [
+            {
+             "text": "Text 108"
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 112"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 23",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0015",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 22",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0016",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 24"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "3:48"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000084",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 58,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000084",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 23"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 113"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 114",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0085",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 115",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0086",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 5"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "2:38"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000087",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 59,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000087",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 114"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "playlistPanelVideoWrapperRenderer": {
+      "primaryRenderer": {
+       "playlistPanelVideoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Text 116"
+          }
+         ]
+        },
+        "longBylineText": {
+         "runs": [
+          {
+           "text": "Text 49",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "UCfakeB0034",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 117",
+           "navigationEndpoint": {
+            "browseEndpoint": {
+             "browseId": "MPREb_fakeB0088",
+             "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": {
+               "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+              }
+             }
+            }
+           }
+          },
+          {
+           "text": " • "
+          },
+          {
+           "text": "Text 90"
+          }
+         ]
+        },
+        "thumbnail": {
+         "thumbnails": [
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 60,
+           "height": 60
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 120,
+           "height": 120
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 180,
+           "height": 180
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 226,
+           "height": 226
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 302,
+           "height": 302
+          },
+          {
+           "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+           "width": 544,
+           "height": 544
+          }
+         ]
+        },
+        "lengthText": {
+         "runs": [
+          {
+           "text": "2:41"
+          }
+         ]
+        },
+        "selected": false,
+        "navigationEndpoint": {
+         "watchEndpoint": {
+          "videoId": "fakeV000089",
+          "playlistId": "RDAMVMfakeP0018",
+          "index": 60,
+          "params": "faketoken"
+         }
+        },
+        "videoId": "fakeV000089",
+        "shortBylineText": {
+         "runs": [
+          {
+           "text": "Text 49"
+          }
+         ]
+        }
+       }
+      },
+      "counterpart": [
+       {
+        "counterpartRenderer": {
+         "playlistPanelVideoRenderer": {
+          "title": {
+           "runs": [
+            {
+             "text": "Text 118"
+            }
+           ]
+          },
+          "longBylineText": {
+           "runs": [
+            {
+             "text": "Text 49"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 119"
+            },
+            {
+             "text": " • "
+            },
+            {
+             "text": "Text 120"
+            }
+           ]
+          },
+          "thumbnail": {
+           "thumbnails": [
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 400,
+             "height": 225
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 800,
+             "height": 450
+            },
+            {
+             "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+             "width": 853,
+             "height": 479
+            }
+           ]
+          },
+          "lengthText": {
+           "runs": [
+            {
+             "text": "2:43"
+            }
+           ]
+          },
+          "selected": false,
+          "navigationEndpoint": {
+           "watchEndpoint": {
+            "videoId": "fakeV000090",
+            "playlistId": "RDAMVMfakeP0018",
+            "params": "faketoken"
+           }
+          },
+          "videoId": "fakeV000090",
+          "shortBylineText": {
+           "runs": [
+            {
+             "text": "Text 49"
+            }
+           ]
+          }
+         }
+        }
+       }
+      ]
+     }
+    },
+    {
+     "playlistPanelVideoRenderer": {
+      "title": {
+       "runs": [
+        {
+         "text": "Text 121"
+        }
+       ]
+      },
+      "longBylineText": {
+       "runs": [
+        {
+         "text": "Text 122",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "UCfakeB0091",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 121",
+         "navigationEndpoint": {
+          "browseEndpoint": {
+           "browseId": "MPREb_fakeB0092",
+           "browseEndpointContextSupportedConfigs": {
+            "browseEndpointContextMusicConfig": {
+             "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+            }
+           }
+          }
+         }
+        },
+        {
+         "text": " • "
+        },
+        {
+         "text": "Text 72"
+        }
+       ]
+      },
+      "thumbnail": {
+       "thumbnails": [
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 60,
+         "height": 60
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 120,
+         "height": 120
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 180,
+         "height": 180
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 226,
+         "height": 226
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 302,
+         "height": 302
+        },
+        {
+         "url": "https://lh3.googleusercontent.com/fake=w544-h544-l90-rj",
+         "width": 544,
+         "height": 544
+        }
+       ]
+      },
+      "lengthText": {
+       "runs": [
+        {
+         "text": "2:45"
+        }
+       ]
+      },
+      "selected": false,
+      "navigationEndpoint": {
+       "watchEndpoint": {
+        "videoId": "fakeV000093",
+        "playlistId": "RDAMVMfakeP0018",
+        "index": 61,
+        "params": "faketoken"
+       }
+      },
+      "videoId": "fakeV000093",
+      "shortBylineText": {
+       "runs": [
+        {
+         "text": "Text 122"
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "playlistId": "RDAMVMfakeP0018",
+   "isInfinite": true,
+   "continuations": [
+    {
+     "nextRadioContinuationData": {
+      "continuation": "faketoken"
+     }
+    }
+   ]
+  }
+ }
+}
