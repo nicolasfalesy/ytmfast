@@ -381,8 +381,8 @@ struct Paged {
 }
 
 /// The like statuses learned lately, by video id: the last `LIKES_KEPT`. A small list, looked
-/// through in order: at 100 entries that is cheaper than hashing, and keeps the order to drop
-/// the oldest by.
+/// through in order: at 100 short ids a scan is well under a microsecond, about once per song,
+/// and the list itself is the order to drop the oldest by (a map would need a second one).
 #[derive(Default)]
 struct Likes(std::collections::VecDeque<KnownLike>);
 
@@ -5617,8 +5617,8 @@ mod tests {
         assert_eq!(s.volume, 0.5);
         r.send(EngineCmd::Mute(false)).await;
         until_state(&mut r, |s| !s.muted).await;
-        eventually("the volume is back", || r.stats.volume() == 0.5).await;
-        assert_eq!(r.stats.volume_sets(), 3);
+        eventually("the volume is back", || r.stats.volume_sets() == 3).await;
+        assert_eq!(r.stats.volume(), 0.5);
         // While muted, setting the volume unmutes at the new volume: the user touched it.
         r.send(EngineCmd::Mute(true)).await;
         r.send(EngineCmd::Volume(0.7)).await;
@@ -5629,8 +5629,10 @@ mod tests {
         r.send(EngineCmd::Mute(true)).await;
         r.send(EngineCmd::Mute(false)).await;
         until_state(&mut r, |s| !s.muted).await;
-        eventually("the volume is back", || r.stats.volume() == 0.7).await;
-        assert_eq!(r.stats.volume_sets(), 7);
+        // The output takes volume changes on its own thread: wait for the count, as the
+        // volume read alone is already 0.7 before the mute reaches it.
+        eventually("two more volume changes", || r.stats.volume_sets() == 7).await;
+        assert_eq!(r.stats.volume(), 0.7);
     }
 
     #[tokio::test]
@@ -5643,13 +5645,16 @@ mod tests {
         // and the mixer's volume is the volume.
         r.stats.mixer_volume(0.3);
         until_state(&mut r, |s| !s.muted && s.volume == 0.3).await;
-        // Not sent back to the output, which already has it.
+        // Not sent back to the output, which already has it. (A set sent back would reach
+        // the output's thread a moment after the state: give it that moment.)
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(r.stats.volume_sets(), 2);
         // Even when the mixer puts it back at the volume it had.
         r.send(EngineCmd::Mute(true)).await;
         eventually("the output is silent", || r.stats.volume() == 0.0).await;
         r.stats.mixer_volume(0.3);
         until_state(&mut r, |s| !s.muted && s.volume == 0.3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(r.stats.volume_sets(), 3);
     }
 
