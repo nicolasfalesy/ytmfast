@@ -98,7 +98,9 @@ song even after the queue changes around it.
   `bad_request`. A `thumbnail` that isn't an https link on YouTube's or Google's image hosts
   is dropped (the song is still added). `lengthSeconds` is a whole number from 0 up.
 - With `videoIds`, the songs join without details; the engine fills them in when they play.
-- `at` is `"next"` (right after the current song) or `"end"` (the default).
+- `at` is `"next"` (right after the current song) or `"end"` (the default). While shuffle
+  is on, `"end"` songs are shuffled into the songs still to come (they go at the end of the
+  original order, which shuffle off brings back).
 - The queue holds at most 1,000 songs. An add that would take it past that is refused whole
   with `bad_request` and the message `the queue is full`; nothing is added. Remove songs
   first, or start a new queue with `play`.
@@ -110,7 +112,9 @@ shuffled order while shuffle is on); an `index` past the end moves it to the end
 error event says nothing was done.
 
 `shuffle` with `on: true` mixes the queue, with the current song moved first; with `false`
-it goes back to the original order, at the same song. `repeat` is `"off"`, `"all"` (the whole queue again after the last
+it goes back to the original order, at the same song. Songs that join later while it is on
+(a list's next page, radio songs) are shuffled into the songs still to come, never before
+the current one. `repeat` is `"off"`, `"all"` (the whole queue again after the last
 song) or `"one"` (the current song again when it ends; `next` and `previous` still move).
 
 ## Events

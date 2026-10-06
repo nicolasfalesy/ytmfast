@@ -342,7 +342,8 @@ impl Queue {
 
     /// Adds songs as new items, in the given order. `Next` puts them right after the current
     /// item, in the play order and (while shuffled) in the original order too, so they still
-    /// come next after shuffle is turned off. False, with nothing added, when they would take
+    /// come next after shuffle is turned off. `End` appends them; while shuffled, only to the
+    /// original order, and the play order gets them shuffled into the songs still to come. False, with nothing added, when they would take
     /// the queue past `MAX_ITEMS`: the user asked for these songs, so none are dropped
     /// quietly, and played songs are not dropped to make room either.
     pub fn add(&mut self, songs: Vec<SongItem>, at: AddAt) -> bool {
@@ -357,12 +358,16 @@ impl Queue {
         let items = self.new_items(songs);
         let ids = items.iter().map(|i| i.id);
         match at {
-            AddAt::End => {
-                if let Some(original) = &mut self.original {
+            AddAt::End => match &mut self.original {
+                // Shuffled: the original order appends them; the play order shuffles them
+                // into the songs still to come (ruling S10, the user's pick), so a later page
+                // of Liked songs or a radio refill isn't heard as one unshuffled run at the end.
+                Some(original) => {
                     original.extend(ids);
+                    self.shuffle_in(items);
                 }
-                self.items.extend(items);
-            }
+                None => self.items.extend(items),
+            },
             AddAt::Next => {
                 let current_id = self.current().map(|i| i.id);
                 if let Some(original) = &mut self.original {
@@ -431,9 +436,10 @@ impl Queue {
         self.repeat == Repeat::Off && left <= 2
     }
 
-    /// Appends a radio page at the end of both orders (radio songs stay in radio order even
-    /// while shuffled), skipping songs already among the queue's last 50 items, because
-    /// consecutive radio pages overlap. Returns how many were added.
+    /// Appends a radio page (or a list's next page) at the end of the original order; while
+    /// shuffled, the play order gets it shuffled into the songs still to come (ruling S10).
+    /// Songs already among the last 50 items appended are skipped, because consecutive radio
+    /// pages overlap. Returns how many were added.
     ///
     /// At `MAX_ITEMS`: first the played songs (before the current one in play order) are
     /// dropped from the front, keeping `KEEP_PLAYED`; then only what fits is appended. A refill
@@ -502,6 +508,31 @@ impl Queue {
                 QueueItem { id, song }
             })
             .collect()
+    }
+
+    /// Shuffles `new` into the items after the current one (all items, with no current one):
+    /// `new` is shuffled, then merged at random with the items to come, which keep their order
+    /// among themselves. Each step takes from either side in proportion to what is left on it,
+    /// which makes every interleaving equally likely. Keeping the order of the songs to come
+    /// keeps the next song (and its preload) in place unless a new song lands before it.
+    fn shuffle_in(&mut self, mut new: Vec<QueueItem>) {
+        self.rng.shuffle(&mut new);
+        let start = self.current.map_or(0, |c| c + 1);
+        let to_come: Vec<QueueItem> = self.items.drain(start..).collect();
+        let mut to_come = to_come.into_iter().peekable();
+        let mut new = new.into_iter().peekable();
+        let (mut a, mut b) = (to_come.len(), new.len());
+        self.items.reserve(a + b);
+        while a + b > 0 {
+            let item = if self.rng.below(a + b) < a {
+                a -= 1;
+                to_come.next()
+            } else {
+                b -= 1;
+                new.next()
+            };
+            self.items.extend(item);
+        }
     }
 
     /// Shuffles `items` with the current item first, and makes index 0 current. With no current
@@ -806,7 +837,9 @@ mod tests {
         q.add(vec![song("e")], AddAt::End);
         let i = q.current_index().unwrap();
         assert_eq!(q.items()[i + 1].song.video_id, "n");
-        assert_eq!(q.items().last().unwrap().song.video_id, "e");
+        // `End` while shuffled: somewhere after the current song (shuffled in, ruling S10).
+        let e = vids(&q).iter().position(|v| v == "e").unwrap();
+        assert!(e > i + 1, "{:?}", vids(&q));
         q.set_shuffle(false);
         let order = vids(&q);
         let p = order.iter().position(|v| *v == playing).unwrap();
@@ -920,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn append_radio_skips_overlap_and_goes_last_when_shuffled() {
+    fn append_radio_skips_overlap_and_goes_last_in_the_original_order() {
         let mut q = queue(3, 0);
         let n = q.append_radio(vec![song("r1"), song("r2")]);
         assert_eq!(n, 2);
@@ -931,17 +964,77 @@ mod tests {
         assert_eq!(vids(&q), vid_list(&["s0", "s1", "s2", "r1", "r2", "r3"]));
         assert_eq!(q.append_radio(Vec::new()), 0);
 
-        // Shuffled: radio songs land at the end of both orders, unshuffled among themselves.
+        // Shuffled: radio songs go after the current song in the play order (shuffled in,
+        // `later_pages_shuffle_into_the_songs_to_come`) and at the end of the original order.
         let mut q = queue(6, 0);
         q.set_shuffle(true);
         q.append_radio(vec![song("r1"), song("r2")]);
         let v = vids(&q);
-        assert_eq!(&v[6..], &vid_list(&["r1", "r2"])[..]);
+        assert_eq!(v[0], "s0");
+        assert!(v[1..].contains(&"r1".to_string()) && v[1..].contains(&"r2".to_string()));
         q.set_shuffle(false);
         assert_eq!(
             vids(&q),
             vid_list(&["s0", "s1", "s2", "s3", "s4", "s5", "r1", "r2"])
         );
+    }
+
+    #[test]
+    fn later_pages_shuffle_into_the_songs_to_come() {
+        // Shuffle on Liked songs: page 1 (20 songs) is shuffled, five songs are played, then
+        // page 2 comes (ruling S10).
+        let mut q = Queue::with_seed(11);
+        q.set_shuffle(true);
+        q.replace(songs_named("a", 20), 0);
+        for _ in 0..5 {
+            q.next(false);
+        }
+        let played: Vec<u64> = q.items()[..=5].iter().map(|i| i.id).collect();
+        let current = q.current().unwrap().clone();
+        let to_come: Vec<u64> = q.items()[6..].iter().map(|i| i.id).collect();
+        assert_eq!(q.append_radio(songs_named("b", 20)), 20);
+
+        // Played songs and the current one are untouched; page 2 went only after the current.
+        assert_eq!(q.current(), Some(&current));
+        assert_eq!(q.current_index(), Some(5));
+        let ids: Vec<u64> = q.items().iter().map(|i| i.id).collect();
+        assert_eq!(&ids[..=5], &played[..]);
+        // The page-1 songs to come keep their (shuffled) order among themselves...
+        let page1_after: Vec<u64> = ids[6..]
+            .iter()
+            .copied()
+            .filter(|id| to_come.contains(id))
+            .collect();
+        assert_eq!(page1_after, to_come);
+        // ...with page 2 interleaved, not tacked on behind them.
+        let upcoming = &vids(&q)[6..];
+        let first_b = upcoming.iter().position(|v| v.starts_with('b')).unwrap();
+        let last_a = upcoming.iter().rposition(|v| v.starts_with('a')).unwrap();
+        assert!(first_b < last_a, "{upcoming:?}");
+        // Page 2 itself is shuffled too.
+        let b_order: Vec<&String> = upcoming.iter().filter(|v| v.starts_with('b')).collect();
+        let b_given: Vec<String> = (0..20).map(|i| format!("b{i}")).collect();
+        assert_ne!(b_order, b_given.iter().collect::<Vec<_>>());
+        assert_orders_agree(&q);
+
+        // The original order still appends page 2 after page 1.
+        q.set_shuffle(false);
+        let mut want: Vec<String> = (0..20).map(|i| format!("a{i}")).collect();
+        want.extend(b_given);
+        assert_eq!(vids(&q), want);
+        assert_eq!(q.current(), Some(&current));
+
+        // The same for songs the user adds at the end, and with no current song yet.
+        let mut q = Queue::with_seed(5);
+        q.add(songs_named("a", 10), AddAt::End);
+        q.set_shuffle(true);
+        q.add(songs_named("e", 10), AddAt::End);
+        assert!(q.current().is_none());
+        let v = vids(&q);
+        let first_e = v.iter().position(|v| v.starts_with('e')).unwrap();
+        let last_a = v.iter().rposition(|v| v.starts_with('a')).unwrap();
+        assert!(first_e < last_a, "{v:?}");
+        assert_orders_agree(&q);
     }
 
     #[test]

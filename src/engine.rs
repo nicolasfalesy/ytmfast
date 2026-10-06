@@ -331,6 +331,10 @@ pub struct Engine {
     at_end: bool,
     /// Songs that failed in a row; a whole queue's worth stops the skipping.
     skip_streak: usize,
+    /// How long that queue was when the run of failures began (once its list was all there):
+    /// the pass the run stops after. Fixed then, because radio refills grow the queue while
+    /// it skips, and an endless radio of unplayable songs would never reach its length.
+    skip_cap: Option<usize>,
     /// Where the current song stopped after a failure: a play goes on from there.
     resume_from: Option<f64>,
     /// The current song's details from its link (fills gaps in the queue item's).
@@ -447,6 +451,7 @@ impl Engine {
             waiting: false,
             at_end: false,
             skip_streak: 0,
+            skip_cap: None,
             resume_from: None,
             resolved_meta: None,
             prefetch: None,
@@ -772,6 +777,7 @@ impl Engine {
         self.waiting = false;
         self.at_end = false;
         self.skip_streak = 0;
+        self.skip_cap = None;
         self.resume_from = None;
     }
 
@@ -1272,8 +1278,9 @@ impl Engine {
         self.emit_state();
     }
 
-    /// An unplayable song: report it and move on, unless every song in the queue failed in
-    /// a row (a full pass), which stops rather than skipping round for ever.
+    /// An unplayable song: report it and move on, unless a queue's worth of songs failed in a
+    /// row (a full pass, measured when the run began), which stops rather than skipping round
+    /// for ever.
     fn skip_unplayable(&mut self, e: &Error) {
         self.emit(EngineEvent::Error {
             code: e.code(),
@@ -1283,8 +1290,15 @@ impl Engine {
         self.started = false;
         self.ticker = None;
         self.skip_streak += 1;
-        // While a play's list is still coming, the queue isn't all there yet.
-        if self.loading.is_none() && self.skip_streak >= self.queue.len() {
+        // While a play's list is still coming, the queue isn't all there yet: the pass is
+        // measured at the first failure after it came.
+        if self.loading.is_none() && self.skip_cap.is_none() {
+            self.skip_cap = Some(self.queue.len());
+        }
+        if self
+            .skip_cap
+            .is_some_and(|cap| self.loading.is_none() && self.skip_streak >= cap)
+        {
             self.resume_from = None;
             self.status.state = PlayState::Stopped;
             self.emit_state();
@@ -1428,6 +1442,7 @@ impl Engine {
                 }
                 // A song played: the skipping run (if any) is over.
                 self.skip_streak = 0;
+                self.skip_cap = None;
                 if self.status.state == PlayState::Buffering {
                     self.set_playing();
                     self.emit_state();
@@ -1573,6 +1588,7 @@ impl Engine {
         self.resume_from = None;
         self.replayed = false;
         self.skip_streak = 0;
+        self.skip_cap = None;
         self.start_seconds = 0.0;
         self.status.video_id = Some(item.song.video_id.clone());
         self.status.queue_id = Some(item.id);
@@ -3313,6 +3329,42 @@ mod tests {
         assert_eq!(r.calls(), [vid('B'), vid('C'), vid('A')], "each tried once");
         assert_eq!(r.status().await.state, PlayState::Stopped);
         assert!(r.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_endless_radio_of_unplayable_songs_stops_after_one_pass() {
+        // A radio that keeps sending new songs, none of them playable: the queue grows with
+        // every refill, so "a pass" is the queue's length when the skipping began (4: A and
+        // its radio's first page), not its length now.
+        let gone = || Error::Unavailable("not here".into());
+        let letters = "ABCDEFGHIJKLMNOPQRS";
+        let mut r = rig(Setup {
+            pages: vec![
+                (radio_of('A'), 0, Ok(page("BCD", Some("CONT1")))),
+                ok("CONT1", 0, "EFG", Some("CONT2")),
+                ok("CONT2", 0, "HIJ", Some("CONT3")),
+                ok("CONT3", 0, "KLM", Some("CONT4")),
+                ok("CONT4", 0, "NOP", Some("CONT5")),
+                ok("CONT5", 0, "QRS", None),
+            ],
+            failures: letters
+                .chars()
+                .map(|c| (&*Box::leak(vid(c).into_boxed_str()), gone()))
+                .collect(),
+            // Each failure takes a moment, so every refill lands before the next skip: the
+            // queue grows the way a real radio's would.
+            delays: letters
+                .chars()
+                .map(|c| (&*Box::leak(vid(c).into_boxed_str()), 30))
+                .collect(),
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        r.until_song(&vid('D'), PlayState::Stopped).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), [vid('A'), vid('B'), vid('C'), vid('D')]);
+        assert_eq!(r.status().await.state, PlayState::Stopped);
     }
 
     /// An engine (not run) playing A, from a queue of `songs`, with A loaded and started.

@@ -11,6 +11,7 @@
 //! YouTube rotates its cookies.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,7 +45,18 @@ pub struct LazySession {
     load_timeout: Duration,
     /// The real pair once a session was loaded. A tokio mutex, held across the load, so
     /// requests made at the same moment wait for one load instead of each prompting.
-    inner: tokio::sync::Mutex<Option<Loaded>>,
+    inner: tokio::sync::Mutex<Inner>,
+    /// How many loads have failed. Read before waiting for `inner`, so a request can tell a
+    /// load that failed while it waited (it takes that load's error) from one that failed
+    /// before it came (it tries again).
+    failures: AtomicU64,
+}
+
+#[derive(Default)]
+struct Inner {
+    loaded: Option<Loaded>,
+    /// The last failed load's error.
+    last_error: Option<Error>,
 }
 
 impl LazySession {
@@ -53,7 +65,8 @@ impl LazySession {
             store,
             build,
             load_timeout: LOAD_TIMEOUT,
-            inner: tokio::sync::Mutex::new(None),
+            inner: tokio::sync::Mutex::new(Inner::default()),
+            failures: AtomicU64::new(0),
         }
     }
 
@@ -63,28 +76,46 @@ impl LazySession {
         self
     }
 
-    /// The real pair, loading the session first if there is none yet. A failed load is not
-    /// remembered: the next call tries again.
+    /// The real pair, loading the session first if there is none yet. Requests that waited
+    /// behind a load that failed get its error, so one unlock prompt (and its up to 10 s) is
+    /// not followed by another for each of them. A request made after a failed load tries
+    /// again, so a later play (or an import) still gets through.
     async fn get(&self) -> Result<Loaded, Error> {
+        let failures_before = self.failures.load(Ordering::Acquire);
         let mut inner = self.inner.lock().await;
-        if let Some(r) = &*inner {
+        if let Some(r) = &inner.loaded {
             return Ok(r.clone());
         }
-        let session = match tokio::time::timeout(self.load_timeout, self.store.load()).await {
-            Ok(Ok(s)) => s,
+        // Only ever bumped under the lock, so this sees every failure made while we waited.
+        if self.failures.load(Ordering::Acquire) != failures_before
+            && let Some(e) = &inner.last_error
+        {
+            return Err(e.clone());
+        }
+        let loaded = match tokio::time::timeout(self.load_timeout, self.store.load()).await {
+            Ok(Ok(s)) => Ok(s),
             Ok(Err(e)) => {
                 // The code only: the message is fixed text, but the code is all a log needs.
                 eprintln!("ytmfast: no usable session ({})", e.code());
-                return Err(e);
+                Err(e)
             }
             Err(_) => {
                 eprintln!("ytmfast: the keyring did not answer in time");
-                return Err(Error::Internal("keyring locked or unavailable".into()));
+                Err(Error::Internal("keyring locked or unavailable".into()))
+            }
+        };
+        let session = match loaded {
+            Ok(s) => s,
+            Err(e) => {
+                inner.last_error = Some(e.clone());
+                self.failures.fetch_add(1, Ordering::Release);
+                return Err(e);
             }
         };
         crate::trace::mark("session loaded (keyring)");
         let r = (self.build)(session);
-        *inner = Some(r.clone());
+        inner.loaded = Some(r.clone());
+        inner.last_error = None;
         Ok(r)
     }
 }
@@ -278,6 +309,29 @@ mod tests {
         assert!(lazy.resolve("testvideo01").await.is_err());
         assert_eq!(*store.loads.lock().unwrap(), 2);
         assert_eq!(builds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn waiters_behind_a_failed_load_get_its_error() {
+        // Two songs asked for at once while the keyring hangs: one unlock wait (one prompt),
+        // and both get its error, instead of the second waiting out a second prompt.
+        let store = Arc::new(StuckStore::default());
+        let lazy = Arc::new(
+            LazySession::new(store.clone(), counting_build(Arc::default()))
+                .with_load_timeout(Duration::from_millis(100)),
+        );
+        let (a, b) = tokio::join!(lazy.resolve("testvideo01"), async {
+            // Starts waiting while the first load is under way.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            lazy.next(NextRequest::default()).await
+        });
+        let want = Error::Internal("keyring locked or unavailable".into());
+        assert_eq!(a, Err(want.clone()));
+        assert_eq!(b, Err(want));
+        assert_eq!(*store.loads.lock().unwrap(), 1);
+        // A later play tries again.
+        assert!(lazy.resolve("testvideo01").await.is_err());
+        assert_eq!(*store.loads.lock().unwrap(), 2);
     }
 
     #[test]
