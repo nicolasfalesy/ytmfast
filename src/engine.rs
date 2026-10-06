@@ -869,8 +869,12 @@ mod tests {
         r.play("AAAAAAAAAAA").await;
         r.until(PlayState::Playing).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // Where the song was just before the restart, and how long it could go on after it.
+        let before = r.status().await.position;
+        let lost_at = std::time::Instant::now();
         r.stats.lose_output();
         let seen = r.until(PlayState::Playing).await;
+        let window = lost_at.elapsed().as_secs_f64();
         // The restart is reported, then the same song plays again from where it was.
         let errors: Vec<_> = seen
             .iter()
@@ -894,8 +898,15 @@ mod tests {
             kinds,
             [PlayState::Stopped, PlayState::Buffering, PlayState::Playing]
         );
+        // The replay starts where the song was when the output went: not before the last
+        // position seen, and no further than the real time that passed since (no fixed window,
+        // so a slow test machine can't fail it).
         let at = states[1].position;
-        assert!(at > 0.3 && at < 0.7, "restarted at {at}");
+        assert!(before > 0.0, "the song played before the restart");
+        assert!(
+            at >= before && at <= before + window,
+            "restarted at {at}, was at {before}, {window} s later"
+        );
         assert_eq!(r.started(), ["AAAAAAAAAAA", "AAAAAAAAAAA"]);
 
         // Once per play: a second restart in the same song is only reported.
