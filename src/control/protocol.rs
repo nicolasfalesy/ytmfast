@@ -212,6 +212,10 @@ const PARAMS_RULE: &str =
 const TOKEN_RULE: &str = "token must be 1 to 4096 characters of A-Z, a-z, 0-9, _, -, +, /, = and %";
 const QUERY_RULE: &str = "query must be text of 1 to 200 characters with no control characters";
 const ENDPOINT_RULE: &str = "endpoint must be a row's play: {\"watchEndpoint\": {videoId, playlistId, index, params}} or {\"watchPlaylistEndpoint\": {playlistId, params}}";
+/// An endpoint's ids follow the browse rule (`browse::id_ok`, as rows are cleaned with), not
+/// the plain `play`'s 1 to 256: an endpoint only ever comes from a row.
+const ENDPOINT_PLAYLIST_ID_RULE: &str =
+    "the endpoint's playlistId must be 2 to 128 characters of A-Z, a-z, 0-9, _ and -";
 const ENDPOINT_INDEX_RULE: &str =
     "the endpoint's index must be a whole number from 0 to 4294967295";
 
@@ -428,7 +432,7 @@ fn parse_endpoint(v: &Value) -> Result<Endpoint, &'static str> {
                 return Err(VIDEO_ID_RULE);
             }
             if given(raw, "playlistId") && w.playlist_id.is_none() {
-                return Err(PLAYLIST_ID_RULE);
+                return Err(ENDPOINT_PLAYLIST_ID_RULE);
             }
             if given(raw, "index") && w.index.is_none() {
                 return Err(ENDPOINT_INDEX_RULE);

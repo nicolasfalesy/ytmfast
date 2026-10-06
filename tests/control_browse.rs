@@ -15,15 +15,18 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
+use ytmfast::audio::player::AudioPlayer;
+use ytmfast::audio::sink::NullSink;
 use ytmfast::browse::{
     self, Browser, Endpoint, Kind, MorePage, Page, PageHeader, Row, SearchPage, Section,
     WatchEndpoint, WatchPlaylistEndpoint,
 };
 use ytmfast::control::{self, Exit, Options};
-use ytmfast::engine::{EngineCmd, EngineEvent, PlayState, QueueView, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
 use ytmfast::error::Error;
-use ytmfast::innertube::MoreKind;
+use ytmfast::innertube::{MoreKind, NextPage, NextRequest};
 use ytmfast::queue::Repeat;
+use ytmfast::streams::{Resolver, Stream};
 
 const SONG: &str = "dQw4w9WgXcQ";
 const WAIT: Duration = Duration::from_secs(10);
@@ -178,6 +181,20 @@ fn rig(mut browser: FakeBrowser) -> Rig {
                         shuffle: false,
                         repeat: Repeat::Off,
                     });
+                }
+                // No play ever comes between: a late play always goes in (the real engine's
+                // rule is tested in `play_page_never_overrides_a_newer_play`).
+                EngineCmd::PlayEpoch(reply) => {
+                    let _ = reply.send(7);
+                }
+                EngineCmd::PlayIfLatest {
+                    epoch,
+                    play,
+                    played,
+                } => {
+                    assert_eq!(epoch, 7);
+                    let _ = played.send(true);
+                    let _ = seen_tx.send(*play);
                 }
                 EngineCmd::Quit => return,
                 other => {
@@ -921,4 +938,121 @@ async fn browsing_restarts_the_idle_clock() {
     tokio::time::sleep(4 * MIN).await;
     assert!(!r.serve.is_finished(), "quit 4 minutes after a browse");
     assert_eq!(r.serve.await.unwrap(), Exit::Idle);
+}
+
+/// Never answers: a play stays `buffering`, with its song as the state's `videoId`.
+struct Hang;
+
+#[async_trait]
+impl Resolver for Hang {
+    async fn resolve(&self, _: &str) -> Result<Stream, Error> {
+        std::future::pending().await
+    }
+    async fn resolve_fresh(&self, id: &str) -> Result<Stream, Error> {
+        self.resolve(id).await
+    }
+}
+
+#[async_trait]
+impl QueueSource for Hang {
+    async fn next(&self, _: NextRequest) -> Result<NextPage, Error> {
+        std::future::pending().await
+    }
+}
+
+/// The real engine (with `Hang` and a `NullSink`) behind the socket, and a browser whose
+/// calls wait for `gate`.
+fn real_engine(pages: HashMap<String, Page>, gate: Arc<Semaphore>) -> (PathBuf, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(control::SOCKET_NAME);
+    let (std, _bound) = control::bind_socket(&path).unwrap();
+    let listener = UnixListener::from_std(std).unwrap();
+    let player = AudioPlayer::spawn(Box::new(NullSink::new()));
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Hang), player);
+    let options = Options {
+        browser: Some(Arc::new(FakeBrowser {
+            pages,
+            gate: Some(gate),
+            ..FakeBrowser::default()
+        })),
+        ..Options::default()
+    };
+    tokio::spawn(control::run(
+        listener,
+        engine,
+        cmds,
+        events,
+        options,
+        std::future::pending(),
+    ));
+    (path, dir)
+}
+
+/// Ruling P7: a `playPage` whose page is still loading never overrides a play the user made
+/// meanwhile (here from another client); alone, it plays.
+#[tokio::test]
+async fn play_page_never_overrides_a_newer_play() {
+    let mut pages = HashMap::new();
+    pages.insert(
+        "UCfake".to_string(),
+        Page {
+            sections: vec![section("Songs", vec![song_row("BBBBBBBBBBB")])],
+            ..Page::default()
+        },
+    );
+    let gate = Arc::new(Semaphore::new(0));
+    let (path, _dir) = real_engine(pages, gate.clone());
+    let mut a = connect(&path).await;
+    let mut b = connect(&path).await;
+
+    a.send(json!({"id": 1, "cmd": "playPage", "args": {"browseId": "UCfake"}}))
+        .await;
+    // Its epoch is read before the browse starts: wait for the browse to be under way.
+    a.send(json!({"id": 2, "cmd": "status"})).await;
+    a.reply(2).await;
+    assert_eq!(b.ask(1, "play", json!({"videoId": SONG})).await["ok"], true);
+    gate.add_permits(1);
+    assert_eq!(
+        a.reply(1).await,
+        json!({"id": 1, "ok": true, "data": {"superseded": true}})
+    );
+    let v = a.ask(3, "status", json!({})).await;
+    assert_eq!(v["data"]["videoId"], SONG, "{v}");
+
+    // Nothing in between: the page's song plays.
+    gate.add_permits(1);
+    assert_eq!(
+        a.ask(4, "playPage", json!({"browseId": "UCfake"})).await,
+        json!({"id": 4, "ok": true, "data": {}})
+    );
+    let v = a.ask(5, "status", json!({})).await;
+    assert_eq!(v["data"]["videoId"], "BBBBBBBBBBB", "{v}");
+}
+
+/// A page whose answer would pass the socket's line cap is refused with `unavailable` rather
+/// than sent, and the client stays connected.
+#[tokio::test]
+async fn an_oversized_answer_is_refused_not_sent() {
+    let mut big = song_row(SONG);
+    big.title = "t".repeat(2000);
+    let mut pages = HashMap::new();
+    pages.insert(
+        "FEbig".to_string(),
+        Page {
+            sections: vec![section("Big", vec![big; 600])],
+            ..Page::default()
+        },
+    );
+    let r = rig(FakeBrowser {
+        pages,
+        ..FakeBrowser::default()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "browse", json!({"browseId": "FEbig"})).await;
+    assert_eq!(
+        v,
+        json!({"id": 1, "ok": false, "error": {"code": "unavailable",
+               "message": "unavailable: the page is too big to send"}})
+    );
+    assert_eq!(c.ask(2, "status", json!({})).await["ok"], true);
 }

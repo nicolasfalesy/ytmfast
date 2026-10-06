@@ -54,7 +54,7 @@ failing) arrives as events.
 | `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
 | `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
-| `playPage`     | `browseId`, `params` (optional)                         | `{}`                        |
+| `playPage`     | `browseId`, `params` (optional)                         | `{}`, or `{"superseded": true}` |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -163,11 +163,12 @@ an artist or a podcast. A section's `more` link is opened the same way, with its
              "thumb": "https://lh3.googleusercontent.com/...=w226-h226",
              "play": {"watchPlaylistEndpoint": {"playlistId": "OLAK5uy_..."}}},
   "sections": [
-    {"title": "", "cont": "", "more": null, "items": [
+    {"title": "", "items": [
       {"title": "A Song", "subtitle": "An Artist", "thumb": "https://...",
        "videoId": "dQw4w9WgXcQ", "setId": "", "playlistId": "", "browseId": "",
        "params": "", "play": {"watchEndpoint": {"videoId": "dQw4w9WgXcQ",
-       "playlistId": "OLAK5uy_..."}}, "duration": "3:33", "kind": "song"}]}],
+       "playlistId": "OLAK5uy_..."}}, "duration": "3:33", "kind": "song"}],
+     "cont": "", "more": null}],
   "cont": ""}}
 ```
 
@@ -189,7 +190,7 @@ filter (Songs, Albums, ...):
 
 ```json
 {"id": 5, "ok": true, "data": {
-  "sections": [{"title": "Top result", "cont": "", "more": null, "items": [...]}],
+  "sections": [{"title": "Top result", "items": [...], "cont": "", "more": null}],
   "chips": [{"label": "Songs", "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"}]}}
 ```
 
@@ -225,8 +226,10 @@ A list's next rows come in `items` (at most 1,000); Home's next shelves come in 
 - A `watchPlaylistEndpoint` plays the list from the start, using its `params` (an artist's
   shuffle, for example).
 
-Other fields in the endpoint are ignored. A malformed `videoId`, `playlistId`, `index` (a
-whole number from 0 to 4294967295) or `params` is `bad_request`, as is an endpoint that
+Other fields in the endpoint are ignored. In an endpoint, `videoId` is as above,
+`playlistId` is 2 to 128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-` (the rule rows are
+made with, not the plain `play`'s 1 to 256), `index` is a whole number from 0 to 4294967295,
+and `params` is as in browsing. A malformed one is `bad_request`, as is an endpoint that
 plays nothing. The reply is `{}`; what comes of the play arrives as events, as with any
 `play`.
 
@@ -237,6 +240,11 @@ shuffle, an album's play), or else its first playable row (of the first 5 rows o
 section). For a tile that has no play of its own, such as an artist. The reply is `{}` once
 the play went to the engine. A page with nothing to play is `bad_request` with the message
 `Nothing here can be played.`
+
+A newer choice wins: when a command that picks what plays (`play`, `playPage`'s own play,
+`queue.jump`, `next`, `previous`, from any client or MPRIS) reaches the engine after this
+`playPage` and before its page has loaded, the page's play is dropped, and the reply is
+`{"id": ..., "ok": true, "data": {"superseded": true}}`.
 
 ### Errors
 

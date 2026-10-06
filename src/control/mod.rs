@@ -424,11 +424,12 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                             quit = true;
                             reply
                         }
-                        Handled::Browse(id, request) => {
+                        Handled::Browse(id, request, epoch) => {
                             if browsing.len() >= MAX_BROWSING {
                                 protocol::error_reply(Some(id), BAD_REQUEST, "busy")
                             } else {
-                                let task = browsing.spawn(answer(shared.clone(), id, request));
+                                let task =
+                                    browsing.spawn(answer(shared.clone(), id, request, epoch));
                                 asking.insert(task.id(), id);
                                 continue;
                             }
@@ -552,8 +553,9 @@ enum Handled {
     Reply(String),
     /// `quit`'s reply; the client closes once it is out, then the daemon quits.
     Quit(String),
-    /// A browsing request, answered from a task of its own (`answer`).
-    Browse(u64, Request),
+    /// A browsing request, answered from a task of its own (`answer`). For `playPage`, the
+    /// engine's play epoch when it came in (ruling P7).
+    Browse(u64, Request, Option<u64>),
 }
 
 /// One request.
@@ -582,10 +584,21 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
             });
         }
         Request::Quit => return Handled::Quit(protocol::ok_reply(id, json!({}))),
-        request @ (Request::Browse { .. }
-        | Request::Search { .. }
-        | Request::More { .. }
-        | Request::PlayPage { .. }) => return Handled::Browse(id, request),
+        // Read now, in this client's command order (through the engine's channel): any play
+        // the user makes after this, from anywhere, wins over the page's (ruling P7).
+        request @ Request::PlayPage { .. } => {
+            let (tx, rx) = oneshot::channel();
+            if shared.cmds.send(EngineCmd::PlayEpoch(tx)).await.is_err() {
+                return Handled::Reply(gone());
+            }
+            return match rx.await {
+                Ok(epoch) => Handled::Browse(id, request, Some(epoch)),
+                Err(_) => Handled::Reply(gone()),
+            };
+        }
+        request @ (Request::Browse { .. } | Request::Search { .. } | Request::More { .. }) => {
+            return Handled::Browse(id, request, None);
+        }
         Request::Play {
             video_id,
             playlist_id,
@@ -650,7 +663,11 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
 /// or a token; ruling R6) and is never broadcast as an `error` event: it is this client's
 /// news alone, and a refused id (`bad_request`) is the client's own mistake. Nothing is logged
 /// here either: the request already logged its failure by endpoint and code.
-async fn answer(shared: Arc<Shared>, id: u64, request: Request) -> String {
+///
+/// `playPage`'s play is sent as `EngineCmd::PlayIfLatest` with the epoch read when it came in
+/// (`epoch`): when the user picked something else to play while the page loaded, the page's
+/// play is dropped and the reply says `{"superseded": true}` (ruling P7).
+async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u64>) -> String {
     let Some(browser) = shared.browser.clone() else {
         return protocol::error_reply(Some(id), "unavailable", "browsing is not available");
     };
@@ -674,12 +691,7 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request) -> String {
                         .cloned()
                         .and_then(EngineCmd::play_endpoint);
                     Ok(match play {
-                        Some(cmd) => match shared.cmds.send(cmd).await {
-                            Ok(()) => protocol::ok_reply(id, json!({})),
-                            Err(_) => {
-                                protocol::error_reply(Some(id), "internal", "the engine stopped")
-                            }
-                        },
+                        Some(cmd) => play_if_latest(&shared.cmds, id, cmd, epoch).await,
                         None => protocol::error_reply(Some(id), BAD_REQUEST, NOTHING_TO_PLAY),
                     })
                 }
@@ -701,6 +713,34 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request) -> String {
         ),
         Ok(line) => line,
         Err(e) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
+    }
+}
+
+/// Sends a late play (`playPage`'s) unless a newer one came in since `epoch`; its reply line.
+async fn play_if_latest(
+    cmds: &mpsc::Sender<EngineCmd>,
+    id: u64,
+    play: EngineCmd,
+    epoch: Option<u64>,
+) -> String {
+    let gone = || protocol::error_reply(Some(id), "internal", "the engine stopped");
+    // `handle` always reads one for a `playPage`.
+    let Some(epoch) = epoch else {
+        return gone();
+    };
+    let (played, rx) = oneshot::channel();
+    let cmd = EngineCmd::PlayIfLatest {
+        epoch,
+        play: Box::new(play),
+        played,
+    };
+    if cmds.send(cmd).await.is_err() {
+        return gone();
+    }
+    match rx.await {
+        Ok(true) => protocol::ok_reply(id, json!({})),
+        Ok(false) => protocol::ok_reply(id, json!({ "superseded": true })),
+        Err(_) => gone(),
     }
 }
 

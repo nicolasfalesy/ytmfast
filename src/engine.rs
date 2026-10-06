@@ -129,6 +129,19 @@ pub enum EngineCmd {
     },
     Shuffle(bool),
     Repeat(Repeat),
+    /// The play epoch now: how many commands that pick what plays (`Play`, `QueueJump`,
+    /// `Next`, `Previous`, from any client or MPRIS) the engine has taken. Asked through the
+    /// command channel, so the answer counts every such command sent before it (ruling P7).
+    PlayEpoch(oneshot::Sender<u64>),
+    /// A play decided on at `epoch` and sent later (`playPage`, whose page had to load
+    /// first): it goes in only when no command that picks what plays came in since, so it
+    /// never overrides the user's newer choice (ruling P7). `played` answers whether it did.
+    /// `play` is an `EngineCmd::Play`; anything else is dropped.
+    PlayIfLatest {
+        epoch: u64,
+        play: Box<EngineCmd>,
+        played: oneshot::Sender<bool>,
+    },
     Quit,
 }
 
@@ -443,6 +456,8 @@ pub struct Engine {
     reporter: Option<Reporter>,
     /// The report of the song playing now: from when it was first heard until it stops.
     report: Option<PlayReport>,
+    /// Commands taken that pick what plays (see `EngineCmd::PlayEpoch`).
+    play_epoch: u64,
 }
 
 impl Engine {
@@ -531,6 +546,7 @@ impl Engine {
             source_playlist: None,
             reporter: None,
             report: None,
+            play_epoch: 0,
         };
         (engine, cmd_tx, events)
     }
@@ -661,6 +677,15 @@ impl Engine {
     }
 
     fn handle(&mut self, cmd: EngineCmd) {
+        if matches!(
+            cmd,
+            EngineCmd::Play { .. }
+                | EngineCmd::QueueJump(_)
+                | EngineCmd::Next
+                | EngineCmd::Previous
+        ) {
+            self.play_epoch += 1;
+        }
         match cmd {
             EngineCmd::Play {
                 video_id,
@@ -709,6 +734,21 @@ impl Engine {
                 self.emit_state();
                 // Repeat off can leave the queue short of songs.
                 self.maybe_refill();
+            }
+            EngineCmd::PlayEpoch(reply) => {
+                let _ = reply.send(self.play_epoch);
+            }
+            EngineCmd::PlayIfLatest {
+                epoch,
+                play,
+                played,
+            } => {
+                let latest = epoch == self.play_epoch && matches!(*play, EngineCmd::Play { .. });
+                let _ = played.send(latest);
+                if latest {
+                    // Through `handle` again, so it counts as a play itself.
+                    return self.handle(*play);
+                }
             }
             // Handled by `run`.
             EngineCmd::Quit => {}
@@ -3529,6 +3569,71 @@ mod tests {
         assert_eq!(ids, [vid('A'), vid('B'), vid('C')]);
         assert_eq!(q.current_id, Some(id_of(&q, 'B')));
         assert_eq!(r.started()[0], vid('B'));
+    }
+
+    /// Ruling P7: a play sent late (a `playPage` whose page was loading) never overrides a
+    /// command that picked what plays after it was decided on.
+    #[tokio::test]
+    async fn a_late_play_never_overrides_a_newer_one() {
+        let mut r = rig(Setup::default()).await;
+        let epoch = |r: &Rig| {
+            let (tx, rx) = oneshot::channel();
+            let cmds = r.cmds.clone();
+            async move {
+                cmds.send(EngineCmd::PlayEpoch(tx)).await.unwrap();
+                rx.await.unwrap()
+            }
+        };
+        let late = |epoch: u64, id: char| {
+            let (played, rx) = oneshot::channel();
+            let cmd = EngineCmd::PlayIfLatest {
+                epoch,
+                play: Box::new(EngineCmd::Play {
+                    video_id: Some(vid(id)),
+                    playlist_id: None,
+                    index: None,
+                    params: None,
+                    start_seconds: 0.0,
+                }),
+                played,
+            };
+            (cmd, rx)
+        };
+        let before = epoch(&r).await;
+        // The user plays A while the page loads: the page's B is dropped.
+        r.play(&vid('A')).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let (cmd, played) = late(before, 'B');
+        r.send(cmd).await;
+        assert!(!played.await.unwrap());
+        assert_eq!(r.status().await.video_id, Some(vid('A')));
+        // Nothing came in between: it plays.
+        let now = epoch(&r).await;
+        let (cmd, played) = late(now, 'B');
+        r.send(cmd).await;
+        assert!(played.await.unwrap());
+        r.until_song(&vid('B'), PlayState::Playing).await;
+
+        // What counts: commands that pick what plays. Not pause, seek, volume or a queue add.
+        let start = epoch(&r).await;
+        r.send(EngineCmd::Pause).await;
+        r.send(EngineCmd::Seek(1.0)).await;
+        r.send(EngineCmd::Volume(0.5)).await;
+        r.send(EngineCmd::Shuffle(true)).await;
+        assert_eq!(epoch(&r).await, start);
+        r.send(EngineCmd::Next).await;
+        r.send(EngineCmd::Previous).await;
+        r.send(EngineCmd::QueueJump(u64::MAX)).await;
+        assert_eq!(epoch(&r).await, start + 3);
+        // Only a play goes in that way.
+        let (played, rx) = oneshot::channel();
+        r.send(EngineCmd::PlayIfLatest {
+            epoch: start + 3,
+            play: Box::new(EngineCmd::Pause),
+            played,
+        })
+        .await;
+        assert!(!rx.await.unwrap());
     }
 
     /// An artist's shuffle button: the list with its params, which reach `next`.
