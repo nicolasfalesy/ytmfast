@@ -1,0 +1,72 @@
+{
+ "header": {
+  "title": "",
+  "subtitle": "",
+  "thumb": "",
+  "play": null
+ },
+ "sections": [
+  {
+   "title": "",
+   "items": [
+    {
+     "title": "Text 769",
+     "subtitle": "Text 770",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "",
+     "setId": "",
+     "playlistId": "LM",
+     "browseId": "VLLM",
+     "params": "",
+     "play": {
+      "watchPlaylistEndpoint": {
+       "playlistId": "LM",
+       "params": "faketoken"
+      }
+     },
+     "duration": "",
+     "kind": "playlist"
+    },
+    {
+     "title": "Text 465",
+     "subtitle": "Text 466 • Text 467",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "",
+     "setId": "",
+     "playlistId": "PLfake000352",
+     "browseId": "VLPLfake000351",
+     "params": "",
+     "play": {
+      "watchPlaylistEndpoint": {
+       "playlistId": "PLfake000352",
+       "params": "faketoken"
+      }
+     },
+     "duration": "",
+     "kind": "playlist"
+    },
+    {
+     "title": "Text 781",
+     "subtitle": "Text 782",
+     "thumb": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj",
+     "videoId": "",
+     "setId": "",
+     "playlistId": "SE",
+     "browseId": "VLfake000654",
+     "params": "",
+     "play": {
+      "watchPlaylistEndpoint": {
+       "playlistId": "SE",
+       "params": "faketoken"
+      }
+     },
+     "duration": "",
+     "kind": "playlist"
+    }
+   ],
+   "cont": "faketoken",
+   "more": null
+  }
+ ],
+ "cont": ""
+}
