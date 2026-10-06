@@ -89,8 +89,10 @@ draw on battery) could not separate the two: the laptop's own draw drifted from 
 
 | Measure | pear-desktop | ytmfast | Change |
 |---|---|---|---|
-| RAM | 677 MB | 31.5 MB | 21x less |
+| RAM | 677 MB | 45.5 MB | 15x less |
 | Processes | 10 | 1 | |
-| CPU while playing | 3.9% | 0.51% | 7.6x less |
-| Time to first sound | 2.5 s | 0.68 s | 3.7x faster |
+| CPU while playing | 3.9% | 0.68% | 5.7x less |
+| Time to first sound | 2.5 s | 0.74 s | 3.4x faster |
 | CPU package power above idle | 0.71 W | 0.10 W | about 7x less |
+
+The ytmfast numbers are from step 2 (2026-10-06), except the power row, which was measured in step 1.

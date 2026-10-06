@@ -470,14 +470,14 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
 }
 
 /// Whether a LOGIN_REQUIRED reason is about something other than the session: the "Sign in to
-/// confirm you're not a bot" check, a private video ("This is a private video…"), or an age
-/// check ("Sign in to confirm your age", "age-restricted", "inappropriate for some users").
-/// Matched on fragments in any case, so either apostrophe YouTube uses (and any text around
-/// them) fits. A bare LOGIN_REQUIRED, or a plain "sign in" reason, is the session.
+/// confirm you're not a bot" check, a private video ("This is a private video…", "This video
+/// is private", "Private video"), or an age check ("Sign in to confirm your age",
+/// "age-restricted", "inappropriate for some users"). Matched on fragments in any case, so
+/// either apostrophe YouTube uses (and any text around them) fits. A bare LOGIN_REQUIRED, or a
+/// plain "sign in" reason, is the session.
 fn not_about_the_session(reason: Option<&str>) -> bool {
-    const FRAGMENTS: [&str; 6] = [
+    const FRAGMENTS: [&str; 5] = [
         "not a bot",
-        "private video",
         "confirm your age",
         "age-restricted",
         "age restricted",
@@ -485,7 +485,11 @@ fn not_about_the_session(reason: Option<&str>) -> bool {
     ];
     reason.is_some_and(|r| {
         let r = r.to_lowercase();
+        // "private" is matched as a word of its own, not a fragment: YouTube words it more
+        // than one way, and the word alone covers them all without catching a longer word.
         FRAGMENTS.iter().any(|f| r.contains(f))
+            || r.split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == "private")
     })
 }
 
@@ -595,6 +599,32 @@ mod tests {
                 "stream_failed",
                 "{reason}"
             );
+        }
+    }
+
+    #[test]
+    fn this_video_is_private_skips() {
+        // "This video is private" (and "Private video") hold the word without the "private
+        // video" fragment: the song is skipped, the session is not blamed (step 2 parked item).
+        for reason in [
+            "This video is private",
+            "This video is private.",
+            "Private video",
+            "Video is PRIVATE; sign in if you own it",
+        ] {
+            let a = answer(json!({"playabilityStatus": {
+                "status": "LOGIN_REQUIRED", "reason": reason}}));
+            assert_eq!(
+                parse(&a, "x").unwrap_err().code(),
+                "stream_failed",
+                "{reason}"
+            );
+        }
+        // Only the word on its own: a longer word holding it is still a sign-in refusal.
+        for reason in ["Sign in privately", "Sign in to unprivatelike"] {
+            let a = answer(json!({"playabilityStatus": {
+                "status": "LOGIN_REQUIRED", "reason": reason}}));
+            assert_eq!(parse(&a, "x"), Err(Error::SignedOut), "{reason:?}");
         }
     }
 

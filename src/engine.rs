@@ -1178,7 +1178,10 @@ impl Engine {
                 if unavailable {
                     self.exhausted = true;
                 }
-                if plan.seed.is_none() {
+                // With no seed, nothing played until the list came, unless the user added a
+                // song and skipped to it: that one plays on (a step 2 parked item), and only
+                // an engine with nothing current stops.
+                if plan.seed.is_none() && self.queue.current().is_none() {
                     self.status.state = PlayState::Stopped;
                     self.emit_state();
                 } else if self.waiting {
@@ -1190,15 +1193,20 @@ impl Engine {
         };
         self.continuation = page.continuation;
         let kept = self.kept(&plan.added);
+        // The songs the user added go back in after the list (they were asked for, and each
+        // add was checked against the cap), so the list gets only the room they leave: the
+        // queue never passes `MAX_ITEMS` (ruling S15; a step 2 parked item).
+        let room = crate::queue::MAX_ITEMS
+            .saturating_sub(kept.played.len() + kept.next.len() + kept.end.len());
         // The user is already on a song they added (skipped or jumped to it) while the list
         // was coming: it stays current, with its queue id, and the list fits around it.
         let playing_kept = kept.played.last().map(|i| i.id);
         match plan.seed {
             None => {
                 match plan.index {
-                    Some(i) => self.queue.replace(page.items, i),
+                    Some(i) => self.queue.replace_within(page.items, i, room),
                     // Shuffled, a random song starts (`Queue::replace_unpicked`).
-                    None => self.queue.replace_unpicked(page.items),
+                    None => self.queue.replace_unpicked(page.items, room),
                 };
                 let start_id = self.queue.current().map(|i| i.id);
                 if let (Some(now), Some(start)) = (playing_kept, start_id) {
@@ -1217,6 +1225,13 @@ impl Engine {
                 }
                 self.queue.insert_items(kept.next, AddAt::Next);
                 self.queue.insert_items(kept.end, AddAt::End);
+                // A list with no room left (the user filled the queue while it loaded) has
+                // no start song: the first song added plays, rather than nothing at all.
+                if self.queue.current().is_none()
+                    && let Some(first) = self.queue.items().first().map(|i| i.id)
+                {
+                    self.queue.jump(first);
+                }
                 self.emit_queue();
                 if playing_kept.is_some() {
                     self.emit_state();
@@ -1245,7 +1260,7 @@ impl Engine {
                     songs.insert(0, bare_song(&seed));
                     0
                 });
-                self.queue.replace(songs, at);
+                self.queue.replace_within(songs, at, room);
                 if let Some(now) = playing_kept {
                     // The seed was heard, then what the user added: they follow it.
                     self.queue.insert_items(kept.played, AddAt::Next);
@@ -2626,6 +2641,7 @@ mod tests {
     use crate::audio::sink::{NullSink, NullStats};
     use crate::error::Error;
     use crate::innertube::Tracking;
+    use crate::queue::MAX_ITEMS;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -4924,6 +4940,136 @@ mod tests {
         assert_eq!(a.song.video_id, vid('A'));
         assert_ne!(a.id, a_before);
         assert_eq!(engine.status.queue_id, Some(a.id));
+    }
+
+    fn named_songs(prefix: &str, n: usize) -> Vec<SongItem> {
+        (0..n)
+            .map(|i| SongItem {
+                video_id: format!("{prefix}{i}"),
+                ..song('N')
+            })
+            .collect()
+    }
+
+    fn named_page(prefix: &str, n: usize) -> NextPage {
+        NextPage {
+            items: named_songs(prefix, n),
+            ..page("", None)
+        }
+    }
+
+    fn add_songs(engine: &mut Engine, songs: Vec<SongItem>, at: AddAt) {
+        engine.handle(EngineCmd::QueueAdd {
+            songs,
+            at,
+            added: oneshot::channel().0,
+        });
+    }
+
+    #[tokio::test]
+    async fn adds_during_load_respect_the_cap() {
+        // Step 2 parked item: songs added while a list loads were put back on top of a full
+        // list, so the queue went past MAX_ITEMS until the next refill trimmed it.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: Some("l0".into()),
+            playlist_id: Some("PLlist".into()),
+            index: Some(0),
+            params: None,
+            start_seconds: 0.0,
+        });
+        add_songs(engine, named_songs("e", 600), AddAt::End);
+        add_songs(engine, named_songs("n", 10), AddAt::Next);
+        let added: HashMap<String, u64> = queue_ids(engine)
+            .into_iter()
+            .filter(|(v, _)| !v.starts_with('l'))
+            .collect();
+        assert_eq!(added.len(), 610);
+        engine.on_load(Ok(named_page("l", MAX_ITEMS)));
+        // The list gives way: every song the user added stays, with its id, and the queue
+        // holds exactly the cap, the seed current.
+        assert_eq!(engine.queue.len(), MAX_ITEMS);
+        let after: HashMap<String, u64> = queue_ids(engine).into_iter().collect();
+        for (v, id) in &added {
+            assert_eq!(after.get(v), Some(id), "{v} keeps its place in the queue");
+        }
+        assert_eq!(engine.queue.current().unwrap().song.video_id, "l0");
+
+        // No seed: the list's start song still makes it, with room for one.
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLother".into()),
+            index: Some(3),
+            params: None,
+            start_seconds: 0.0,
+        });
+        add_songs(engine, named_songs("u", MAX_ITEMS - 1), AddAt::End);
+        engine.on_load(Ok(named_page("p", 500)));
+        assert_eq!(engine.queue.len(), MAX_ITEMS);
+        assert_eq!(engine.queue.current().unwrap().song.video_id, "p3");
+        assert_eq!(engine.status.video_id.as_deref(), Some("p3"));
+    }
+
+    #[tokio::test]
+    async fn a_list_with_no_room_left_plays_the_songs_added() {
+        // The user filled the queue while a list with no song picked loaded: the list has no
+        // room, so the first song added plays instead of the engine hanging on Buffering.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLlist".into()),
+            index: None,
+            params: None,
+            start_seconds: 0.0,
+        });
+        add_songs(engine, named_songs("u", MAX_ITEMS), AddAt::End);
+        engine.on_load(Ok(named_page("p", 50)));
+        assert_eq!(engine.queue.len(), MAX_ITEMS);
+        assert!(order(engine).iter().all(|v| v.starts_with('u')));
+        assert_eq!(engine.queue.current().unwrap().song.video_id, "u0");
+        assert_eq!(engine.status.video_id.as_deref(), Some("u0"));
+        assert_ne!(engine.status.state, PlayState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn failed_unpicked_list_keeps_a_playing_song() {
+        // Step 2 parked item: a playlist with no song picked fails to load while a song the
+        // user added and skipped to plays; the engine said Stopped over it.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLlist".into()),
+            index: None,
+            params: None,
+            start_seconds: 0.0,
+        });
+        add(engine, "X", AddAt::End);
+        engine.handle(EngineCmd::Next);
+        assert_eq!(engine.status.video_id, Some(vid('X')));
+        let state = engine.status.state;
+        assert_ne!(state, PlayState::Stopped);
+        engine.on_load(Err(Error::Network("down".into())));
+        assert_eq!(engine.status.state, state);
+        assert_eq!(engine.status.video_id, Some(vid('X')));
+        assert_eq!(
+            engine.queue.current().map(|i| i.song.video_id.clone()),
+            Some(vid('X'))
+        );
+
+        // With nothing playing, the failure still stops.
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLlist".into()),
+            index: None,
+            params: None,
+            start_seconds: 0.0,
+        });
+        add(engine, "Y", AddAt::End);
+        engine.on_load(Err(Error::Network("down".into())));
+        assert_eq!(engine.status.state, PlayState::Stopped);
     }
 
     #[tokio::test]

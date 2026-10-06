@@ -149,18 +149,33 @@ impl Queue {
     /// queue is shuffled with the start song first. A list over `MAX_ITEMS` keeps that many
     /// around the start: `KEEP_PLAYED` before it and the rest after, reaching further back
     /// when the list ends sooner.
-    pub fn replace(&mut self, mut songs: Vec<SongItem>, start_index: usize) -> Option<&QueueItem> {
+    pub fn replace(&mut self, songs: Vec<SongItem>, start_index: usize) -> Option<&QueueItem> {
+        self.replace_within(songs, start_index, MAX_ITEMS)
+    }
+
+    /// `replace` keeping at most `room` songs (never more than `MAX_ITEMS`), for a list that
+    /// lands while songs the user added wait to be put back: the list gives way, so the queue
+    /// stays within the cap. The window around the start is the same as `replace`'s, with
+    /// fewer played songs kept when the room is smaller than `KEEP_PLAYED`, so the start song
+    /// always fits. No room means an empty queue.
+    pub fn replace_within(
+        &mut self,
+        mut songs: Vec<SongItem>,
+        start_index: usize,
+        room: usize,
+    ) -> Option<&QueueItem> {
+        let room = room.min(MAX_ITEMS);
         let mut start_index = start_index;
-        if songs.len() > MAX_ITEMS {
+        if songs.len() > room {
             let start = if start_index < songs.len() {
                 start_index
             } else {
                 0
             };
             let from = start
-                .saturating_sub(KEEP_PLAYED)
-                .min(songs.len() - MAX_ITEMS);
-            songs.truncate(from + MAX_ITEMS);
+                .saturating_sub(KEEP_PLAYED.min(room.saturating_sub(1)))
+                .min(songs.len() - room);
+            songs.truncate(from + room);
             songs.drain(..from);
             start_index = start - from;
         }
@@ -184,13 +199,14 @@ impl Queue {
     /// on, a random song of the whole list starts (the user's pick, 2026-10-06), so a
     /// shuffled album or playlist doesn't open on its first track every time; with shuffle
     /// off, the first song.
-    pub fn replace_unpicked(&mut self, songs: Vec<SongItem>) -> Option<&QueueItem> {
+    /// `room` is `replace_within`'s.
+    pub fn replace_unpicked(&mut self, songs: Vec<SongItem>, room: usize) -> Option<&QueueItem> {
         let start = if self.original.is_some() && !songs.is_empty() {
             self.rng.below(songs.len())
         } else {
             0
         };
-        self.replace(songs, start)
+        self.replace_within(songs, start, room)
     }
 
     /// A queue from a saved state (`crate::state`): `songs` in play order with new ids,
@@ -960,7 +976,7 @@ mod tests {
         // Shuffle off: the first song, whatever the seed.
         let mut q = Queue::with_seed(5);
         assert_eq!(
-            q.replace_unpicked(songs(8))
+            q.replace_unpicked(songs(8), MAX_ITEMS)
                 .map(|i| i.song.video_id.clone()),
             Some("s0".into())
         );
@@ -970,7 +986,12 @@ mod tests {
         q.set_shuffle(true);
         let mut starts = HashSet::new();
         for _ in 0..40 {
-            let first = q.replace_unpicked(songs(8)).unwrap().song.video_id.clone();
+            let first = q
+                .replace_unpicked(songs(8), MAX_ITEMS)
+                .unwrap()
+                .song
+                .video_id
+                .clone();
             assert_eq!(q.current_index(), Some(0));
             assert_eq!(q.len(), 8);
             starts.insert(first);
@@ -980,18 +1001,27 @@ mod tests {
         let pick = |seed| {
             let mut q = Queue::with_seed(seed);
             q.set_shuffle(true);
-            q.replace_unpicked(songs(8)).unwrap().song.video_id.clone()
+            q.replace_unpicked(songs(8), MAX_ITEMS)
+                .unwrap()
+                .song
+                .video_id
+                .clone()
         };
         assert_eq!(pick(11), pick(11));
         // Turning shuffle off goes back to the list's own order, at the song that started.
         let mut q = Queue::with_seed(11);
         q.set_shuffle(true);
-        let first = q.replace_unpicked(songs(8)).unwrap().song.video_id.clone();
+        let first = q
+            .replace_unpicked(songs(8), MAX_ITEMS)
+            .unwrap()
+            .song
+            .video_id
+            .clone();
         q.set_shuffle(false);
         assert_eq!(vids(&q), vids(&queue(8, 0)));
         assert_eq!(cur(&q), Some(first));
         // An empty list: nothing current.
-        assert!(q.replace_unpicked(Vec::new()).is_none());
+        assert!(q.replace_unpicked(Vec::new(), MAX_ITEMS).is_none());
     }
 
     #[test]
@@ -1276,6 +1306,30 @@ mod tests {
             .collect();
         assert!(originals.windows(2).all(|w| w[0] < w[1]), "{originals:?}");
         assert_eq!(q.items().last().unwrap().song.video_id, "r99");
+    }
+
+    #[test]
+    fn replace_within_leaves_room_for_what_the_user_added() {
+        let mut q = Queue::with_seed(3);
+        // Room for 400: the window around the start shrinks, keeping the same 50 played.
+        q.replace_within(songs(3000), 700, 400);
+        assert_eq!(q.len(), 400);
+        assert_eq!(cur(&q), Some("s700".into()));
+        assert_eq!(q.current_index(), Some(KEEP_PLAYED));
+        // Room for fewer than 50 played: the start song still makes it, last in the window.
+        q.replace_within(songs(3000), 700, 10);
+        assert_eq!(q.len(), 10);
+        assert_eq!(cur(&q), Some("s700".into()));
+        // Room for one: just the start song.
+        q.replace_within(songs(500), 3, 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(cur(&q), Some("s3".into()));
+        // No room: an empty queue, nothing current.
+        assert!(q.replace_within(songs(500), 3, 0).is_none());
+        assert!(q.is_empty());
+        // More room than the cap is still the cap.
+        q.replace_within(songs(3000), 0, 5000);
+        assert_eq!(q.len(), MAX_ITEMS);
     }
 
     #[test]
