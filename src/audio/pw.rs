@@ -20,7 +20,7 @@ use pw::properties::properties;
 use pw::spa;
 use pw::stream::{StreamFlags, StreamRc, StreamState};
 
-use crate::audio::sink::Sink;
+use crate::audio::sink::{LostNotify, Sink};
 use crate::error::Error;
 
 /// The ring between the audio thread and PipeWire, in seconds of audio.
@@ -68,6 +68,9 @@ struct Shared {
     /// The stream is gone for good: it errored, or the sound server went away (see
     /// `stream_gone` and `core_gone`).
     failed: AtomicBool,
+    /// Set by `close` before it stops the stream: the Unconnected that follows is ours, not
+    /// a loss to report.
+    closing: AtomicBool,
 }
 
 /// Messages to the PipeWire main loop.
@@ -95,7 +98,8 @@ struct Output {
 
 /// How an `Output` is made: `Output::connect`, or a stand-in in tests (which must never
 /// reach the user's PipeWire).
-type Connect = fn(rate: u32, volume: f32, paused: bool) -> Result<Output, Error>;
+type Connect =
+    fn(rate: u32, volume: f32, paused: bool, notify: Option<LostNotify>) -> Result<Output, Error>;
 
 /// PipeWire playback. Connects on the first `open`; a new rate reconnects (the rare switch
 /// between 48 kHz Opus and 44.1 kHz AAC), and so does a stream that failed.
@@ -105,6 +109,8 @@ pub struct PipeWireSink {
     /// The slider value (0..=1), re-applied to each new stream.
     volume: f32,
     paused: bool,
+    /// Passed to each new stream: told when it is lost (`Sink::watch_lost`).
+    notify: Option<LostNotify>,
 }
 
 impl PipeWireSink {
@@ -114,6 +120,7 @@ impl PipeWireSink {
             connect: Output::connect,
             volume: 1.0,
             paused: false,
+            notify: None,
         }
     }
 
@@ -189,6 +196,7 @@ impl Sink for PipeWireSink {
             rate,
             channel_volume(self.volume),
             self.paused,
+            self.notify.clone(),
         )?);
         Ok(())
     }
@@ -252,6 +260,22 @@ impl Sink for PipeWireSink {
         self.out
             .as_ref()
             .is_some_and(|o| o.shared.failed.load(Ordering::Acquire))
+    }
+
+    fn watch_lost(&mut self, notify: LostNotify) {
+        self.notify = Some(notify);
+    }
+}
+
+/// Marks the output gone, and tells the watcher the first time, unless `close` is stopping
+/// it on purpose. Runs on the PipeWire thread, from its state and core error callbacks.
+fn mark_gone(shared: &Shared, notify: &Option<LostNotify>) {
+    let was_failed = shared.failed.swap(true, Ordering::AcqRel);
+    if !was_failed
+        && !shared.closing.load(Ordering::Acquire)
+        && let Some(notify) = notify
+    {
+        notify();
     }
 }
 
@@ -334,7 +358,12 @@ impl<'a> StallWatch<'a> {
 }
 
 impl Output {
-    fn connect(rate: u32, volume: f32, paused: bool) -> Result<Output, Error> {
+    fn connect(
+        rate: u32,
+        volume: f32,
+        paused: bool,
+        notify: Option<LostNotify>,
+    ) -> Result<Output, Error> {
         let capacity = ((RING_SECS * f64::from(rate)) as usize) * 2;
         let (producer, consumer) = rtrb::RingBuffer::new(capacity);
         let shared = Arc::new(Shared::default());
@@ -351,6 +380,7 @@ impl Output {
                     rate,
                     volume,
                     paused,
+                    notify,
                     consumer,
                     shared: thread_shared,
                     inbox,
@@ -407,6 +437,7 @@ impl Output {
     /// ever. That is also the one wait in `open` (after a failed or late connect) that had no
     /// bound.
     fn close(mut self) {
+        self.shared.closing.store(true, Ordering::Release);
         let _ = self.control.send(Control::Quit);
         let Some(t) = self.thread.take() else {
             return;
@@ -429,6 +460,7 @@ struct Setup {
     rate: u32,
     volume: f32,
     paused: bool,
+    notify: Option<LostNotify>,
     consumer: rtrb::Consumer<f32>,
     shared: Arc<Shared>,
     inbox: pw::channel::Receiver<Control>,
@@ -467,11 +499,12 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
     // drop free the pw_core first, and then `_core`'s drop wrote into freed memory on every
     // close (AddressSanitizer: heap-use-after-free in libspa's list remove).
     let core_shared = setup.shared.clone();
+    let core_notify = setup.notify.clone();
     let _core = core
         .add_listener_local()
         .error(move |id, _seq, _res, _message| {
             if core_gone(id) {
-                core_shared.failed.store(true, Ordering::Release);
+                mark_gone(&core_shared, &core_notify);
             }
         })
         .register();
@@ -512,7 +545,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
         .add_local_listener_with_user_data(())
         .state_changed(move |s, _, _, new| {
             if stream_gone(&new) {
-                state_shared.failed.store(true, Ordering::Release);
+                mark_gone(&state_shared, &setup.notify);
             } else if matches!(new, StreamState::Paused | StreamState::Streaming) {
                 // Controls only stick once the stream is negotiated: apply the volume then.
                 set_volume(s, state_volume.get());
@@ -723,7 +756,12 @@ mod tests {
     }
 
     /// An `Output` with no PipeWire behind it: nothing reads its ring or its control channel.
-    fn fake_connect(rate: u32, _volume: f32, _paused: bool) -> Result<Output, Error> {
+    fn fake_connect(
+        rate: u32,
+        _volume: f32,
+        _paused: bool,
+        _notify: Option<LostNotify>,
+    ) -> Result<Output, Error> {
         CONNECTS.with(|c| c.set(c.get() + 1));
         let (producer, _consumer) = rtrb::RingBuffer::new(16);
         let (control, _inbox) = pw::channel::channel();
@@ -826,6 +864,26 @@ mod tests {
         let returned = rx.recv_timeout(CLOSE_WAIT + Duration::from_secs(2));
         drop(release_tx);
         assert!(returned.is_ok(), "close waited for ever on a stuck thread");
+    }
+
+    #[test]
+    fn a_loss_is_told_once_and_never_for_our_own_close() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let notify: Option<LostNotify> = Some(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let shared = Shared::default();
+        mark_gone(&shared, &notify);
+        mark_gone(&shared, &notify);
+        assert!(shared.failed.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "once per stream");
+        // Closing it ourselves also leaves the stream Unconnected: that is not a loss.
+        let closing = Shared::default();
+        closing.closing.store(true, Ordering::Release);
+        mark_gone(&closing, &notify);
+        assert!(closing.failed.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

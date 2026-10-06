@@ -445,6 +445,7 @@ impl Engine {
             }
             AudioEvent::Error(e) => {
                 self.status.position = self.player.position();
+                let was_paused = self.status.state == PlayState::Paused;
                 self.fail(&e);
                 // The sound server restarted under the song (often a `systemctl restart` or
                 // an update): after reporting it, play the song again from where it was, on
@@ -456,6 +457,11 @@ impl Engine {
                     let at = self.status.position;
                     self.start(id, at);
                     self.replayed = true;
+                    // A paused song comes back paused: it loads at its place and waits for a
+                    // play, rather than starting by itself after a restart.
+                    if was_paused {
+                        self.pause();
+                    }
                 }
             }
         }
@@ -930,6 +936,51 @@ mod tests {
         r.until(PlayState::Stopped).await;
         r.until(PlayState::Playing).await;
         assert_eq!(r.started().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_restart_while_paused_reloads_the_song_paused_where_it_was() {
+        let mut r = rig(Setup::default()).await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Playing).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.send(EngineCmd::Pause).await;
+        r.until(PlayState::Paused).await;
+        let before = r.status().await.position;
+        r.stats.lose_output();
+        // Reported at once, without a play, then the song is loaded again, still paused.
+        let seen = r.until(PlayState::Paused).await;
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                EngineEvent::Error {
+                    code: "internal",
+                    ..
+                }
+            )),
+            "{seen:?}"
+        );
+        let status = r.status().await;
+        assert_eq!(status.state, PlayState::Paused);
+        // The audio thread's own paused position: the engine's figure from the moment it sent
+        // the pause can be a packet (20 ms) behind it.
+        assert!(
+            (status.position - before).abs() < 0.1,
+            "reloaded at {}, paused at {before}",
+            status.position
+        );
+        eventually("the song is downloaded again", || r.started().len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(e) = r.events.try_recv() {
+            assert!(
+                !matches!(&e, EngineEvent::State(s) if s.state == PlayState::Playing),
+                "a paused song must not start by itself"
+            );
+        }
+        assert!(r.stats.paused(), "the output stays paused");
+        // A play resumes it from there.
+        r.send(EngineCmd::Toggle).await;
+        r.until(PlayState::Playing).await;
     }
 
     #[tokio::test]

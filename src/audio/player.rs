@@ -51,6 +51,8 @@ enum Command {
     Seek(f64),
     Volume(f32),
     Stop,
+    /// The sink says its output was lost (`Sink::watch_lost`).
+    OutputLost,
     Quit,
 }
 
@@ -79,8 +81,15 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     /// Starts the audio thread with `sink` as its output.
-    pub fn spawn(sink: Box<dyn Sink>) -> AudioPlayer {
+    pub fn spawn(mut sink: Box<dyn Sink>) -> AudioPlayer {
         let (commands, inbox) = crossbeam_channel::unbounded();
+        // The sink's news of a lost output comes in as a command, so it wakes an audio thread
+        // that is waiting for one (paused): a dead output is reported at once, not at the next
+        // play, and nothing polls for it.
+        let wake = commands.clone();
+        sink.watch_lost(Arc::new(move || {
+            let _ = wake.send(Command::OutputLost);
+        }));
         let (events_tx, events) = crossbeam_channel::unbounded();
         let position = Arc::new(AtomicU64::new(0f64.to_bits()));
         let worker = Worker {
@@ -328,6 +337,13 @@ impl Worker {
                 }
             }
             Command::Stop => self.unload(),
+            Command::OutputLost => {
+                // Only about the current output (a replaced one doesn't matter), and only when
+                // a song is loaded: a playing song's write may have reported it already.
+                if self.sink.lost() && self.track.as_ref().is_some_and(|t| !t.ended) {
+                    self.fail(Error::OutputRestarted);
+                }
+            }
             Command::Quit => {}
         }
     }
@@ -751,6 +767,25 @@ mod tests {
         // The position stays where the song was, so the engine can play it again from there.
         let at = p.position();
         assert!(at > 0.05 && at < 0.4, "position {at}");
+    }
+
+    #[test]
+    fn output_lost_while_paused_is_reported_at_once() {
+        let (p, events, stats) = player(NullSink::realtime());
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        p.play();
+        assert_eq!(next_event(&events), AudioEvent::Started);
+        std::thread::sleep(Duration::from_millis(200));
+        p.pause();
+        assert_eq!(next_event(&events), AudioEvent::Paused);
+        let at = p.position();
+        // No play needed: the sink's own news wakes the paused audio thread.
+        stats.lose_output();
+        assert_eq!(
+            next_event(&events),
+            AudioEvent::Error(Error::OutputRestarted)
+        );
+        assert_eq!(p.position(), at, "the position stays where it was paused");
     }
 
     #[test]

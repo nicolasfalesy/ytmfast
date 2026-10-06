@@ -2,8 +2,8 @@
 //!
 //! Found live: the sound server was restarted while a song played, the song went quietly to
 //! `paused`, and the next play failed with "the audio output stopped". The output must say
-//! that it restarted (an `internal` error the engine retries on), and the next song must get a
-//! new stream.
+//! that it restarted (an `internal` error the engine retries on), at once even when paused,
+//! and the next song must get a new stream. Our own closes (a new song, quit) must not count.
 //!
 //! The daemon runs from a config written here: a null sink and the modules a client stream
 //! needs, nothing that opens a sound card, no session manager and no D-Bus. Its socket is in
@@ -274,8 +274,8 @@ fn output_survives_a_sound_server_restart() {
         AudioEvent::Ended
     );
 
-    // 3. Paused when the daemon restarts: the play after it reports the restart instead of
-    // resuming into a dead stream.
+    // 3. Paused when the daemon goes away: reported at once, without waiting for a play
+    // (the PipeWire thread's news wakes the paused audio thread).
     player.load(fixture(), OPUS_MIME, 1.0, 0.0, None);
     player.play();
     assert_eq!(
@@ -289,13 +289,35 @@ fn output_survives_a_sound_server_restart() {
         AudioEvent::Paused
     );
     daemon.stop();
-    let daemon = Daemon::start(&dir);
-    std::thread::sleep(Duration::from_millis(200));
-    player.play();
     assert_restarted(next_event(&events, Duration::from_secs(2)));
+    let daemon = Daemon::start(&dir);
 
     // 4. And the song after that plays, on a new stream.
     player.load(fixture(), OPUS_MIME, 1.0, 0.0, None);
+    player.play();
+    assert_eq!(
+        next_event(&events, Duration::from_secs(5)),
+        AudioEvent::Started
+    );
+    link(&dir);
+    assert_eq!(
+        next_event(&events, Duration::from_secs(5)),
+        AudioEvent::Ended
+    );
+
+    // 5. Our own close (the AAC fixture's 44.1 kHz needs a new stream) is not a loss: the
+    // song plays to its end with no error.
+    let aac = format!(
+        "{}/tests/fixtures/sine440_44k.m4a",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    player.load(
+        TrackBuffer::from_bytes(std::fs::read(aac).unwrap()).reader(),
+        "audio/mp4; codecs=\"mp4a.40.2\"",
+        1.0,
+        0.0,
+        None,
+    );
     player.play();
     assert_eq!(
         next_event(&events, Duration::from_secs(5)),

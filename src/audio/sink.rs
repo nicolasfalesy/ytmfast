@@ -1,11 +1,15 @@
 //! Where decoded audio goes: the `Sink` trait, and `NullSink`, which plays nothing and counts
 //! what it is given (tests and benchmarks). The real one is `pw::PipeWireSink`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
+
+/// Called, from whatever thread notices, when an output's connection goes away. The audio
+/// thread passes one that wakes it, so a paused song (which never writes) learns at once.
+pub type LostNotify = Arc<dyn Fn() + Send + Sync>;
 
 /// An audio output. Owned by the audio thread, so `&mut self` everywhere.
 pub trait Sink: Send {
@@ -29,6 +33,11 @@ pub trait Sink: Send {
     fn lost(&self) -> bool {
         false
     }
+    /// Calls `notify` once each time an open output is lost (not when it is closed on
+    /// purpose). An output that can't be lost ignores it.
+    fn watch_lost(&mut self, notify: LostNotify) {
+        let _ = notify;
+    }
 }
 
 /// What a `NullSink` saw. Shared, so a test keeps reading it after the sink moves to the
@@ -44,6 +53,18 @@ pub struct NullStats {
     rate: AtomicU32,
     /// Set by `lose_output`, cleared by the next `open`.
     lost: AtomicBool,
+    /// Told when `lose_output` loses the output.
+    watcher: Watcher,
+}
+
+/// `NullStats`' watcher, in a type of its own so the stats stay `Debug`.
+#[derive(Default)]
+struct Watcher(Mutex<Option<LostNotify>>);
+
+impl std::fmt::Debug for Watcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Watcher")
+    }
 }
 
 impl NullStats {
@@ -70,7 +91,17 @@ impl NullStats {
     /// Plays a sound server restart: the sink acts like a `PipeWireSink` whose stream died
     /// (writes fail, `lost` is true) until it is opened again.
     pub fn lose_output(&self) {
-        self.lost.store(true, Ordering::SeqCst);
+        if !self.lost.swap(true, Ordering::SeqCst) {
+            let watcher = self
+                .watcher
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(notify) = watcher {
+                notify();
+            }
+        }
     }
 }
 
@@ -225,6 +256,15 @@ impl Sink for NullSink {
     fn lost(&self) -> bool {
         self.stats.lost.load(Ordering::SeqCst)
     }
+
+    fn watch_lost(&mut self, notify: LostNotify) {
+        *self
+            .stats
+            .watcher
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(notify);
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +296,28 @@ mod tests {
         s.open(48_000, 2).unwrap();
         assert!(!s.lost(), "open reconnects");
         s.write(&[0.0; 4]).unwrap();
+    }
+
+    #[test]
+    fn a_lost_output_tells_its_watcher_once() {
+        let mut s = NullSink::new();
+        let stats = s.stats();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        s.watch_lost(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        s.open(48_000, 2).unwrap();
+        stats.lose_output();
+        stats.lose_output();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "once per loss");
+        s.open(48_000, 2).unwrap();
+        stats.lose_output();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a new output can be lost again"
+        );
     }
 
     #[test]
