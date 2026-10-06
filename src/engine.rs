@@ -6,9 +6,16 @@
 //! driven through `AudioPlayer`'s command channel. (The audio thread can be blocked for a
 //! while opening a track whose first bytes haven't arrived; nothing here waits for it.)
 //!
-//! Two counters keep late news from an older song out of the state:
+//! The engine also drives the queue (`crate::queue`): a play fills it from YouTube Music's
+//! `next` (a `QueueSource`), a song's end plays the next item, an unplayable song is skipped,
+//! the next song's link is prefetched halfway through the current one, and radio songs are
+//! fetched when the queue is about to run out.
+//!
+//! Three counters keep late news out of the state:
 //! - every play gets a generation number, and a resolve that comes back for an older one is
 //!   dropped (its task is aborted too, but an answer already in the channel isn't);
+//! - every new queue gets a queue generation, and a queue page that comes back for an older
+//!   queue is dropped the same way;
 //! - every load handed to the audio thread is counted, and so is every `AudioEvent::Loading`
 //!   it sends back; until they match, its events are about an earlier track and are dropped.
 //!
@@ -30,7 +37,7 @@ use crate::audio::fetch::{Relink, TrackBuffer};
 use crate::audio::player::{AudioEvent, AudioPlayer};
 use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
-use crate::queue::{AddAt, Queue, QueueItem, Repeat};
+use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
 use crate::streams::{Resolver, Stream, TrackMeta};
 
 /// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
@@ -172,17 +179,42 @@ const COMMANDS_CAPACITY: usize = 32;
 
 const TICK: Duration = Duration::from_secs(1);
 
+/// The playlist a play with nothing at all starts: the user's Liked songs.
+const LIKED_SONGS: &str = "LM";
+
+/// A song's radio is the playlist `RDAMVM` + its id, asked for together with the id.
+const RADIO_PREFIX: &str = "RDAMVM";
+
 /// A finished resolve, tagged with the play it was for.
 struct Resolved {
     generation: u64,
     result: Result<Stream, Error>,
 }
 
+/// A finished queue request, tagged with the queue it was for (`Engine::queue_generation`).
+struct Paged {
+    queue_generation: u64,
+    /// More radio songs for the end of the queue, rather than a play's whole queue.
+    refill: bool,
+    result: Result<NextPage, Error>,
+}
+
+/// A play's queue that is still being fetched.
+struct PendingLoad {
+    /// The song the play named. It plays at once, alone in the queue until the list arrives.
+    seed: Option<String>,
+    /// Where to start when there is no seed (or the seed is found at that index).
+    index: Option<usize>,
+    /// Where the first song starts when there is no seed.
+    start: f64,
+    /// The play named a playlist, so failing to fetch it is news for the user. A lone song's
+    /// radio is a background extra: it failing just leaves the song alone in the queue.
+    report_errors: bool,
+}
+
 pub struct Engine {
     resolver: Arc<dyn Resolver>,
-    #[allow(dead_code)]
     source: Arc<dyn QueueSource>,
-    #[allow(dead_code)]
     queue: Queue,
     player: AudioPlayer,
     start_buffer: Starter,
@@ -190,11 +222,37 @@ pub struct Engine {
     events: broadcast::Sender<EngineEvent>,
     resolved_tx: mpsc::UnboundedSender<Resolved>,
     resolved_rx: mpsc::UnboundedReceiver<Resolved>,
+    pages_tx: mpsc::UnboundedSender<Paged>,
+    pages_rx: mpsc::UnboundedReceiver<Paged>,
     status: Status,
-    /// Bumped by every play that starts a song.
+    /// Bumped by every play that starts a song, and by every stop.
     generation: u64,
+    /// Bumped by every play that makes a new queue: a queue page that comes back for an older
+    /// one is dropped (the same rule as `generation`, for queues).
+    queue_generation: u64,
     /// The running resolve, aborted when a newer play replaces it.
     resolving: Option<AbortHandle>,
+    /// The play's queue request, and what it is for.
+    loading: Option<AbortHandle>,
+    pending: Option<PendingLoad>,
+    /// The radio request for the end of the queue. One at a time.
+    refilling: Option<AbortHandle>,
+    /// The queue's next page, when it came from a radio (or another endless list).
+    continuation: Option<String>,
+    /// YouTube has no more songs for this queue: no more radio requests until a new queue.
+    exhausted: bool,
+    /// The queue ran out while more songs were on the way: the next one plays when they come.
+    waiting: bool,
+    /// Stopped because the queue ran out (not by an error).
+    at_end: bool,
+    /// Songs that failed in a row; a whole queue's worth stops the skipping.
+    skip_streak: usize,
+    /// Where the current song stopped after a failure: a play goes on from there.
+    resume_from: Option<f64>,
+    /// The current song's details from its link (fills gaps in the queue item's).
+    resolved_meta: Option<TrackMeta>,
+    /// The latest link prefetch, by queue id.
+    prefetch: Option<(u64, AbortHandle)>,
     /// Where the current song starts: the play's start, moved by a seek while resolving.
     start_seconds: f64,
     /// The current song was handed to the audio thread and has not ended or failed.
@@ -238,6 +296,7 @@ impl Engine {
         let (cmd_tx, commands) = mpsc::channel(COMMANDS_CAPACITY);
         let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
+        let (pages_tx, pages_rx) = mpsc::unbounded_channel();
         let engine = Engine {
             resolver,
             source,
@@ -248,6 +307,8 @@ impl Engine {
             events: events.clone(),
             resolved_tx,
             resolved_rx,
+            pages_tx,
+            pages_rx,
             status: Status {
                 state: PlayState::Stopped,
                 video_id: None,
@@ -260,7 +321,19 @@ impl Engine {
                 repeat: Repeat::Off,
             },
             generation: 0,
+            queue_generation: 0,
             resolving: None,
+            loading: None,
+            pending: None,
+            refilling: None,
+            continuation: None,
+            exhausted: false,
+            waiting: false,
+            at_end: false,
+            skip_streak: 0,
+            resume_from: None,
+            resolved_meta: None,
+            prefetch: None,
             start_seconds: 0.0,
             loaded: false,
             started: false,
@@ -283,11 +356,21 @@ impl Engine {
                     Some(cmd) => self.handle(cmd),
                 },
                 Some(r) = self.resolved_rx.recv() => self.on_resolved(r),
+                Some(p) = self.pages_rx.recv() => self.on_page(p),
                 Some(e) = audio.recv() => self.on_audio(e),
                 () = next_tick(&mut self.ticker) => self.on_tick(),
             }
         }
-        if let Some(task) = self.resolving.take() {
+        let prefetch = self.prefetch.take().map(|(_, task)| task);
+        for task in [
+            self.resolving.take(),
+            self.loading.take(),
+            self.refilling.take(),
+            prefetch,
+        ]
+        .into_iter()
+        .flatten()
+        {
             task.abort();
         }
         // Dropping the player cancels its reader and joins the audio thread; the forwarder
@@ -307,45 +390,116 @@ impl Engine {
         match cmd {
             EngineCmd::Play {
                 video_id,
+                playlist_id,
+                index,
                 start_seconds,
-                ..
-            } => self.play(video_id, start_seconds),
+            } => self.play(video_id, playlist_id, index, start_seconds),
             EngineCmd::Pause => self.pause(),
             EngineCmd::Toggle => match self.status.state {
                 PlayState::Playing | PlayState::Buffering => self.pause(),
                 PlayState::Paused => self.resume(),
-                PlayState::Stopped => self.play(None, 0.0),
+                PlayState::Stopped => self.play(None, None, None, 0.0),
             },
             EngineCmd::Seek(seconds) => self.seek(seconds),
             EngineCmd::Volume(v) => self.volume(v),
             EngineCmd::Status(reply) => {
                 let _ = reply.send(self.snapshot());
             }
+            EngineCmd::Next => self.advance(false, false),
+            EngineCmd::Previous => self.previous(),
             EngineCmd::QueueGet(reply) => {
                 let _ = reply.send(self.queue_view());
             }
-            EngineCmd::Next
-            | EngineCmd::Previous
-            | EngineCmd::QueueAdd { .. }
-            | EngineCmd::QueueRemove(_)
-            | EngineCmd::QueueJump(_)
-            | EngineCmd::QueueMove { .. }
-            | EngineCmd::Shuffle(_)
-            | EngineCmd::Repeat(_) => {}
+            EngineCmd::QueueAdd { songs, at } => self.queue_add(songs, at),
+            EngineCmd::QueueRemove(id) => self.queue_remove(id),
+            EngineCmd::QueueJump(id) => self.queue_jump(id),
+            EngineCmd::QueueMove { id, index } => {
+                if self.queue.move_to(id, index) {
+                    self.emit_queue();
+                } else {
+                    self.not_in_queue();
+                }
+            }
+            EngineCmd::Shuffle(on) => {
+                self.queue.set_shuffle(on);
+                self.emit_queue();
+                self.emit_state();
+            }
+            EngineCmd::Repeat(repeat) => {
+                self.queue.set_repeat(repeat);
+                self.emit_queue();
+                self.emit_state();
+                // Repeat off can leave the queue short of songs.
+                self.maybe_refill();
+            }
             // Handled by `run`.
             EngineCmd::Quit => {}
         }
     }
 
-    fn play(&mut self, video_id: Option<String>, start_seconds: f64) {
+    fn play(
+        &mut self,
+        video_id: Option<String>,
+        playlist_id: Option<String>,
+        index: Option<usize>,
+        start_seconds: f64,
+    ) {
         let start = if start_seconds.is_finite() {
             start_seconds.max(0.0)
         } else {
             0.0
         };
-        if let Some(id) = video_id {
-            return self.start(id, start);
+        let request = match (&video_id, &playlist_id) {
+            (None, None) => return self.play_current(start),
+            // A song's radio is asked for with its seed song.
+            (Some(v), Some(p)) if p.starts_with(RADIO_PREFIX) => NextRequest {
+                video_id: Some(v.clone()),
+                playlist_id: Some(p.clone()),
+                ..NextRequest::default()
+            },
+            // An album or playlist by its id alone: with a video id too, YouTube answers
+            // with just that song (tests/fixtures/NEXT_FIXTURES.md).
+            (_, Some(p)) => NextRequest {
+                playlist_id: Some(p.clone()),
+                ..NextRequest::default()
+            },
+            // A lone song: its radio fills the queue behind it, so "radio when the queue
+            // runs out" holds from the first song.
+            (Some(v), None) => NextRequest {
+                video_id: Some(v.clone()),
+                playlist_id: Some(format!("{RADIO_PREFIX}{v}")),
+                ..NextRequest::default()
+            },
+        };
+        self.new_queue();
+        match &video_id {
+            Some(id) => {
+                // It plays at once, without waiting for the list.
+                self.queue.replace(vec![bare_song(id)], 0);
+                self.emit_queue();
+                self.start_current(start);
+            }
+            None => {
+                self.queue.replace(Vec::new(), 0);
+                self.emit_queue();
+                self.halt();
+                self.show_nothing();
+                self.status.position = start;
+                self.status.state = PlayState::Buffering;
+                self.emit_state();
+            }
         }
+        self.pending = Some(PendingLoad {
+            seed: video_id,
+            index,
+            start,
+            report_errors: playlist_id.is_some(),
+        });
+        self.loading = Some(self.request(request, false));
+    }
+
+    /// A play without an id or a playlist.
+    fn play_current(&mut self, start: f64) {
         match self.status.state {
             PlayState::Paused => {
                 if start > 0.0 {
@@ -358,15 +512,386 @@ impl Engine {
                     self.seek(start);
                 }
             }
-            PlayState::Stopped => match self.status.video_id.clone() {
-                Some(id) => self.start(id, start),
-                // Step 2 starts Liked songs here.
-                None => self.emit(EngineEvent::Error {
-                    code: "internal",
-                    message: "nothing to play".into(),
-                }),
-            },
+            PlayState::Stopped => {
+                // The queue ran out and songs were added since: go on with them.
+                if self.at_end && self.queue.peek_next(false).is_some() {
+                    return self.advance(false, false);
+                }
+                if self.queue.current().is_some() {
+                    let from = if start > 0.0 {
+                        start
+                    } else {
+                        self.resume_from.unwrap_or(0.0)
+                    };
+                    self.start_current(from);
+                } else {
+                    self.play(None, Some(LIKED_SONGS.into()), None, start);
+                }
+            }
         }
+    }
+
+    /// Forgets everything about the old queue's fetching: its answers are dropped when they
+    /// come.
+    fn new_queue(&mut self) {
+        self.queue_generation += 1;
+        let prefetch = self.prefetch.take().map(|(_, task)| task);
+        for task in [self.loading.take(), self.refilling.take(), prefetch]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+        self.pending = None;
+        self.continuation = None;
+        self.exhausted = false;
+        self.waiting = false;
+        self.at_end = false;
+        self.skip_streak = 0;
+        self.resume_from = None;
+    }
+
+    /// Asks the queue source for a page, tagged with the current queue.
+    fn request(&self, req: NextRequest, refill: bool) -> AbortHandle {
+        let source = self.source.clone();
+        let tx = self.pages_tx.clone();
+        let queue_generation = self.queue_generation;
+        let task = tokio::spawn(async move {
+            let result = source.next(req).await;
+            let _ = tx.send(Paged {
+                queue_generation,
+                refill,
+                result,
+            });
+        });
+        task.abort_handle()
+    }
+
+    fn on_page(&mut self, p: Paged) {
+        if p.queue_generation != self.queue_generation {
+            return;
+        }
+        if p.refill {
+            self.refilling = None;
+            self.on_refill(p.result);
+        } else {
+            self.loading = None;
+            self.on_load(p.result);
+        }
+    }
+
+    /// A play's queue arrived (or failed).
+    fn on_load(&mut self, result: Result<NextPage, Error>) {
+        let Some(plan) = self.pending.take() else {
+            return;
+        };
+        let result = result.and_then(|page| {
+            if page.items.is_empty() {
+                Err(Error::Unavailable("YouTube sent no queue".into()))
+            } else {
+                Ok(page)
+            }
+        });
+        let page = match result {
+            Ok(page) => page,
+            Err(e) => {
+                let unavailable = matches!(e, Error::Unavailable(_));
+                if plan.report_errors || plan.seed.is_none() {
+                    self.emit(EngineEvent::Error {
+                        code: e.code(),
+                        message: e.to_string(),
+                    });
+                } else if !unavailable {
+                    // The code only: the radio is a background extra, and the song plays on.
+                    eprintln!("ytmfast: could not fetch the song's radio ({})", e.code());
+                }
+                // "No queue" means no songs to come; anything else may work on a later try.
+                if unavailable {
+                    self.exhausted = true;
+                }
+                if plan.seed.is_none() {
+                    self.status.state = PlayState::Stopped;
+                    self.emit_state();
+                } else if self.waiting {
+                    // Not another request at once: a source that keeps failing would loop.
+                    self.stop_at_end();
+                }
+                return;
+            }
+        };
+        self.continuation = page.continuation;
+        match plan.seed {
+            None => {
+                self.queue.replace(page.items, plan.index.unwrap_or(0));
+                self.emit_queue();
+                let paused = self.status.state == PlayState::Paused;
+                self.start_current(plan.start);
+                if paused {
+                    self.pause();
+                }
+            }
+            Some(seed) => {
+                // The seed already plays: find it in the list (at the play's index if it is
+                // there), so its item there becomes current; a list without it gets it first.
+                let mut songs = page.items;
+                let at = plan
+                    .index
+                    .filter(|&i| songs.get(i).is_some_and(|s| s.video_id == seed))
+                    .or_else(|| songs.iter().position(|s| s.video_id == seed));
+                let at = at.unwrap_or_else(|| {
+                    songs.insert(0, bare_song(&seed));
+                    0
+                });
+                self.queue.replace(songs, at);
+                if let Some(item) = self.queue.current() {
+                    self.status.queue_id = Some(item.id);
+                    self.status.album = item.song.album.clone();
+                }
+                self.refresh_meta();
+                self.emit_queue();
+                self.emit_state();
+                if self.waiting {
+                    // The seed already ended or failed while the list was coming.
+                    self.waiting = false;
+                    return self.advance(false, true);
+                }
+            }
+        }
+        self.maybe_refill();
+    }
+
+    /// More radio songs for the end of the queue arrived (or failed).
+    fn on_refill(&mut self, result: Result<NextPage, Error>) {
+        match result {
+            Ok(page) => {
+                self.continuation = page.continuation;
+                let added = self.queue.append_radio(page.items);
+                if added == 0 {
+                    // Nothing new (radio pages overlap): asking again could loop.
+                    self.exhausted = true;
+                } else {
+                    self.emit_queue();
+                }
+                if self.waiting {
+                    self.waiting = false;
+                    if added > 0 {
+                        self.advance(false, true);
+                    } else {
+                        self.stop_at_end();
+                    }
+                } else if added > 0 {
+                    self.maybe_refill();
+                }
+            }
+            Err(e) => {
+                let unavailable = matches!(e, Error::Unavailable(_));
+                if unavailable {
+                    // "YouTube sent no queue": no more songs (ruling S7).
+                    self.exhausted = true;
+                } else {
+                    eprintln!("ytmfast: could not fetch more radio songs ({})", e.code());
+                }
+                if self.waiting {
+                    if !unavailable {
+                        self.emit(EngineEvent::Error {
+                            code: e.code(),
+                            message: e.to_string(),
+                        });
+                    }
+                    self.stop_at_end();
+                }
+            }
+        }
+    }
+
+    /// Fetches more radio songs when the queue is about to run out: the radio's next page if
+    /// the queue came from one, else the radio of the queue's last song. Never while a request
+    /// is out, and never again once YouTube had no more.
+    fn maybe_refill(&mut self) {
+        if self.loading.is_some()
+            || self.refilling.is_some()
+            || self.exhausted
+            || !self.queue.needs_more()
+        {
+            return;
+        }
+        let Some(last) = self.queue.items().last() else {
+            return;
+        };
+        let req = match &self.continuation {
+            Some(c) => NextRequest {
+                continuation: Some(c.clone()),
+                ..NextRequest::default()
+            },
+            None => {
+                let id = last.song.video_id.clone();
+                NextRequest {
+                    playlist_id: Some(format!("{RADIO_PREFIX}{id}")),
+                    video_id: Some(id),
+                    ..NextRequest::default()
+                }
+            }
+        };
+        self.refilling = Some(self.request(req, true));
+    }
+
+    /// Moves on to the next item: `auto` when the song ended by itself (only then does repeat
+    /// one play it again). At the end of the queue it waits for songs on the way, or stops.
+    fn advance(&mut self, auto: bool, keep_pause: bool) {
+        let paused = keep_pause && self.status.state == PlayState::Paused;
+        if self.queue.next(auto).is_some() {
+            self.start_current(0.0);
+            if paused {
+                self.pause();
+            }
+            self.emit_queue();
+            self.maybe_refill();
+            return;
+        }
+        self.maybe_refill();
+        if self.loading.is_some() || self.refilling.is_some() {
+            self.halt();
+            self.waiting = true;
+            if !paused {
+                self.status.state = PlayState::Buffering;
+            }
+            self.emit_state();
+        } else {
+            self.stop_at_end();
+        }
+    }
+
+    fn stop_at_end(&mut self) {
+        self.halt();
+        self.waiting = false;
+        self.at_end = true;
+        self.status.state = PlayState::Stopped;
+        self.emit_state();
+    }
+
+    /// Stops what plays (keeping its position in the status) and drops its resolve.
+    fn halt(&mut self) {
+        if self.loaded && self.started {
+            self.status.position = self.player.position();
+        }
+        self.generation += 1;
+        if let Some(task) = self.resolving.take() {
+            task.abort();
+        }
+        self.player.stop();
+        self.loaded = false;
+        self.started = false;
+        self.ticker = None;
+    }
+
+    fn previous(&mut self) {
+        let position = self.snapshot().position;
+        let moved = matches!(self.queue.previous(position), Previous::Item(_));
+        if moved {
+            self.start_current(0.0);
+            self.emit_queue();
+            self.maybe_refill();
+        } else if self.loaded {
+            self.seek(0.0);
+        } else if self.queue.current().is_some() {
+            self.start_current(0.0);
+        }
+    }
+
+    fn queue_add(&mut self, songs: Vec<SongItem>, at: AddAt) {
+        self.queue.add(songs, at);
+        self.emit_queue();
+        if self.waiting {
+            self.waiting = false;
+            return self.advance(false, true);
+        }
+        self.maybe_refill();
+    }
+
+    fn queue_remove(&mut self, id: u64) {
+        let was_current = self.queue.current().map(|i| i.id) == Some(id);
+        if !self.queue.remove(id) {
+            return self.not_in_queue();
+        }
+        if was_current {
+            if self.queue.current().is_some() {
+                // The queue's new current item takes the removed song's place, in its state.
+                match self.status.state {
+                    PlayState::Stopped => self.show_current(),
+                    PlayState::Paused => {
+                        self.start_current(0.0);
+                        self.pause();
+                    }
+                    PlayState::Playing | PlayState::Buffering => self.start_current(0.0),
+                }
+            } else {
+                self.halt();
+                self.waiting = false;
+                self.at_end = false;
+                self.show_nothing();
+                self.status.position = 0.0;
+                self.status.state = PlayState::Stopped;
+                self.emit_state();
+            }
+        }
+        self.emit_queue();
+        self.maybe_refill();
+    }
+
+    fn queue_jump(&mut self, id: u64) {
+        if self.queue.jump(id).is_none() {
+            return self.not_in_queue();
+        }
+        self.start_current(0.0);
+        self.emit_queue();
+        self.maybe_refill();
+    }
+
+    /// A queue id the queue doesn't have (a widget acting on an old copy of the queue).
+    fn not_in_queue(&self) {
+        self.emit(EngineEvent::Error {
+            code: Error::Unavailable(String::new()).code(),
+            message: Error::Unavailable("not in the queue".into()).to_string(),
+        });
+    }
+
+    /// The status shows the queue's current item without playing it.
+    fn show_current(&mut self) {
+        let Some(item) = self.queue.current().cloned() else {
+            return;
+        };
+        self.resolved_meta = None;
+        self.status.video_id = Some(item.song.video_id.clone());
+        self.status.queue_id = Some(item.id);
+        self.status.album = item.song.album.clone();
+        self.status.meta = song_meta(&item.song, None);
+        self.status.position = 0.0;
+        self.resume_from = None;
+        self.emit_state();
+    }
+
+    fn show_nothing(&mut self) {
+        self.resolved_meta = None;
+        self.status.video_id = None;
+        self.status.queue_id = None;
+        self.status.album = None;
+        self.status.meta = None;
+    }
+
+    /// Plays the queue's current item from `start`.
+    fn start_current(&mut self, start: f64) {
+        let Some(item) = self.queue.current().cloned() else {
+            return;
+        };
+        self.waiting = false;
+        self.at_end = false;
+        self.resume_from = None;
+        self.resolved_meta = None;
+        self.status.queue_id = Some(item.id);
+        self.status.album = item.song.album.clone();
+        // The queue item's details show at once; the link's only fill its gaps.
+        self.status.meta = song_meta(&item.song, None);
+        self.start(item.song.video_id, start);
     }
 
     /// A new song: drop the old one at once and resolve the new one in the background.
@@ -384,7 +909,6 @@ impl Engine {
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
         self.status.video_id = Some(video_id.clone());
-        self.status.meta = None;
         self.status.position = start;
         self.emit_state();
         crate::trace::play(&video_id);
@@ -408,14 +932,27 @@ impl Engine {
             Ok(s) => s,
             Err(e) => {
                 crate::trace::mark("resolve failed");
+                // This song can't be played: the next one may. Anything else (signed out,
+                // the network, a bug) would fail every song the same way, so it stops.
+                if matches!(e, Error::Unavailable(_) | Error::StreamFailed(_)) {
+                    return self.skip_unplayable(&e);
+                }
                 return self.fail(&e);
             }
         };
         crate::trace::mark("link resolved");
-        self.status.meta = Some(stream.meta.clone());
+        self.resolved_meta = Some(stream.meta.clone());
+        self.refresh_meta();
         let gain = loudness_gain(stream.loudness_db);
         let mime = stream.mime.clone();
-        let length_hint = Some(f64::from(stream.meta.length_seconds)).filter(|s| *s > 0.0);
+        // The link's own length first: it describes the file the audio thread decodes.
+        let length_hint = [
+            stream.meta.length_seconds,
+            self.status.meta.as_ref().map_or(0, |m| m.length_seconds),
+        ]
+        .into_iter()
+        .find(|s| *s > 0)
+        .map(f64::from);
         // A link that stops working mid-song is replaced by a fresh one, never a cached one
         // (ruling R2).
         let relink: Relink = {
@@ -443,6 +980,36 @@ impl Engine {
             self.player.play();
         }
         self.emit_state();
+    }
+
+    /// An unplayable song: report it and move on, unless every song in the queue failed in
+    /// a row (a full pass), which stops rather than skipping round for ever.
+    fn skip_unplayable(&mut self, e: &Error) {
+        self.emit(EngineEvent::Error {
+            code: e.code(),
+            message: e.to_string(),
+        });
+        self.loaded = false;
+        self.started = false;
+        self.ticker = None;
+        self.skip_streak += 1;
+        // While a play's list is still coming, the queue isn't all there yet.
+        if self.loading.is_none() && self.skip_streak >= self.queue.len() {
+            self.resume_from = None;
+            self.status.state = PlayState::Stopped;
+            self.emit_state();
+            return;
+        }
+        self.advance(false, true);
+    }
+
+    /// The current song's details: its queue item's, with gaps filled from its link.
+    fn refresh_meta(&mut self) {
+        if let Some(item) = self.queue.current()
+            && self.status.video_id.as_deref() == Some(item.song.video_id.as_str())
+        {
+            self.status.meta = song_meta(&item.song, self.resolved_meta.as_ref());
+        }
     }
 
     fn pause(&mut self) {
@@ -488,6 +1055,10 @@ impl Engine {
         if let Some(len) = self.status.meta.as_ref().map(|m| m.length_seconds)
             && len > 0
         {
+            // At or past the end: the song is over, as if it had played out.
+            if at >= f64::from(len) {
+                return self.advance(false, false);
+            }
             // The decoder lands at most 1 s before the end (so a seek never lands on
             // silence); the reported position must match where the audio really goes.
             at = at.min((f64::from(len) - 1.0).max(0.0));
@@ -532,6 +1103,8 @@ impl Engine {
         match event {
             AudioEvent::Started => {
                 self.started = true;
+                // A song played: the skipping run (if any) is over.
+                self.skip_streak = 0;
                 if self.status.state == PlayState::Buffering {
                     self.set_playing();
                     self.emit_state();
@@ -544,9 +1117,8 @@ impl Engine {
                 self.loaded = false;
                 self.started = false;
                 self.ticker = None;
-                // Step 2 moves to the next song in the queue here.
-                self.status.state = PlayState::Stopped;
-                self.emit_state();
+                // A normal load of the next item (ruling S2; gapless handover is Task 5).
+                self.advance(true, true);
             }
             AudioEvent::Error(e) => {
                 self.status.position = self.player.position();
@@ -555,12 +1127,9 @@ impl Engine {
                 // The sound server restarted under the song (often a `systemctl restart` or
                 // an update): after reporting it, play the song again from where it was, on
                 // a new stream. The link is usually still cached, so this is quick.
-                if e == Error::OutputRestarted
-                    && !self.replayed
-                    && let Some(id) = self.status.video_id.clone()
-                {
+                if e == Error::OutputRestarted && !self.replayed && self.queue.current().is_some() {
                     let at = self.status.position;
-                    self.start(id, at);
+                    self.start_current(at);
                     self.replayed = true;
                     // A paused song comes back paused: it loads at its place and waits for a
                     // play, rather than starting by itself after a restart.
@@ -572,11 +1141,13 @@ impl Engine {
         }
     }
 
-    /// The current song failed: report it, and stop (keeping the song in the status).
+    /// The current song failed: report it, and stop, keeping the song and where it stopped
+    /// in the status, so a play goes on from there.
     fn fail(&mut self, e: &Error) {
         self.loaded = false;
         self.started = false;
         self.ticker = None;
+        self.resume_from = Some(self.status.position);
         self.status.state = PlayState::Stopped;
         self.emit(EngineEvent::Error {
             code: e.code(),
@@ -602,6 +1173,55 @@ impl Engine {
             seconds,
             seeked: false,
         });
+        self.maybe_prefetch(seconds);
+    }
+
+    /// Past half the song, fetches the next song's link, so it starts without waiting for
+    /// one (the resolver keeps it in its link cache). Once per next item; a newer prefetch
+    /// replaces an older one.
+    fn maybe_prefetch(&mut self, position: f64) {
+        let Some(len) = self
+            .status
+            .meta
+            .as_ref()
+            .map(|m| m.length_seconds)
+            .filter(|l| *l > 0)
+        else {
+            return;
+        };
+        if position < f64::from(len) / 2.0 {
+            return;
+        }
+        let Some(next) = self.queue.peek_next(true) else {
+            return;
+        };
+        // Repeat one (or the same song queued twice): its link is the one playing.
+        if self.prefetch.as_ref().is_some_and(|(id, _)| *id == next.id)
+            || self.status.video_id.as_deref() == Some(next.song.video_id.as_str())
+        {
+            return;
+        }
+        let (id, video_id) = (next.id, next.song.video_id.clone());
+        if let Some((_, old)) = self.prefetch.take() {
+            old.abort();
+        }
+        let resolver = self.resolver.clone();
+        let task = tokio::spawn(async move {
+            // Only the cache matters here; a failure shows when the song's turn comes.
+            let _ = resolver.resolve(&video_id).await;
+        });
+        self.prefetch = Some((id, task.abort_handle()));
+    }
+
+    /// The status, with the position fresh from the audio thread once the song has started
+    /// (before that, the audio thread's position is still the old song's or zero).
+    fn snapshot(&mut self) -> Status {
+        if self.loaded && self.started {
+            self.status.position = self.player.position();
+        }
+        self.status.shuffle = self.queue.shuffle();
+        self.status.repeat = self.queue.repeat();
+        self.status.clone()
     }
 
     fn queue_view(&self) -> QueueView {
@@ -613,13 +1233,19 @@ impl Engine {
         }
     }
 
-    /// The status, with the position fresh from the audio thread once the song has started
-    /// (before that, the audio thread's position is still the old song's or zero).
-    fn snapshot(&mut self) -> Status {
-        if self.loaded && self.started {
-            self.status.position = self.player.position();
-        }
-        self.status.clone()
+    fn emit_queue(&self) {
+        let QueueView {
+            items,
+            current_id,
+            shuffle,
+            repeat,
+        } = self.queue_view();
+        self.emit(EngineEvent::Queue {
+            items,
+            current_id,
+            shuffle,
+            repeat,
+        });
     }
 
     fn emit_state(&mut self) {
@@ -631,6 +1257,41 @@ impl Engine {
         // No listener is fine: nobody is connected.
         let _ = self.events.send(event);
     }
+}
+
+/// A queue item for a song known only by its id (its details come with its link, or with
+/// the list it is found in).
+fn bare_song(video_id: &str) -> SongItem {
+    SongItem {
+        video_id: video_id.into(),
+        ..SongItem::default()
+    }
+}
+
+/// What the bar shows for a queue song: its own details, with gaps filled from its link's
+/// (`resolved`). A song with no title (a bare id) shows its link's details alone.
+fn song_meta(song: &SongItem, resolved: Option<&TrackMeta>) -> Option<TrackMeta> {
+    if song.title.is_empty() {
+        return resolved.cloned();
+    }
+    let artist = if song.artists.is_empty() {
+        resolved.map(|m| m.artist.clone()).unwrap_or_default()
+    } else {
+        song.artists.join(", ")
+    };
+    Some(TrackMeta {
+        title: song.title.clone(),
+        artist,
+        length_seconds: if song.length_seconds > 0 {
+            song.length_seconds
+        } else {
+            resolved.map_or(0, |m| m.length_seconds)
+        },
+        thumbnail: song
+            .thumbnail
+            .clone()
+            .or_else(|| resolved.and_then(|m| m.thumbnail.clone())),
+    })
 }
 
 /// Waits for the position clock's next tick; never, while there is no clock.
@@ -820,7 +1481,6 @@ mod tests {
     }
 
     impl FakeSource {
-        #[allow(dead_code)] // the queue tests come next
         fn requests(&self) -> Vec<NextRequest> {
             self.requests.lock().unwrap().clone()
         }
@@ -845,7 +1505,6 @@ mod tests {
         started: Arc<Mutex<Vec<String>>>,
         stats: Arc<NullStats>,
         resolver: Arc<Fake>,
-        #[allow(dead_code)] // the queue tests come next
         source: Arc<FakeSource>,
         server: Server,
         task: JoinHandle<()>,
@@ -1015,6 +1674,117 @@ mod tests {
         fn started(&self) -> Vec<String> {
             self.started.lock().unwrap().clone()
         }
+
+        fn calls(&self) -> Vec<String> {
+            self.resolver.calls.lock().unwrap().clone()
+        }
+
+        async fn play_list(&self, playlist: &str, index: Option<usize>) {
+            self.send(EngineCmd::Play {
+                video_id: None,
+                playlist_id: Some(playlist.into()),
+                index,
+                start_seconds: 0.0,
+            })
+            .await;
+        }
+
+        /// Events up to and including the first state of `want` for song `id`.
+        async fn until_song(&mut self, id: &str, want: PlayState) -> Vec<EngineEvent> {
+            let mut seen = Vec::new();
+            loop {
+                let e = self.next().await;
+                let done = matches!(&e, EngineEvent::State(s)
+                    if s.state == want && s.video_id.as_deref() == Some(id));
+                seen.push(e);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
+        /// The next `Queue` event.
+        async fn until_queue(&mut self) -> QueueView {
+            loop {
+                if let EngineEvent::Queue {
+                    items,
+                    current_id,
+                    shuffle,
+                    repeat,
+                } = self.next().await
+                {
+                    return QueueView {
+                        items,
+                        current_id,
+                        shuffle,
+                        repeat,
+                    };
+                }
+            }
+        }
+
+        async fn queue(&self) -> QueueView {
+            let (tx, rx) = oneshot::channel();
+            self.send(EngineCmd::QueueGet(tx)).await;
+            rx.await.unwrap()
+        }
+    }
+
+    /// An 11-character id of one repeated letter.
+    fn vid(c: char) -> String {
+        c.to_string().repeat(11)
+    }
+
+    /// A queue song with every detail filled, unlike what the resolver says (`meta`).
+    fn song(c: char) -> SongItem {
+        SongItem {
+            video_id: vid(c),
+            title: format!("Title {c}"),
+            artists: vec!["One".into(), "Two".into()],
+            album: Some("Album".into()),
+            thumbnail: Some(format!("https://i.ytimg.com/{c}.jpg")),
+            length_seconds: 2,
+            playlist_id: None,
+        }
+    }
+
+    fn page(songs: &str, continuation: Option<&str>) -> NextPage {
+        NextPage {
+            items: songs.chars().map(song).collect(),
+            continuation: continuation.map(String::from),
+            playlist_id: None,
+        }
+    }
+
+    fn ok(
+        key: &str,
+        ms: u64,
+        songs: &str,
+        continuation: Option<&str>,
+    ) -> (String, u64, Result<NextPage, Error>) {
+        (key.into(), ms, Ok(page(songs, continuation)))
+    }
+
+    fn radio_of(c: char) -> String {
+        format!("RDAMVM{}", vid(c))
+    }
+
+    fn errors(events: &[EngineEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Error { code, .. } => Some(*code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn id_of(q: &QueueView, c: char) -> u64 {
+        q.items
+            .iter()
+            .find(|i| i.song.video_id == vid(c))
+            .unwrap()
+            .id
     }
 
     fn states(events: &[EngineEvent]) -> Vec<Status> {
@@ -1313,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seek_past_end_reports_length_minus_one() {
+    async fn seek_near_the_end_reports_length_minus_one() {
         let server = server().await;
         let fake = Arc::new(Fake {
             base: server.base.clone(),
@@ -1340,8 +2110,9 @@ mod tests {
             result: Ok(stream),
         });
         while rx.try_recv().is_ok() {}
-        // The decoder lands at most 1 s before the end; the report must say the same.
-        engine.handle(EngineCmd::Seek(9999.0));
+        // The decoder lands at most 1 s before the end; the report must say the same. (At or
+        // past the end, a seek is a `Next`: `seek_past_end_acts_like_next`.)
+        engine.handle(EngineCmd::Seek(317.5));
         assert_eq!(
             rx.try_recv().unwrap(),
             EngineEvent::Position {
@@ -1415,29 +2186,6 @@ mod tests {
         let e = next(&mut r).await;
         assert!(matches!(e, EngineEvent::Position { .. }), "{e:?}");
         assert_eq!(t1.elapsed(), Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn play_without_id_and_nothing_loaded_is_noop_error() {
-        let mut r = rig(Setup::default()).await;
-        r.send(EngineCmd::Play {
-            video_id: None,
-            playlist_id: None,
-            index: None,
-            start_seconds: 0.0,
-        })
-        .await;
-        assert_eq!(
-            r.next().await,
-            EngineEvent::Error {
-                code: "internal",
-                message: "nothing to play".into()
-            }
-        );
-        let s = r.status().await;
-        assert_eq!(s.state, PlayState::Stopped);
-        assert_eq!(s.video_id, None);
-        assert!(r.started().is_empty());
     }
 
     #[tokio::test]
@@ -1624,8 +2372,429 @@ mod tests {
         engine.on_audio(AudioEvent::Started);
         assert_eq!(engine.status.state, PlayState::Playing);
         assert_eq!(engine.status.video_id.as_deref(), Some("BBBBBBBBBBB"));
+        // B's radio answer ("no queue") arrives: the queue has nothing after B.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(p) = engine.pages_rx.try_recv() {
+            engine.on_page(p);
+        }
         // B's own end counts.
         engine.on_audio(AudioEvent::Ended);
         assert_eq!(engine.status.state, PlayState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn play_playlist_fills_queue_and_plays_index() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", Some(1)).await;
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        no_errors(&seen);
+        // A playlist is asked for by its id alone (with a video id, YouTube sends one song).
+        assert_eq!(
+            r.source.requests()[0],
+            NextRequest {
+                playlist_id: Some("PLlist".into()),
+                ..NextRequest::default()
+            }
+        );
+        let q = r.queue().await;
+        let ids: Vec<_> = q.items.iter().map(|i| i.song.video_id.clone()).collect();
+        assert_eq!(ids, [vid('A'), vid('B'), vid('C')]);
+        assert_eq!(q.current_id, Some(id_of(&q, 'B')));
+        let status = r.status().await;
+        assert_eq!(status.queue_id, Some(id_of(&q, 'B')));
+        assert_eq!(status.album.as_deref(), Some("Album"));
+        assert_eq!(r.started(), [vid('B')]);
+    }
+
+    #[tokio::test]
+    async fn ended_plays_next() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "AB", None)],
+            fast: true,
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        // B is the last song and the radio has nothing more: the end stops, keeping B.
+        let seen = r.until(PlayState::Stopped).await;
+        no_errors(&seen);
+        assert_eq!(r.status().await.video_id, Some(vid('B')));
+        assert_eq!(r.started(), [vid('A'), vid('B')]);
+    }
+
+    #[tokio::test]
+    async fn end_of_queue_waits_for_radio() {
+        // Review Focus 2: the last song ends while the radio request is still out.
+        let mut r = rig(Setup {
+            pages: vec![
+                ok("PLone", 0, "A", None),
+                // A radio starts with its seed song, already in the queue.
+                ok(&radio_of('A'), 600, "ABC", None),
+            ],
+            fast: true,
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLone", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        no_errors(&seen);
+        // It waited (buffering) rather than stopping, and nothing played twice.
+        assert!(
+            !states(&seen).iter().any(|s| s.state == PlayState::Stopped),
+            "{seen:?}"
+        );
+        assert_eq!(r.started(), [vid('A'), vid('B')]);
+        let radio: Vec<_> = r
+            .source
+            .requests()
+            .into_iter()
+            .filter(|q| q.playlist_id.as_deref() == Some(radio_of('A').as_str()))
+            .collect();
+        assert_eq!(radio.len(), 1, "one radio request");
+        let q = r.queue().await;
+        assert_eq!(q.items.len(), 3, "the seed isn't queued twice");
+    }
+
+    #[tokio::test]
+    async fn needs_more_fetches_radio_once() {
+        let mut r = rig(Setup {
+            pages: vec![
+                ok("PLlist", 0, "ABC", None),
+                ok(&radio_of('C'), 300, "CD", Some("CONT1")),
+            ],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        // Changes while the radio request is out ask for nothing more.
+        r.send(EngineCmd::Repeat(Repeat::Off)).await;
+        r.send(EngineCmd::Shuffle(false)).await;
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![],
+            at: AddAt::End,
+        })
+        .await;
+        let q = loop {
+            let q = r.until_queue().await;
+            if q.items.len() == 4 {
+                break q;
+            }
+        };
+        assert_eq!(q.items[3].song.video_id, vid('D'));
+        // Two after B: the queue needs more, and continues the radio it now plays from.
+        r.send(EngineCmd::Next).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        // That continuation has no queue: no more songs. A, B, C, D: nothing asked at C.
+        r.send(EngineCmd::Next).await;
+        r.until_song(&vid('C'), PlayState::Playing).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let asked = r.source.requests();
+        assert_eq!(
+            asked,
+            [
+                NextRequest {
+                    playlist_id: Some("PLlist".into()),
+                    ..NextRequest::default()
+                },
+                // The radio of the queue's last song.
+                NextRequest {
+                    video_id: Some(vid('C')),
+                    playlist_id: Some(radio_of('C')),
+                    ..NextRequest::default()
+                },
+                NextRequest {
+                    continuation: Some("CONT1".into()),
+                    ..NextRequest::default()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_song_is_skipped() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![("BBBBBBBBBBB", Error::Unavailable("not here".into()))],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", Some(1)).await;
+        let seen = r.until_song(&vid('C'), PlayState::Playing).await;
+        assert_eq!(errors(&seen), ["unavailable"]);
+        assert_eq!(r.started(), [vid('C')]);
+        assert_eq!(r.queue().await.current_id, Some(3));
+    }
+
+    #[tokio::test]
+    async fn all_unplayable_stops_after_one_pass() {
+        // Review Focus 3: with repeat on, a queue of nothing but unplayable songs must not
+        // skip round for ever.
+        let gone = || Error::Unavailable("not here".into());
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![
+                ("AAAAAAAAAAA", gone()),
+                ("BBBBBBBBBBB", gone()),
+                ("CCCCCCCCCCC", gone()),
+            ],
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Repeat(Repeat::All)).await;
+        r.play_list("PLlist", Some(1)).await;
+        // B, C, then A (repeat all wraps), the last one tried.
+        let seen = r.until_song(&vid('A'), PlayState::Stopped).await;
+        assert_eq!(errors(&seen), ["unavailable"; 3]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), [vid('B'), vid('C'), vid('A')], "each tried once");
+        assert_eq!(r.status().await.state, PlayState::Stopped);
+        assert!(r.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_link_prefetched_at_half() {
+        // The queue says each song is 1 s long (the fixture plays 2 s): half is 0.5 s, so the
+        // first tick (1 s) prefetches.
+        let short = |c| SongItem {
+            length_seconds: 1,
+            ..song(c)
+        };
+        let mut r = rig(Setup {
+            pages: vec![(
+                "PLlist".into(),
+                0,
+                Ok(NextPage {
+                    items: vec![short('A'), short('B')],
+                    ..NextPage::default()
+                }),
+            )],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        assert_eq!(r.calls(), [vid('A')], "nothing before half");
+        let calls = r.resolver.clone();
+        eventually("B's link is fetched", || {
+            calls.calls.lock().unwrap().contains(&vid('B'))
+        })
+        .await;
+        // Only its link: B isn't loaded while A plays.
+        assert_eq!(r.started(), [vid('A')]);
+        assert_eq!(r.status().await.video_id, Some(vid('A')));
+    }
+
+    #[tokio::test]
+    async fn seek_past_end_acts_like_next() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "AB", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        r.send(EngineCmd::Seek(5.0)).await;
+        let seen = r.until_song(&vid('B'), PlayState::Playing).await;
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Position { seeked: true, .. })),
+            "no seek is reported: {seen:?}"
+        );
+        assert_eq!(r.started(), [vid('A'), vid('B')]);
+    }
+
+    #[tokio::test]
+    async fn meta_comes_from_queue_item_not_oembed() {
+        // The queue item has no length: that one gap is filled from the resolver.
+        let mut r = rig(Setup {
+            pages: vec![(
+                "PLlist".into(),
+                0,
+                Ok(NextPage {
+                    items: vec![SongItem {
+                        length_seconds: 0,
+                        ..song('A')
+                    }],
+                    ..NextPage::default()
+                }),
+            )],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let seen = r.until_song(&vid('A'), PlayState::Playing).await;
+        let from_queue = TrackMeta {
+            title: "Title A".into(),
+            artist: "One, Two".into(),
+            length_seconds: 0,
+            thumbnail: Some("https://i.ytimg.com/A.jpg".into()),
+        };
+        // Known at once, before the link is resolved.
+        let first = states(&seen)
+            .into_iter()
+            .find(|s| s.video_id == Some(vid('A')))
+            .unwrap();
+        assert_eq!(first.meta, Some(from_queue.clone()));
+        let status = r.status().await;
+        assert_eq!(
+            status.meta,
+            Some(TrackMeta {
+                length_seconds: 2,
+                ..from_queue
+            })
+        );
+        assert_eq!(status.album.as_deref(), Some("Album"));
+
+        // A raw song id with no queue details: the resolver's details.
+        r.play("XXXXXXXXXXX").await;
+        r.until_song("XXXXXXXXXXX", PlayState::Playing).await;
+        assert_eq!(r.status().await.meta, Some(meta("XXXXXXXXXXX")));
+    }
+
+    #[tokio::test]
+    async fn play_without_anything_starts_liked_songs() {
+        let mut r = rig(Setup {
+            pages: vec![ok("LM", 0, "AB", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Play {
+            video_id: None,
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        })
+        .await;
+        let seen = r.until_song(&vid('A'), PlayState::Playing).await;
+        no_errors(&seen);
+        assert_eq!(
+            r.source.requests()[0],
+            NextRequest {
+                playlist_id: Some("LM".into()),
+                ..NextRequest::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_event_on_every_change() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let q = loop {
+            let q = r.until_queue().await;
+            if q.items.len() == 3 {
+                break q;
+            }
+        };
+        assert_eq!(q.current_id, Some(id_of(&q, 'A')));
+        r.until_song(&vid('A'), PlayState::Playing).await;
+
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('D')],
+            at: AddAt::End,
+        })
+        .await;
+        let q = r.until_queue().await;
+        assert_eq!(q.items.len(), 4);
+        let d = id_of(&q, 'D');
+        r.send(EngineCmd::QueueMove { id: d, index: 1 }).await;
+        assert_eq!(r.until_queue().await.items[1].id, d);
+        r.send(EngineCmd::QueueRemove(d)).await;
+        assert_eq!(r.until_queue().await.items.len(), 3);
+        r.send(EngineCmd::Shuffle(true)).await;
+        assert!(r.until_queue().await.shuffle);
+        r.send(EngineCmd::Repeat(Repeat::All)).await;
+        assert_eq!(r.until_queue().await.repeat, Repeat::All);
+        let c = id_of(&q, 'C');
+        r.send(EngineCmd::QueueJump(c)).await;
+        assert_eq!(r.until_queue().await.current_id, Some(c));
+        r.send(EngineCmd::Next).await;
+        assert_ne!(r.until_queue().await.current_id, Some(c));
+        r.send(EngineCmd::Previous).await;
+        assert_eq!(r.until_queue().await.current_id, Some(c));
+        let status = r.status().await;
+        assert!(status.shuffle);
+        assert_eq!(status.repeat, Repeat::All);
+    }
+
+    #[tokio::test]
+    async fn seek_sets_seeked_flag() {
+        let mut r = rig(Setup::default()).await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Playing).await;
+        // A tick is not a seek.
+        loop {
+            if let EngineEvent::Position { seeked, .. } = r.next().await {
+                assert!(!seeked);
+                break;
+            }
+        }
+        r.send(EngineCmd::Seek(0.5)).await;
+        loop {
+            if let EngineEvent::Position { seconds, seeked } = r.next().await {
+                assert_eq!(seconds, 0.5);
+                assert!(seeked);
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn position_kept_after_mid_song_error() {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let Built { mut engine, .. } =
+            engine_for(&server, fake.clone(), Arc::default(), false, false);
+        engine.handle(EngineCmd::Play {
+            video_id: Some("AAAAAAAAAAA".into()),
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        });
+        engine.on_resolved(Resolved {
+            generation: engine.generation,
+            result: Ok(fake.stream("AAAAAAAAAAA")),
+        });
+        engine.on_audio(AudioEvent::Loading);
+        engine.on_audio(AudioEvent::Started);
+        // The song plays in real time for a while, then the download fails for good.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        engine.on_audio(AudioEvent::Error(Error::StreamFailed("x".into())));
+        let at = engine.snapshot().position;
+        assert_eq!(engine.status.state, PlayState::Stopped);
+        assert!(at > 0.3, "the position is kept: {at}");
+        // A play goes on from there, not from the start.
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        });
+        assert_eq!(engine.status.state, PlayState::Buffering);
+        assert_eq!(engine.status.video_id.as_deref(), Some("AAAAAAAAAAA"));
+        assert!(
+            (engine.status.position - at).abs() < 1e-9,
+            "{}",
+            engine.status.position
+        );
+        assert!((engine.start_seconds - at).abs() < 1e-9);
     }
 }
