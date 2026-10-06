@@ -1,11 +1,17 @@
-//! Imports the session from a Chromium (Electron) profile: the `pear-desktop` app's.
+//! Imports the session from a Chromium profile: the `pear-desktop` app's (Electron), or the
+//! Brave Origin browser's.
 //!
 //! Chromium keeps cookies in an SQLite database. Each value is either plain text in `value`
 //! (with `encrypted_value` empty) or encrypted in `encrypted_value`:
 //! - `v10`: AES-128-CBC with a key every Linux Chromium shares when no keyring is in use
 //!   (PBKDF2-HMAC-SHA1 of "peanuts", salt "saltysalt", 1 round, 16 bytes; IV of 16 spaces).
-//!   From database version 24 the plaintext starts with SHA-256(host_key), which is dropped.
-//! - `v11`: the key lives in the user's keyring. Not supported yet: a clear error.
+//! - `v11`: the same, with the browser's "Safe Storage" password from the user's keyring in
+//!   place of "peanuts" (`KeySource`). Read for Brave Origin only; the `pear-desktop` import
+//!   still refuses it with a clear error.
+//!
+//! From database version 24 the plaintext starts with SHA-256(host_key). It is checked and
+//! dropped: Chromium checks it too, and it is what proves a keyring key right (a wrong key
+//! gives valid padding 1 time in 256).
 
 use std::fs;
 use std::io::Cursor;
@@ -14,9 +20,31 @@ use std::path::Path;
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use super::{Cookie, Session};
 use crate::error::Error;
+
+/// Where the `v11` key comes from: the browser's "Safe Storage" password in the user's
+/// keyring. A trait so the tests hand in a fake and never reach the user's keyring.
+pub trait KeySource {
+    /// Every password that may be the key, best first (the keyring can hold more than one
+    /// matching item). Asked at most once per import, and only when a kept cookie is `v11`,
+    /// so a profile that needs no key never shows an unlock prompt. Empty when the keyring
+    /// holds none; an `Err` is the keyring's own failure, passed on as it is.
+    ///
+    /// `oo7::Secret`, not bytes: it wipes its memory when dropped.
+    fn passwords(&self) -> Result<Vec<oo7::Secret>, Error>;
+}
+
+/// The fixed texts of the Brave Origin import. The bar widget shows them as they are, so
+/// they say what to do; none carries a path, a cookie or a key.
+pub const NO_BRAVE_PROFILE: &str =
+    "no Brave Origin profile; open Brave Origin once, or pass --profile <folder>";
+pub const NO_BRAVE_KEY: &str =
+    "Brave Origin's cookie key (\"Brave Safe Storage\") is not in the keyring";
+pub const BRAVE_KEY_WRONG: &str =
+    "the keyring's \"Brave Safe Storage\" key does not open Brave Origin's cookies";
 
 /// The only cookie hosts kept: the YouTube and Google sign-in cookies the API needs.
 /// Everything else in the profile (other Google country domains, any other site) stays out
@@ -47,6 +75,19 @@ pub fn import(profile: &Path) -> Result<Session, Error> {
     import_with(profile, Path::new("/proc"))
 }
 
+/// Reads the YouTube and Google cookies out of the Brave Origin profile folder `profile`
+/// (`Default`), with `keys` for the `v11` ones.
+///
+/// Brave Origin may be running: it holds the database open, so it is copied first (see
+/// `open_copy`), as for `pear-desktop`. Unlike `pear-desktop` that is no reason to refuse:
+/// the user browses with it, and Chromium writes its cookie changes in short transactions
+/// (batched, about every 30 seconds), so a copy is whole; the sign-in cookies the import
+/// needs change rarely, so it is not stale either.
+pub fn import_brave_origin(profile: &Path, keys: &dyn KeySource) -> Result<Session, Error> {
+    let db_path = find_database(profile).ok_or_else(|| Error::Internal(NO_BRAVE_PROFILE.into()))?;
+    read_session(&db_path, Keys::new(Some(keys)))
+}
+
 /// `import` with the `/proc` root injectable, so tests don't depend on what runs on the box.
 fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
     if pear_desktop_running(proc_root, profile) {
@@ -54,16 +95,23 @@ fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
             "pear-desktop is running; quit it, then import again".into(),
         ));
     }
-    let db_path = DB_CANDIDATES
+    let db_path = find_database(profile).ok_or_else(|| {
+        Error::Internal("no Cookies database in the profile folder; pass --profile <folder>".into())
+    })?;
+    read_session(&db_path, Keys::new(None))
+}
+
+/// The profile's cookie database, wherever this Chromium keeps it.
+fn find_database(profile: &Path) -> Option<std::path::PathBuf> {
+    DB_CANDIDATES
         .iter()
         .map(|c| profile.join(c))
         .find(|p| p.is_file())
-        .ok_or_else(|| {
-            Error::Internal(
-                "no Cookies database in the profile folder; pass --profile <folder>".into(),
-            )
-        })?;
-    let db = open_copy(&db_path)?;
+}
+
+/// The kept cookies of the database at `db_path`.
+fn read_session(db_path: &Path, mut keys: Keys) -> Result<Session, Error> {
+    let db = open_copy(db_path)?;
     let version = meta_version(&db)?;
 
     let mut stmt = db
@@ -73,7 +121,6 @@ fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
         )
         .map_err(unreadable)?;
     let mut rows = stmt.query([]).map_err(unreadable)?;
-    let mut key = None;
     let mut cookies = Vec::new();
     while let Some(row) = rows.next().map_err(unreadable)? {
         let host: String = row.get(0).map_err(unreadable)?;
@@ -85,8 +132,7 @@ fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
         let value = if encrypted.is_empty() {
             row.get(2).map_err(unreadable)?
         } else {
-            let key = key.get_or_insert_with(v10_key);
-            decrypt(&encrypted, key, version)?
+            keys.decrypt(&encrypted, &host, version)?
         };
         let expires: i64 = row.get(5).map_err(unreadable)?;
         cookies.push(Cookie {
@@ -154,38 +200,114 @@ fn meta_version(db: &Connection) -> Result<i64, Error> {
 
 /// The fixed `v10` key (see the module docs).
 fn v10_key() -> [u8; 16] {
+    derive_key(b"peanuts")
+}
+
+/// A key from a password: PBKDF2-HMAC-SHA1, salt "saltysalt", 1 round, 16 bytes (Chromium's
+/// `os_crypt` on Linux, for both `v10` and `v11`).
+fn derive_key(password: &[u8]) -> [u8; 16] {
     let mut key = [0u8; 16];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"peanuts", b"saltysalt", 1, &mut key);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, b"saltysalt", 1, &mut key);
     key
 }
 
-fn decrypt(encrypted: &[u8], key: &[u8; 16], meta_version: i64) -> Result<String, Error> {
-    let ciphertext = match encrypted.split_at_checked(3) {
-        Some((b"v10", rest)) => rest,
-        Some((b"v11", _)) => {
+/// The keys this import may need, each found the first time a cookie needs it.
+struct Keys<'a> {
+    v10: Option<[u8; 16]>,
+    /// `None` for an import that doesn't read `v11` (`pear-desktop`).
+    source: Option<&'a dyn KeySource>,
+    /// The keys from `source`'s passwords once asked; the last one that worked comes first.
+    v11: Option<Vec<[u8; 16]>>,
+}
+
+impl<'a> Keys<'a> {
+    fn new(source: Option<&'a dyn KeySource>) -> Self {
+        Keys {
+            v10: None,
+            source,
+            v11: None,
+        }
+    }
+
+    /// The value of one encrypted cookie of `host`.
+    fn decrypt(
+        &mut self,
+        encrypted: &[u8],
+        host: &str,
+        meta_version: i64,
+    ) -> Result<String, Error> {
+        match encrypted.split_at_checked(3) {
+            Some((b"v10", rest)) => {
+                let key = self.v10.get_or_insert_with(v10_key);
+                let plain = open(rest, key, host, meta_version)
+                    .ok_or_else(|| Error::Internal("could not decrypt a v10 cookie".into()))?;
+                String::from_utf8(plain)
+                    .map_err(|_| Error::Internal("a decrypted cookie is not text".into()))
+            }
+            Some((b"v11", rest)) => self.decrypt_v11(rest, host, meta_version),
+            _ => Err(Error::Internal(
+                "a cookie uses an unknown encryption format".into(),
+            )),
+        }
+    }
+
+    fn decrypt_v11(
+        &mut self,
+        ciphertext: &[u8],
+        host: &str,
+        meta_version: i64,
+    ) -> Result<String, Error> {
+        let Some(source) = self.source else {
             return Err(Error::Internal(
                 "the cookies are encrypted with a keyring key (v11), which ytmfast can't read yet"
                     .into(),
             ));
+        };
+        let keys = match &mut self.v11 {
+            Some(keys) => keys,
+            None => {
+                let keys = source
+                    .passwords()?
+                    .iter()
+                    .map(|p| derive_key(p.as_bytes()))
+                    .collect();
+                self.v11.insert(keys)
+            }
+        };
+        if keys.is_empty() {
+            return Err(Error::Internal(NO_BRAVE_KEY.into()));
         }
-        _ => {
-            return Err(Error::Internal(
-                "a cookie uses an unknown encryption format".into(),
-            ));
+        // Each key in turn (two keyring items can match). The one that works moves to the
+        // front, so the other cookies try it first.
+        for i in 0..keys.len() {
+            if let Some(value) = open(ciphertext, &keys[i], host, meta_version)
+                .and_then(|p| String::from_utf8(p).ok())
+            {
+                keys.swap(0, i);
+                return Ok(value);
+            }
         }
-    };
+        Err(Error::Internal(BRAVE_KEY_WRONG.into()))
+    }
+}
+
+/// Decrypts one value (without its version tag) with `key`, checking and dropping the host
+/// hash of databases from version 24. `None` for a wrong key, a damaged value, or a value
+/// that belongs to another host.
+fn open(ciphertext: &[u8], key: &[u8; 16], host: &str, meta_version: i64) -> Option<Vec<u8>> {
     let mut plain = cbc::Decryptor::<aes::Aes128>::new(key.into(), &[b' '; 16].into())
         .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
-        .map_err(|_| Error::Internal("could not decrypt a v10 cookie".into()))?;
+        .ok()?;
     if meta_version >= 24 {
         // The SHA-256 of the host the cookie belongs to, which Chromium prepends so a value
-        // can't be moved to another host's row.
-        if plain.len() < 32 {
-            return Err(Error::Internal("could not decrypt a v10 cookie".into()));
+        // can't be moved to another host's row. Checked, as Chromium does: it is also what
+        // tells a wrong keyring key from the right one.
+        if plain.get(..32)? != Sha256::digest(host.as_bytes()).as_slice() {
+            return None;
         }
         plain.drain(..32);
     }
-    String::from_utf8(plain).map_err(|_| Error::Internal("a decrypted cookie is not text".into()))
+    Some(plain)
 }
 
 /// True when a process under `proc_root` looks like the `pear-desktop` main process.
@@ -228,7 +350,6 @@ mod tests {
     use super::*;
     use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
     use rusqlite::{Connection, params};
-    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
     /// Chromium time for a Unix time: microseconds since 1601-01-01.
@@ -313,6 +434,209 @@ mod tests {
         let mut out = b"v10".to_vec();
         out.extend_from_slice(&ct);
         out
+    }
+
+    /// Chromium's `v11` encryption with the keyring password `password` (the same AES and
+    /// PBKDF2 as v10, with the password in place of "peanuts").
+    fn v11_encrypt(password: &[u8], host: &str, value: &str, version: i64) -> Vec<u8> {
+        let mut key = [0u8; 16];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, b"saltysalt", 1, &mut key);
+        let mut plaintext = Vec::new();
+        if version >= 24 {
+            plaintext.extend_from_slice(&Sha256::digest(host.as_bytes()));
+        }
+        plaintext.extend_from_slice(value.as_bytes());
+        let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
+            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        let mut out = b"v11".to_vec();
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// A fake keyring: hands out fixed passwords (or an error) and counts the asks.
+    struct FakeKeys {
+        answer: Result<Vec<&'static [u8]>, Error>,
+        asked: std::cell::Cell<u32>,
+    }
+
+    impl FakeKeys {
+        fn new(passwords: &[&'static [u8]]) -> Self {
+            FakeKeys {
+                answer: Ok(passwords.to_vec()),
+                asked: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl KeySource for FakeKeys {
+        fn passwords(&self) -> Result<Vec<oo7::Secret>, Error> {
+            self.asked.set(self.asked.get() + 1);
+            self.answer
+                .clone()
+                .map(|list| list.into_iter().map(oo7::Secret::from).collect())
+        }
+    }
+
+    const PASSWORD: &[u8] = b"fake-safe-storage-password";
+
+    fn v11_row<'a>(host: &'a str, name: &'a str, value: &str, version: i64) -> Row<'a> {
+        let mut r = plain(host, name, "");
+        r.encrypted = v11_encrypt(PASSWORD, host, value, version);
+        r
+    }
+
+    #[test]
+    fn brave_v11_cookies_open_with_the_keyring_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for version in [23, 24] {
+            let d = dir.path().join(version.to_string());
+            let mut v10 = plain(".google.com", "NID", "");
+            v10.encrypted = v10_encrypt(".google.com", "v10-value", version);
+            let p = profile(
+                &d,
+                version,
+                &[
+                    v11_row(".youtube.com", "SAPISID", "v11-value", version),
+                    v10,
+                    plain("accounts.google.com", "LSID", "plain-value"),
+                    // Dropped hosts are never decrypted, whatever their key.
+                    v11_row(".google.ca", "SID", "x", version),
+                ],
+            );
+            let keys = FakeKeys::new(&[PASSWORD]);
+            let s = import_brave_origin(&p, &keys).unwrap();
+            let got: Vec<(&str, &str)> = s
+                .cookies
+                .iter()
+                .map(|c| (c.name.as_str(), c.value.as_str()))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("SAPISID", "v11-value"),
+                    ("NID", "v10-value"),
+                    ("LSID", "plain-value")
+                ],
+                "meta version {version}"
+            );
+            assert_eq!(keys.asked.get(), 1, "the keyring is asked once");
+        }
+    }
+
+    #[test]
+    fn brave_keyring_is_not_asked_without_v11_cookies() {
+        // No unlock prompt for a profile that doesn't need the key.
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(dir.path(), 24, &[plain(".youtube.com", "SAPISID", "abc")]);
+        let keys = FakeKeys::new(&[]);
+        assert_eq!(import_brave_origin(&p, &keys).unwrap().cookies.len(), 1);
+        assert_eq!(keys.asked.get(), 0);
+    }
+
+    #[test]
+    fn brave_tries_each_matching_key() {
+        // Two keyring items can match: the one that opens the cookies is used.
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(
+            dir.path(),
+            24,
+            &[
+                v11_row(".youtube.com", "SAPISID", "one", 24),
+                v11_row(".youtube.com", "SID", "two", 24),
+            ],
+        );
+        let keys = FakeKeys::new(&[b"wrong-password", PASSWORD]);
+        let s = import_brave_origin(&p, &keys).unwrap();
+        let values: Vec<&str> = s.cookies.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, ["one", "two"]);
+    }
+
+    #[test]
+    fn brave_wrong_or_missing_key_is_a_clear_error_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(
+            dir.path(),
+            24,
+            &[v11_row(
+                ".youtube.com",
+                "SAPISID",
+                "secret-cookie-value",
+                24,
+            )],
+        );
+        let err = import_brave_origin(&p, &FakeKeys::new(&[b"wrong-password"])).unwrap_err();
+        assert_eq!(err, Error::Internal(BRAVE_KEY_WRONG.into()));
+        assert!(!format!("{err} {err:?}").contains("secret-cookie-value"));
+        let err = import_brave_origin(&p, &FakeKeys::new(&[])).unwrap_err();
+        assert_eq!(err, Error::Internal(NO_BRAVE_KEY.into()));
+        // The keyring's own failure (locked, a dismissed prompt, no Secret Service) is passed
+        // on as it is.
+        let locked = FakeKeys {
+            answer: Err(Error::Internal("keyring locked or unavailable".into())),
+            asked: std::cell::Cell::new(0),
+        };
+        assert_eq!(
+            import_brave_origin(&p, &locked).unwrap_err(),
+            Error::Internal("keyring locked or unavailable".into())
+        );
+    }
+
+    #[test]
+    fn a_cookie_moved_to_another_host_is_refused() {
+        // From version 24 the value starts with the SHA-256 of its own host. A wrong key that
+        // happens to give valid padding (1 in 256) fails this too, which is what tells two
+        // keyring keys apart.
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = plain(".youtube.com", "SAPISID", "");
+        r.encrypted = v11_encrypt(PASSWORD, ".google.com", "moved", 24);
+        let mut v10 = plain(".youtube.com", "SID", "");
+        v10.encrypted = v10_encrypt(".google.com", "moved", 24);
+        let p = profile(dir.path(), 24, &[r]);
+        assert_eq!(
+            import_brave_origin(&p, &FakeKeys::new(&[PASSWORD])).unwrap_err(),
+            Error::Internal(BRAVE_KEY_WRONG.into())
+        );
+        let d = dir.path().join("v10");
+        let p = profile(&d, 24, &[v10]);
+        assert!(matches!(
+            import_brave_origin(&p, &FakeKeys::new(&[])),
+            Err(Error::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn brave_reads_the_database_at_the_profile_root() {
+        // Brave Origin keeps it at `Default/Cookies`, not under `Network/`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(
+            dir.path(),
+            24,
+            &[v11_row(".youtube.com", "SAPISID", "v", 24)],
+        );
+        std::fs::rename(p.join("Network/Cookies"), p.join("Cookies")).unwrap();
+        let s = import_brave_origin(&p, &FakeKeys::new(&[PASSWORD])).unwrap();
+        assert_eq!(s.cookies[0].value, "v");
+    }
+
+    #[test]
+    fn brave_without_a_profile_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for p in [dir.path().to_path_buf(), dir.path().join("missing")] {
+            assert_eq!(
+                import_brave_origin(&p, &FakeKeys::new(&[])),
+                Err(Error::Internal(NO_BRAVE_PROFILE.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn brave_with_no_youtube_cookies_is_signed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(dir.path(), 24, &[plain(".google.ca", "D", "4")]);
+        assert_eq!(
+            import_brave_origin(&p, &FakeKeys::new(&[])),
+            Err(Error::SignedOut)
+        );
     }
 
     #[test]

@@ -39,15 +39,28 @@ Delete it, with the engine stopped, to start fresh.
 
 ## Sign in
 
-ytmfast reuses the sign-in of the YouTube Music desktop app. Close that app, then run:
+ytmfast reuses a sign-in the user already has: the Brave Origin browser's, or the YouTube Music desktop app's.
+
+From Brave Origin (sign in to music.youtube.com there first; Brave Origin can stay open):
+
+```sh
+ytmfast import-session --browser brave-origin
+```
+
+It reads the first profile (`~/.config/BraveSoftware/Brave-Origin/Default`; `--profile <folder>` picks another) and
+opens its cookies with the key Brave keeps in the login keyring, the item labelled "Brave Safe Storage" (an unlock
+prompt may show). Brave writes new cookies to disk about every 30 seconds, so right after signing in, wait half a minute
+if the import says Brave Origin isn't signed in.
+
+From the desktop app (close it first):
 
 ```sh
 ytmfast import-session
 ```
 
-It copies the session into the login keyring (never into a plain file) and prints how many cookies it took. It
-refuses a profile that isn't signed in. If the engine is running, it is stopped, so the next play starts it with the
-new session.
+Either way, it copies only the YouTube and Google sign-in cookies into the login keyring (never into a plain file)
+and prints how many it took, never a value. It refuses a profile that isn't signed in. If the engine is running, it
+is stopped, so the next play starts it with the new session.
 
 ## Build
 

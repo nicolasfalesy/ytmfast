@@ -110,3 +110,113 @@ fn a_signed_in_profile_goes_on_to_the_keyring() {
     assert!(stderr.contains("keyring locked or unavailable"), "{stderr}");
     assert!(!stderr.contains("fake-value"));
 }
+
+// ---- --browser brave-origin ---------------------------------------------------------------
+
+/// `import-session --browser brave-origin [args]` with the same throwaway folders and dead bus.
+fn import_brave(root: &Path, args: &[&Path]) -> Output {
+    let run = root.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ytmfast"));
+    cmd.args(["import-session", "--browser", "brave-origin"]);
+    for p in args {
+        cmd.arg("--profile").arg(p);
+    }
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .env("XDG_RUNTIME_DIR", &run)
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-bus", root.display()),
+        )
+        .output()
+        .unwrap()
+}
+
+/// A Brave Origin profile as Brave Origin lays it out: `Default/Cookies`, no `Network/`. One
+/// SAPISID encrypted with a keyring key (`v11`), so the import must ask the keyring.
+fn brave_profile(dir: &Path) {
+    profile(dir, &[(".youtube.com", "SID")]);
+    std::fs::rename(dir.join("Network/Cookies"), dir.join("Cookies")).unwrap();
+    let db = Connection::open(dir.join("Cookies")).unwrap();
+    db.execute(
+        "INSERT INTO cookies VALUES (0, '.youtube.com', '', 'SAPISID', '', ?1, '/', ?2, 1, 1)",
+        params![b"v11-not-really-encrypted".to_vec(), EXPIRES],
+    )
+    .unwrap();
+}
+
+#[test]
+fn brave_origin_without_a_profile_says_so() {
+    let root = tempfile::tempdir().unwrap();
+    let out = import_brave(root.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "ytmfast: internal error: no Brave Origin profile; open Brave Origin once, or pass --profile <folder>\n"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn brave_origin_signed_out_is_refused_before_the_keyring() {
+    let root = tempfile::tempdir().unwrap();
+    // The default place: ~/.config/BraveSoftware/Brave-Origin/Default.
+    let p = root
+        .path()
+        .join(".config/BraveSoftware/Brave-Origin/Default");
+    profile(&p, &[(".youtube.com", "VISITOR_INFO1_LIVE")]);
+    let out = import_brave(root.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "ytmfast: Brave Origin isn't signed in to YouTube Music\n"
+    );
+    // Nothing YouTube at all is the same answer.
+    let other = root.path().join("other");
+    profile(&other, &[(".example.com", "SAPISID")]);
+    let out = import_brave(root.path(), &[&other]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "ytmfast: Brave Origin isn't signed in to YouTube Music\n"
+    );
+}
+
+#[test]
+fn brave_origin_v11_cookies_need_the_keyring() {
+    // No Secret Service here, so the key can't be read: the keyring's own fixed message, and
+    // no cookie value anywhere in the output.
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path().join("brave");
+    brave_profile(&p);
+    let out = import_brave(root.path(), &[&p]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "ytmfast: internal error: keyring locked or unavailable\n"
+    );
+    assert!(!stderr.contains("fake-value") && !stderr.contains("v11-not"));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn brave_origin_plain_sign_in_goes_on_to_the_keyring() {
+    // A profile Brave wrote without a keyring (plain values): no key needed, so it reaches
+    // the save, which fails here for want of a keyring. `pear-desktop` running doesn't matter.
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path().join("brave");
+    profile(&p, &[(".youtube.com", "SAPISID"), (".youtube.com", "SID")]);
+    let out = import_brave(root.path(), &[&p]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("keyring locked or unavailable"), "{stderr}");
+    assert!(!stderr.contains("pear-desktop"), "{stderr}");
+    assert!(!stderr.contains("fake-value"));
+}
