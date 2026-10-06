@@ -369,6 +369,19 @@ impl Queue {
 
     fn insert(&mut self, songs: Vec<SongItem>, at: AddAt) {
         let items = self.new_items(songs);
+        self.insert_items(items, at);
+    }
+
+    /// The id the next new item gets: the items an `add` makes get the ids from here up to
+    /// the new `next_id()`.
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// `add` for items this queue already gave ids (taken out of it, and put back): they keep
+    /// their ids, so a widget's or the status's queue id for them stays valid. No cap check:
+    /// the engine only puts back what was in the queue a moment ago.
+    pub fn insert_items(&mut self, items: Vec<QueueItem>, at: AddAt) {
         let ids = items.iter().map(|i| i.id);
         match at {
             AddAt::End => match &mut self.original {

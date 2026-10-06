@@ -35,6 +35,7 @@
 //! `Advanced` for a gapless handover) gets its own report, told about the position ticks,
 //! pauses, resumes and seeks, and ended wherever the song stops being the one playing.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -297,6 +298,22 @@ struct PendingLoad {
     /// The play named a playlist, so failing to fetch it is news for the user. A lone song's
     /// radio is a background extra: it failing just leaves the song alone in the queue.
     report_errors: bool,
+    /// Songs the user added while the list was on its way, by queue id, and where. The list
+    /// replaces the queue when it lands; these are put back (`Engine::keep_added`), so they
+    /// aren't lost and the one playing keeps its queue id.
+    added: HashMap<u64, AddAt>,
+}
+
+/// The songs added while a play's list was on its way that are still in the queue, in play
+/// order, sorted by where they go once it lands.
+#[derive(Default)]
+struct Kept {
+    /// Up to and including the current item, when that is one of them: heard, or playing.
+    played: Vec<QueueItem>,
+    /// Still to come, added with `next` (right after the current song).
+    next: Vec<QueueItem>,
+    /// Still to come, added with `end`.
+    end: Vec<QueueItem>,
 }
 
 pub struct Engine {
@@ -725,6 +742,7 @@ impl Engine {
             index,
             start,
             report_errors: playlist_id.is_some(),
+            added: HashMap::new(),
         });
         self.loading = Some(self.request(request, false));
     }
@@ -858,6 +876,10 @@ impl Engine {
             }
         };
         self.continuation = page.continuation;
+        let kept = self.kept(&plan.added);
+        // The user is already on a song they added (skipped or jumped to it) while the list
+        // was coming: it stays current, with its queue id, and the list fits around it.
+        let playing_kept = kept.played.last().map(|i| i.id);
         match plan.seed {
             None => {
                 match plan.index {
@@ -865,11 +887,37 @@ impl Engine {
                     // Shuffled, a random song starts (`Queue::replace_unpicked`).
                     None => self.queue.replace_unpicked(page.items),
                 };
+                let start_id = self.queue.current().map(|i| i.id);
+                if let (Some(now), Some(start)) = (playing_kept, start_id) {
+                    // What the user heard goes before the list's start song, which comes
+                    // next: it was never heard. (While shuffled this moves it in the play
+                    // order only, like any move.)
+                    self.queue.insert_items(kept.played, AddAt::Next);
+                    self.queue.jump(now);
+                    // `move_to` takes the index after the start song is taken out: it sits
+                    // before the current song (the played ones went in right after it), so
+                    // the current song's index is the place right after it.
+                    let c = self.queue.current_index().unwrap_or(0);
+                    let s = self.queue.items().iter().position(|i| i.id == start);
+                    let to = if s.is_some_and(|s| s < c) { c } else { c + 1 };
+                    self.queue.move_to(start, to);
+                }
+                self.queue.insert_items(kept.next, AddAt::Next);
+                self.queue.insert_items(kept.end, AddAt::End);
                 self.emit_queue();
-                let paused = self.status.state == PlayState::Paused;
-                self.start_current(plan.start);
-                if paused {
-                    self.pause();
+                if playing_kept.is_some() {
+                    self.emit_state();
+                    if self.waiting {
+                        // The added song already ended or failed while the list was coming.
+                        self.waiting = false;
+                        return self.advance(false, true);
+                    }
+                } else {
+                    let paused = self.status.state == PlayState::Paused;
+                    self.start_current(plan.start);
+                    if paused {
+                        self.pause();
+                    }
                 }
             }
             Some(seed) => {
@@ -885,7 +933,17 @@ impl Engine {
                     0
                 });
                 self.queue.replace(songs, at);
-                if let Some(item) = self.queue.current() {
+                if let Some(now) = playing_kept {
+                    // The seed was heard, then what the user added: they follow it.
+                    self.queue.insert_items(kept.played, AddAt::Next);
+                    self.queue.jump(now);
+                }
+                self.queue.insert_items(kept.next, AddAt::Next);
+                self.queue.insert_items(kept.end, AddAt::End);
+                // With an added song current, the status already shows it (its id is kept).
+                if playing_kept.is_none()
+                    && let Some(item) = self.queue.current()
+                {
                     self.status.queue_id = Some(item.id);
                     self.status.album = item.song.album.clone();
                 }
@@ -900,6 +958,33 @@ impl Engine {
             }
         }
         self.maybe_refill();
+    }
+
+    /// The songs in `added` still in the queue, sorted for putting back once the list lands:
+    /// as if they were added after it. When the current item is one of them, it and the ones
+    /// before it are `played`; the rest go by how they were added.
+    fn kept(&self, added: &HashMap<u64, AddAt>) -> Kept {
+        let mut kept = Kept::default();
+        if added.is_empty() {
+            return kept;
+        }
+        let current = self
+            .queue
+            .current()
+            .filter(|i| added.contains_key(&i.id))
+            .and(self.queue.current_index());
+        for (p, item) in self.queue.items().iter().enumerate() {
+            let Some(at) = added.get(&item.id) else {
+                continue;
+            };
+            let to = match (current, at) {
+                (Some(c), _) if p <= c => &mut kept.played,
+                (_, AddAt::Next) => &mut kept.next,
+                (_, AddAt::End) => &mut kept.end,
+            };
+            to.push(item.clone());
+        }
+        kept
     }
 
     /// More radio songs for the end of the queue arrived (or failed).
@@ -1047,8 +1132,15 @@ impl Engine {
 
     /// False when the queue is full (nothing changed).
     fn queue_add(&mut self, songs: Vec<SongItem>, at: AddAt) -> bool {
+        let first = self.queue.next_id();
         if !self.queue.add(songs, at) {
             return false;
+        }
+        // A play's list still on its way replaces the queue when it lands: these are put
+        // back then.
+        if let Some(plan) = &mut self.pending {
+            plan.added
+                .extend((first..self.queue.next_id()).map(|id| (id, at)));
         }
         self.emit_queue();
         if self.waiting {
@@ -3885,6 +3977,146 @@ mod tests {
             r.source.requests()
         );
         assert_eq!(r.queue().await.items.len(), 1);
+    }
+
+    /// An engine (not run) whose queue requests never answer by themselves: the tests hand it
+    /// the list with `on_load`, when they choose.
+    async fn idle_engine() -> (Built, Server) {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let built = engine_for(&server, fake, Arc::default(), true, false);
+        (built, server)
+    }
+
+    fn add(engine: &mut Engine, songs: &str, at: AddAt) {
+        engine.handle(EngineCmd::QueueAdd {
+            songs: songs.chars().map(song).collect(),
+            at,
+            added: oneshot::channel().0,
+        });
+    }
+
+    fn queue_ids(engine: &Engine) -> Vec<(String, u64)> {
+        engine
+            .queue
+            .items()
+            .iter()
+            .map(|i| (i.song.video_id.clone(), i.id))
+            .collect()
+    }
+
+    fn order(engine: &Engine) -> Vec<String> {
+        engine
+            .queue
+            .items()
+            .iter()
+            .map(|i| i.song.video_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_song_added_and_playing_before_the_radio_lands_stays_current() {
+        // The review's repro: A alone, its radio slow; A ends; the user adds B, which plays;
+        // then the radio lands. B must stay current under the same queue id, and no song is
+        // lost.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: Some(vid('A')),
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        });
+        // A ends while its radio is still on the way: the engine waits.
+        engine.advance(true, true);
+        assert!(engine.waiting);
+        add(engine, "B", AddAt::End);
+        assert_eq!(engine.status.video_id, Some(vid('B')));
+        let b = engine.queue.current().unwrap().id;
+        assert_eq!(engine.status.queue_id, Some(b));
+
+        engine.on_load(Ok(page("ACD", None)));
+        // A (heard), B (playing), then the radio's songs to come.
+        assert_eq!(order(engine), [vid('A'), vid('B'), vid('C'), vid('D')]);
+        assert_eq!(engine.queue.current().map(|i| i.id), Some(b));
+        assert_eq!(engine.status.queue_id, Some(b));
+        assert_eq!(engine.status.video_id, Some(vid('B')));
+        assert_eq!(
+            engine
+                .queue
+                .peek_next(false)
+                .map(|i| i.song.video_id.clone()),
+            Some(vid('C'))
+        );
+    }
+
+    #[tokio::test]
+    async fn songs_added_while_the_list_loads_are_added_again_after_it() {
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: Some(vid('A')),
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        });
+        add(engine, "B", AddAt::End);
+        add(engine, "X", AddAt::Next);
+        add(engine, "Y", AddAt::Next);
+        let before: HashMap<String, u64> = queue_ids(engine).into_iter().collect();
+        let a_before = before[&vid('A')];
+        engine.on_load(Ok(page("ACD", None)));
+        // As if added after it landed: next ones right after A, the end one at the end, each
+        // with the queue id it already had.
+        assert_eq!(
+            order(engine),
+            [vid('A'), vid('Y'), vid('X'), vid('C'), vid('D'), vid('B')]
+        );
+        for c in ['B', 'X', 'Y'] {
+            let id = queue_ids(engine)
+                .into_iter()
+                .find(|(v, _)| *v == vid(c))
+                .unwrap()
+                .1;
+            assert_eq!(id, before[&vid(c)], "{c} keeps its id");
+        }
+        // A (the seed) is current, as the list's own item.
+        let a = engine.queue.current().unwrap();
+        assert_eq!(a.song.video_id, vid('A'));
+        assert_ne!(a.id, a_before);
+        assert_eq!(engine.status.queue_id, Some(a.id));
+    }
+
+    #[tokio::test]
+    async fn a_song_played_before_a_list_with_no_seed_lands_stays_current() {
+        // A playlist without a song: while it loads, the user adds X and skips to it.
+        let (mut built, _server) = idle_engine().await;
+        let engine = &mut built.engine;
+        engine.handle(EngineCmd::Play {
+            video_id: None,
+            playlist_id: Some("PLlist".into()),
+            index: Some(1),
+            start_seconds: 0.0,
+        });
+        add(engine, "X", AddAt::End);
+        add(engine, "Z", AddAt::End);
+        engine.handle(EngineCmd::Next);
+        assert_eq!(engine.status.video_id, Some(vid('X')));
+        let x = engine.queue.current().unwrap().id;
+        engine.on_load(Ok(page("ABC", None)));
+        // X stays current; the list's start song (B) comes next; Z, added to the end, last.
+        assert_eq!(engine.queue.current().map(|i| i.id), Some(x));
+        assert_eq!(engine.status.queue_id, Some(x));
+        assert_eq!(engine.status.video_id, Some(vid('X')));
+        assert_eq!(
+            order(engine),
+            [vid('A'), vid('X'), vid('B'), vid('C'), vid('Z')]
+        );
     }
 
     #[tokio::test]
