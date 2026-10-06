@@ -67,9 +67,36 @@ pub(crate) fn thumb_of(r: &Value) -> String {
         u.truncate(cut);
         u.push_str("/mqdefault.jpg");
     }
-    // A picture link goes to the widget, which loads it: only https on YouTube's own hosts, and sent
-    // in the parsed form that was checked (see `allowed_link`).
-    crate::net::allowed_link(&u).unwrap_or_default()
+    // A picture link goes to the widget, which loads it: only https on YouTube's own hosts (or
+    // YouTube Music's own tile art, see `ytm_art_link`), and sent in the parsed form that was checked
+    // (see `allowed_link`).
+    crate::net::allowed_link(&u)
+        .or_else(|| ytm_art_link(&u))
+        .unwrap_or_default()
+}
+
+/// Where YouTube Music keeps its own tile art: the Liked songs tile and page header, and the
+/// podcast-queue tile.
+const YTM_ART_HOST: &str = "www.gstatic.com";
+const YTM_ART_PATH: &str = "/youtube/media/ytm/images/";
+
+/// A link to YouTube Music's own tile art, in its parsed form, else `None`.
+///
+/// Page.js shows these tiles, and the live parity check against it found them blank here:
+/// www.gstatic.com is not on `net::allowed_host`. It stays off that list on purpose, as ytmfast
+/// never requests these itself (only the widget loads them), so this lets through exactly one
+/// host and one path, for pictures handed to a client only. The parsed form is what is checked
+/// and sent (as in `allowed_link`), so `..` and `%2e%2e` segments are already resolved and can't
+/// walk out of the path; a user name, password or port is refused, as YouTube never sends one.
+fn ytm_art_link(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let ok = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.host() == Some(url::Host::Domain(YTM_ART_HOST))
+        && url.path().starts_with(YTM_ART_PATH);
+    ok.then(|| url.into())
 }
 
 /// Where Page.js's `/\/(hq|sd)?default\.jpg.*$/` first matches: the leftmost `/` followed by

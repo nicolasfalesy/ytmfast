@@ -347,6 +347,74 @@ fn thumbnail_rules() {
     assert_eq!(first_thumb(json!([])), "");
 }
 
+/// YouTube Music's own tile art (the Liked songs tile and page header, the podcast-queue tile) lives
+/// on www.gstatic.com under one path. Page.js shows it, so ytmfast keeps exactly that path; the rest
+/// of gstatic, and every look-alike, stays blank. (Found by the live parity check against Page.js.)
+#[test]
+fn youtube_music_tile_art_is_kept() {
+    let liked = "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-1200.png";
+    // A row: protocol-relative and https forms both kept, as for any other picture.
+    assert_eq!(first_thumb(json!([{"url": liked, "width": 120}])), liked);
+    assert_eq!(
+        first_thumb(json!([{"url": liked.trim_start_matches("https:"), "width": 120}])),
+        liked
+    );
+    // The same size rule picks among them.
+    let t = first_thumb(json!([
+        {"url": "https://www.gstatic.com/youtube/media/ytm/images/pbg/a-226.png", "width": 226},
+        {"url": "https://www.gstatic.com/youtube/media/ytm/images/pbg/a-544.png", "width": 544},
+    ]));
+    assert_eq!(
+        t,
+        "https://www.gstatic.com/youtube/media/ytm/images/pbg/a-226.png"
+    );
+
+    // A page header (Liked songs).
+    let answer = json!({"contents": {"twoColumnBrowseResultsRenderer": {
+        "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            {"musicResponsiveHeaderRenderer": {
+                "title": {"runs": [{"text": "Liked music"}]},
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                    {"url": liked, "width": 226}]}}},
+            }},
+        ]}}}}],
+        "secondaryContents": {"sectionListRenderer": {"contents": [
+            {"musicShelfRenderer": {"contents": [list_row("A song", "abcdefghijk", None)]}},
+        ]}},
+    }}});
+    assert_eq!(parse_browse(&answer).header.thumb, liked);
+    const HEADER_THUMB_URL: &str = "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/\
+        content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer/thumbnail/\
+        musicThumbnailRenderer/thumbnail/thumbnails/0/url";
+
+    // Anything else on or near gstatic stays blank, in a row and in a header.
+    for bad in [
+        "https://www.gstatic.com/images/branding/x.png",
+        "https://www.gstatic.com/youtube/media/ytm/imagesx/x.png",
+        "https://www.gstatic.com/youtube/media/ytm/x.png",
+        "https://www.gstatic.com/youtube/media/ytm/images/../x.png",
+        "https://www.gstatic.com/youtube/media/ytm/images/%2e%2e/x.png",
+        "http://www.gstatic.com/youtube/media/ytm/images/x.png",
+        "https://www.gstatic.com.evil.example/youtube/media/ytm/images/x.png",
+        "https://www.gstatic.com@evil.example/youtube/media/ytm/images/x.png",
+        "https://user@www.gstatic.com/youtube/media/ytm/images/x.png",
+        "https://user:pw@www.gstatic.com/youtube/media/ytm/images/x.png",
+        "https://www.gstatic.com:8443/youtube/media/ytm/images/x.png",
+        "https://gstatic.com/youtube/media/ytm/images/x.png",
+        "https://ssl.gstatic.com/youtube/media/ytm/images/x.png",
+        "https://www.gstatic.com./youtube/media/ytm/images/x.png",
+    ] {
+        assert_eq!(
+            first_thumb(json!([{"url": bad, "width": 120}])),
+            "",
+            "row {bad}"
+        );
+        let mut a = answer.clone();
+        *a.pointer_mut(HEADER_THUMB_URL).unwrap() = json!(bad);
+        assert_eq!(parse_browse(&a).header.thumb, "", "header {bad}");
+    }
+}
+
 #[test]
 fn dedupe_keeps_playlist_repeats_by_set_id() {
     // A playlist holding the same song twice: each entry has its own set id, so both stay.
