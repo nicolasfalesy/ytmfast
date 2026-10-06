@@ -20,11 +20,11 @@ use tokio::sync::{broadcast, mpsc};
 use ytmfast::audio::player::AudioPlayer;
 use ytmfast::audio::sink::NullSink;
 use ytmfast::control::{self, Exit, Hub, Options};
-use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, Status};
+use ytmfast::engine::{Engine, EngineCmd, EngineEvent, PlayState, QueueSource, QueueView, Status};
 use ytmfast::error::Error;
-use ytmfast::innertube::{NextPage, NextRequest};
+use ytmfast::innertube::{NextPage, NextRequest, SongItem};
 use ytmfast::mpris::{self, Bus, Mpris};
-use ytmfast::queue::Repeat;
+use ytmfast::queue::{QueueItem, Repeat};
 use ytmfast::streams::{Resolver, Stream, TrackMeta};
 use zbus::zvariant::{ObjectPath, OwnedValue};
 use zbus::{Connection, Proxy};
@@ -104,13 +104,51 @@ fn private_bus() -> PrivateBus {
     }
 }
 
-/// The engine side, faked: answers `Status` from `status`, echoes a seek's landing as a
-/// `Position` event (as the engine does), and passes every other command to the test.
+/// The engine side, faked: answers `Status` from `status` and `QueueGet` from `queue`,
+/// echoes a seek's landing as a `Position` event (as the engine does), and passes every
+/// other command to the test.
 struct FakeEngine {
     cmds: mpsc::Sender<EngineCmd>,
     events: broadcast::Sender<EngineEvent>,
     status: Arc<Mutex<Status>>,
+    queue: Arc<Mutex<QueueView>>,
     seen: mpsc::UnboundedReceiver<EngineCmd>,
+}
+
+fn empty_queue() -> QueueView {
+    QueueView {
+        items: Vec::new().into(),
+        current_id: None,
+        shuffle: false,
+        repeat: Repeat::Off,
+    }
+}
+
+/// A queue of `n` songs (queue ids 1 to n) with `current` (a queue id) current.
+fn queue_of(n: u64, current: Option<u64>, repeat: Repeat) -> QueueView {
+    QueueView {
+        items: (1..=n)
+            .map(|id| QueueItem {
+                id,
+                song: SongItem {
+                    video_id: format!("song{id:07}"),
+                    ..SongItem::default()
+                },
+            })
+            .collect(),
+        current_id: current,
+        shuffle: false,
+        repeat,
+    }
+}
+
+fn queue_event(q: &QueueView) -> EngineEvent {
+    EngineEvent::Queue {
+        items: q.items.clone(),
+        current_id: q.current_id,
+        shuffle: q.shuffle,
+        repeat: q.repeat,
+    }
 }
 
 fn fake_engine(initial: Status) -> FakeEngine {
@@ -118,13 +156,17 @@ fn fake_engine(initial: Status) -> FakeEngine {
     // The engine's own event capacity.
     let (events, _) = broadcast::channel(64);
     let status = Arc::new(Mutex::new(initial));
+    let queue = Arc::new(Mutex::new(empty_queue()));
     let (seen_tx, seen) = mpsc::unbounded_channel();
-    let (st, ev) = (status.clone(), events.clone());
+    let (st, q, ev) = (status.clone(), queue.clone(), events.clone());
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 EngineCmd::Status(reply) => {
                     let _ = reply.send(st.lock().unwrap().clone());
+                }
+                EngineCmd::QueueGet(reply) => {
+                    let _ = reply.send(q.lock().unwrap().clone());
                 }
                 EngineCmd::Seek(seconds) => {
                     st.lock().unwrap().position = seconds;
@@ -144,6 +186,7 @@ fn fake_engine(initial: Status) -> FakeEngine {
         cmds,
         events,
         status,
+        queue,
         seen,
     }
 }
@@ -368,6 +411,8 @@ async fn set_position_seeks_only_for_the_current_track() {
         (&other, 30_000_000i64),
         (&current, -1),
         (&current, 214_000_000),
+        // Exactly the end too: the engine would take a seek there as Next.
+        (&current, 213_000_000),
     ] {
         r.player
             .call_method("SetPosition", &(track, at))
@@ -521,8 +566,10 @@ async fn identity_and_capabilities() {
         ("CanPause", true),
         ("CanSeek", true),
         ("CanControl", true),
+        // An empty queue: nowhere to go.
         ("CanGoNext", false),
         ("CanGoPrevious", false),
+        ("Shuffle", false),
     ] {
         assert_eq!(
             r.player.get_property::<bool>(prop).await.unwrap(),
@@ -532,15 +579,293 @@ async fn identity_and_capabilities() {
     }
     let s: String = r.player.get_property("PlaybackStatus").await.unwrap();
     assert_eq!(s, "Stopped");
+    let l: String = r.player.get_property("LoopStatus").await.unwrap();
+    assert_eq!(l, "None");
     assert_eq!(r.player.get_property::<f64>("Rate").await.unwrap(), 1.0);
 }
 
 #[tokio::test]
-async fn next_and_previous_do_nothing() {
+async fn next_and_previous_send_the_commands() {
     let mut r = rig(playing("dQw4w9WgXcQ", 1.0)).await;
     call(&r.player, "Next").await;
+    assert!(matches!(r.engine.next().await, EngineCmd::Next));
     call(&r.player, "Previous").await;
+    assert!(matches!(r.engine.next().await, EngineCmd::Previous));
+    tokio::time::timeout(WAIT, r.hub.touched())
+        .await
+        .expect("Next and Previous restart the idle clock");
+}
+
+async fn properties(client: &Connection) -> zbus::fdo::PropertiesProxy<'static> {
+    zbus::fdo::PropertiesProxy::builder(client)
+        .destination(NAME)
+        .unwrap()
+        .path(PATH)
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn can_go(p: &Proxy<'_>) -> (bool, bool) {
+    (
+        p.get_property("CanGoNext").await.unwrap(),
+        p.get_property("CanGoPrevious").await.unwrap(),
+    )
+}
+
+/// The value a PropertiesChanged signal carried for `prop`, waiting for the first signal
+/// that names it.
+async fn changed<T>(changes: &mut zbus::fdo::PropertiesChangedStream, prop: &str) -> T
+where
+    T: TryFrom<OwnedValue>,
+    <T as TryFrom<OwnedValue>>::Error: std::fmt::Debug,
+{
+    loop {
+        let signal = tokio::time::timeout(WAIT, changes.next())
+            .await
+            .unwrap_or_else(|_| panic!("no PropertiesChanged for {prop} in time"))
+            .unwrap();
+        let args = signal.args().unwrap();
+        if let Some(v) = args.changed_properties().get(prop) {
+            let owned = OwnedValue::try_from(v.try_clone().unwrap()).unwrap();
+            return T::try_from(owned).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn can_go_next_and_previous_follow_the_queue() {
+    let r = rig(playing("song0000001", 1.0)).await;
+    let props = properties(&r.client).await;
+    let mut changes = props.receive_properties_changed().await.unwrap();
+    let player = &r.player;
+    let send = |q: QueueView| {
+        *r.engine.queue.lock().unwrap() = q.clone();
+        r.engine.events.send(queue_event(&q)).unwrap();
+    };
+    // The first of three: only forward.
+    send(queue_of(3, Some(1), Repeat::Off));
+    assert!(changed::<bool>(&mut changes, "CanGoNext").await);
+    eventually(|| async move { can_go(player).await == (true, false) }).await;
+    // The middle: both ways.
+    send(queue_of(3, Some(2), Repeat::Off));
+    assert!(changed::<bool>(&mut changes, "CanGoPrevious").await);
+    eventually(|| async move { can_go(player).await == (true, true) }).await;
+    // The last: only back.
+    send(queue_of(3, Some(3), Repeat::Off));
+    assert!(!changed::<bool>(&mut changes, "CanGoNext").await);
+    eventually(|| async move { can_go(player).await == (false, true) }).await;
+    // Repeat all wraps both ways, from either end.
+    send(queue_of(3, Some(3), Repeat::All));
+    eventually(|| async move { can_go(player).await == (true, true) }).await;
+    send(queue_of(3, Some(1), Repeat::All));
+    eventually(|| async move { can_go(player).await == (true, true) }).await;
+    // Repeat one: a skip still moves on (it only repeats when a song ends by itself).
+    send(queue_of(3, Some(3), Repeat::One));
+    eventually(|| async move { can_go(player).await == (false, true) }).await;
+    // Songs but none current: Next starts the first one.
+    send(queue_of(2, None, Repeat::Off));
+    eventually(|| async move { can_go(player).await == (true, false) }).await;
+    send(empty_queue());
+    eventually(|| async move { can_go(player).await == (false, false) }).await;
+}
+
+#[tokio::test]
+async fn shuffle_and_loop_status_map_to_the_engine() {
+    let mut r = rig(stopped()).await;
+    r.player.set_property("Shuffle", true).await.unwrap();
+    assert!(matches!(r.engine.next().await, EngineCmd::Shuffle(true)));
+    assert!(r.player.get_property::<bool>("Shuffle").await.unwrap());
+    r.player.set_property("Shuffle", false).await.unwrap();
+    assert!(matches!(r.engine.next().await, EngineCmd::Shuffle(false)));
+
+    for (loop_status, want) in [
+        ("Playlist", Repeat::All),
+        ("Track", Repeat::One),
+        ("None", Repeat::Off),
+    ] {
+        r.player
+            .set_property("LoopStatus", loop_status)
+            .await
+            .unwrap();
+        match r.engine.next().await {
+            EngineCmd::Repeat(got) => assert_eq!(got, want, "{loop_status}"),
+            other => panic!("{loop_status}: {other:?}"),
+        }
+        let now: String = r.player.get_property("LoopStatus").await.unwrap();
+        assert_eq!(now, loop_status);
+    }
+    // Not one of the spec's three: refused, and nothing reaches the engine.
+    assert!(
+        r.player
+            .set_property("LoopStatus", "Forever")
+            .await
+            .is_err()
+    );
     assert!(r.engine.none_within(Duration::from_millis(200)).await);
+    tokio::time::timeout(WAIT, r.hub.touched())
+        .await
+        .expect("setting Shuffle or LoopStatus restarts the idle clock");
+
+    // Both follow the engine (a socket client changed them), with PropertiesChanged.
+    let props = properties(&r.client).await;
+    let mut changes = props.receive_properties_changed().await.unwrap();
+    let mut st = stopped();
+    st.shuffle = true;
+    st.repeat = Repeat::All;
+    r.engine.events.send(EngineEvent::State(st)).unwrap();
+    assert!(changed::<bool>(&mut changes, "Shuffle").await);
+    let l: String = r.player.get_property("LoopStatus").await.unwrap();
+    assert_eq!(l, "Playlist");
+    let mut st = stopped();
+    st.shuffle = true;
+    st.repeat = Repeat::One;
+    r.engine.events.send(EngineEvent::State(st)).unwrap();
+    assert_eq!(changed::<String>(&mut changes, "LoopStatus").await, "Track");
+}
+
+/// A seek from anywhere (here the socket) moves the position under the desktop's widgets,
+/// so MPRIS announces it with `Seeked`; ticks never do.
+#[tokio::test]
+async fn socket_seek_emits_seeked() {
+    let r = rig(playing("dQw4w9WgXcQ", 1.0)).await;
+    let mut seeked = r.player.receive_signal("Seeked").await.unwrap();
+    // The socket on the same fake engine.
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, path) = listener(dir.path());
+    let serve = tokio::spawn(control::serve(
+        socket,
+        r.engine.cmds.clone(),
+        r.engine.events.clone(),
+        Options {
+            power_supply_root: dir.path().to_path_buf(),
+            ..Options::default()
+        },
+    ));
+    // A tick first: no Seeked for it.
+    r.engine
+        .events
+        .send(EngineEvent::Position {
+            seconds: 2.0,
+            seeked: false,
+        })
+        .unwrap();
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(b"{\"id\":1,\"cmd\":\"seek\",\"args\":{\"seconds\":42.5}}\n")
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(read).lines();
+    let reply = tokio::time::timeout(WAIT, lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(reply.contains("\"ok\":true"), "{reply}");
+    let signal = tokio::time::timeout(WAIT, seeked.next())
+        .await
+        .expect("no Seeked in time")
+        .unwrap();
+    let at: i64 = signal.body().deserialize().unwrap();
+    assert_eq!(at, 42_500_000);
+    assert_eq!(
+        r.player.get_property::<i64>("Position").await.unwrap(),
+        42_500_000
+    );
+    // Exactly one Seeked for the one seek.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), seeked.next())
+            .await
+            .is_err()
+    );
+    serve.abort();
+}
+
+/// The MPRIS seek methods announce their landing once, not twice (now that every seeked
+/// position is announced).
+#[tokio::test]
+async fn mpris_seek_emits_one_seeked() {
+    let mut r = rig(playing("dQw4w9WgXcQ", 5.0)).await;
+    let mut seeked = r.player.receive_signal("Seeked").await.unwrap();
+    r.player
+        .call_method("Seek", &(1_000_000i64,))
+        .await
+        .unwrap();
+    r.engine.next().await;
+    tokio::time::timeout(WAIT, seeked.next())
+        .await
+        .expect("no Seeked in time")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), seeked.next())
+            .await
+            .is_err()
+    );
+}
+
+/// The album and the art come from the song's queue item, on the real engine: a song added
+/// over the socket with its details and jumped to shows them at once (its link never
+/// resolves here).
+#[tokio::test]
+async fn album_and_art_come_from_the_queue_item() {
+    let bus = private_bus();
+    let dir = tempfile::tempdir().unwrap();
+    let (task, path) = run_daemon(dir.path(), Bus::Address(bus.address.clone()));
+    let conn = client(&bus.address).await;
+    eventually(|| name_has_owner(&conn)).await;
+    let player = proxy(&conn, PLAYER).await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let add = serde_json::json!({"id": 1, "cmd": "queue.add", "args": {"songs": [
+        {"videoId": "dQw4w9WgXcQ", "title": "Song", "artists": ["A", "B"],
+         "album": "The Album", "thumbnail": "https://lh3.googleusercontent.com/art=w544-h544",
+         "lengthSeconds": 200}]}});
+    write
+        .write_all(format!("{add}\n").as_bytes())
+        .await
+        .unwrap();
+    // The queue event carries the new song's id.
+    let qid = loop {
+        let line = tokio::time::timeout(WAIT, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if v["event"] == "queue" {
+            break v["items"][0]["queueId"].as_u64().unwrap();
+        }
+    };
+    write
+        .write_all(
+            format!("{{\"id\":2,\"cmd\":\"queue.jump\",\"args\":{{\"queueId\":{qid}}}}}\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let p = &player;
+    eventually(|| async move { metadata(p).await.contains_key("xesam:album") }).await;
+    let m = metadata(&player).await;
+    let album: String = m["xesam:album"].try_clone().unwrap().try_into().unwrap();
+    assert_eq!(album, "The Album");
+    let art: String = m["mpris:artUrl"].try_clone().unwrap().try_into().unwrap();
+    assert_eq!(art, "https://lh3.googleusercontent.com/art=w544-h544");
+    let title: String = m["xesam:title"].try_clone().unwrap().try_into().unwrap();
+    assert_eq!(title, "Song");
+    assert_eq!(track_id(&m), "/org/ytmfast/track/dQw4w9WgXcQ");
+    // One song: nowhere to go either way.
+    assert_eq!(can_go(&player).await, (false, false));
+
+    let root = proxy(&conn, ROOT).await;
+    call(&root, "Quit").await;
+    assert_eq!(
+        tokio::time::timeout(WAIT, task).await.unwrap().unwrap(),
+        Exit::Quit
+    );
 }
 
 #[tokio::test]

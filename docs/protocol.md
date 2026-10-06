@@ -178,6 +178,23 @@ second restart in the same song leaves it stopped.
 - A client that closes its sending side still gets the replies to what it sent; then the
   connection closes.
 
+## MPRIS
+
+The engine also shows as a media player on the session bus, as
+`org.mpris.MediaPlayer2.ytmfast`, for media keys, `playerctl` and desktop widgets. It drives
+the same engine as the socket, so a change from either side shows on both.
+
+- `Next` and `Previous` are the socket's `next` and `previous`. `CanGoNext` and
+  `CanGoPrevious` follow the queue: true when there is a song after (or before) the current
+  one, or with repeat `all`.
+- `Shuffle` (true or false) is the socket's `shuffle`. `LoopStatus` is the socket's
+  `repeat`: `"None"` is `off`, `"Track"` is `one` and `"Playlist"` is `all`.
+- `Metadata` holds the title, the artist, the length, `xesam:album` and `mpris:artUrl`
+  (from the song's queue item when it has them).
+- `Seeked` comes once for every seek, from any client, with where the song landed.
+- `SetPosition` at or past the song's end is ignored, as the spec says.
+- There is no track list (`HasTrackList` is false): the socket's `queue.get` has the queue.
+
 ## Lifecycle
 
 With the systemd units in `dist/systemd`, the first connection starts the engine. It quits by
