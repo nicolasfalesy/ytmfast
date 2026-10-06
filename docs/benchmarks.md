@@ -73,6 +73,33 @@ of the next song.
 The extra 14 MB over step 1 is probably mostly the preloaded next song (its whole download is held in memory, about
 7 MB for a 4-minute song) and the queue; this was not broken down further.
 
+## ytmfast step 3 (browsing), 2026-10-06, on AC power
+
+Measured live on the user's account, with a private engine on a silent output. Each time is the median of 3 tries; "cold"
+is the first request after the engine starts.
+
+| Measure | Median | Range |
+|---|---|---|
+| Browse a page, cold | 770 ms | 641 to 781 ms |
+| Browse a page, warm | 316 ms | 248 to 317 ms |
+| Search, cold | 615 ms | 548 to 680 ms |
+| Search, warm | 589 ms | 419 to 630 ms |
+| Next page (a continuation), warm | 181 ms | 169 to 197 ms |
+| RAM (PSS), idle after a search | 13.6 MB | |
+| RAM added by scrolling a 500-song playlist to the end | 0.0 MB | 24.2 MB before and after |
+
+The 500-song playlist came in 5 pages (about 72 KB of replies per 138 rows). Pages go straight to the client and
+nothing is kept, so scrolling does not grow the engine. Lyrics took 68 ms and 88 ms (one try each) and 0 ms when
+asked again, from the cache.
+
+### Matches the widget
+
+The same live YouTube answers were read by ytmfast and by the bar widget's own parser (`Page.js`), and the two
+results compared field by field. After one fix (YouTube Music's own tile art on `www.gstatic.com`, such as the Liked
+songs tile, had come out blank), there were 0 differences on: Home and its next 2 pages, Liked albums, Library
+artists, a search (mixed results, the Songs filter and its next page), an album, an artist and its "Show all" page,
+a 140-song playlist and its next page, a podcast page, and lyrics.
+
 ## Power (CPU package energy), 2026-10-05, on AC power
 
 Measured with the processor's own energy counter (Intel RAPL, `intel-rapl:0` package) over 240 s of playback after
