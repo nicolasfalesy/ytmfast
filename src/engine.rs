@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
@@ -47,6 +47,7 @@ use crate::audio::player::{AudioEvent, AudioPlayer};
 use crate::error::Error;
 use crate::innertube::{Innertube, NextPage, NextRequest, SongItem};
 use crate::queue::{AddAt, Previous, Queue, QueueItem, Repeat};
+use crate::state::{self, Saved, SourceKind, Writer};
 use crate::streams::{Resolver, Stream, TrackMeta};
 
 /// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
@@ -197,6 +198,14 @@ const RADIO_PREFIX: &str = "RDAMVM";
 /// The next song is preloaded this long before the current one ends (Global Constraints).
 const PRELOAD_LEAD_SECS: f64 = 10.0;
 
+/// While playing, the state is saved every this many position ticks (30 s; Global
+/// Constraints), so a crash or a power loss loses at most that much of the song.
+const SAVE_EVERY_TICKS: u32 = 30;
+
+/// How long a quit waits for its last save: long enough for any working disk, short enough
+/// that a hung one can't hold up `systemctl stop` (whose own limit is far longer).
+const LAST_SAVE_WAIT: Duration = Duration::from_secs(2);
+
 /// A finished resolve, tagged with the play it was for.
 struct Resolved {
     generation: u64,
@@ -342,6 +351,25 @@ pub struct Engine {
     /// The position clock: only exists while playing, so a paused or stopped engine has no
     /// timer waking it.
     ticker: Option<Interval>,
+    /// Saves the state (`crate::state`); `None` when nothing is saved (most tests).
+    writer: Option<Writer>,
+    /// Something worth saving changed (a song, the queue, a pause, a seek, the volume). Saved
+    /// once the command or event at hand is handled, so a burst of changes is one snapshot.
+    dirty: bool,
+    /// Position ticks since the last save; `SAVE_EVERY_TICKS` of them save again. The ticker
+    /// only runs while playing, so this 30 s timer only exists then too.
+    ticks_since_save: u32,
+    /// The current song comes from a saved state and was never loaded: a play loads it at
+    /// its saved second (`status.position`).
+    restored: bool,
+    /// A seek's target, for the save it causes: the audio thread takes the seek a moment
+    /// later, so until then its position is still the old one (a paused song would be saved
+    /// at its old second, and stay so until the next save).
+    seeked_to: Option<f64>,
+    /// The playlist the queue came from, and what kind it is (saved, so a resumed queue
+    /// refills the same way).
+    source_playlist: Option<String>,
+    source_kind: SourceKind,
 }
 
 impl Engine {
@@ -421,8 +449,63 @@ impl Engine {
             loads_sent: 0,
             loads_seen: 0,
             ticker: None,
+            writer: None,
+            dirty: false,
+            ticks_since_save: 0,
+            restored: false,
+            seeked_to: None,
+            source_playlist: None,
+            source_kind: SourceKind::List,
         };
         (engine, cmd_tx, events)
+    }
+
+    /// Takes up a saved state (before `run`): the queue, the current song paused at its
+    /// second, volume, shuffle, repeat and the queue's source. Nothing is fetched or
+    /// downloaded until a play.
+    pub fn restore(&mut self, saved: Saved) {
+        let current = (!saved.queue.is_empty()).then_some(saved.current_index);
+        // Shuffle on with no order saved: `Queue::restore` falls back to the play order.
+        let original = saved
+            .shuffle
+            .then(|| saved.original_order.unwrap_or_default());
+        self.queue = Queue::restore(saved.queue, current, original, saved.repeat);
+        self.source_playlist = saved.source_playlist;
+        self.source_kind = saved.source_kind;
+        self.continuation = saved.continuation;
+        self.exhausted = saved.exhausted;
+        let volume = if saved.volume.is_finite() {
+            saved.volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.player.set_volume(volume);
+        self.status.volume = volume;
+        self.status.shuffle = self.queue.shuffle();
+        self.status.repeat = self.queue.repeat();
+        let Some(item) = self.queue.current().cloned() else {
+            return;
+        };
+        let at = if saved.position.is_finite() {
+            saved.position.max(0.0)
+        } else {
+            0.0
+        };
+        self.status.video_id = Some(item.song.video_id.clone());
+        self.status.queue_id = Some(item.id);
+        self.status.album = item.song.album.clone();
+        self.status.meta = song_meta(&item.song, None);
+        self.status.position = at;
+        self.start_seconds = at;
+        // Paused, never Playing: a restart (an update, an idle quit) must not start music by
+        // itself. Nothing is loaded until a play (`resume`).
+        self.status.state = PlayState::Paused;
+        self.restored = true;
+    }
+
+    /// Saves the state through `writer` from now on, and once more on the way out.
+    pub fn save_with(&mut self, writer: Writer) {
+        self.writer = Some(writer);
     }
 
     /// Runs until `Quit`, or until every command sender is gone. Stops the audio thread on
@@ -440,6 +523,17 @@ impl Engine {
                 Some(p) = self.preloads_rx.recv() => self.on_preloaded(p),
                 Some(e) = audio.recv() => self.on_audio(e),
                 () = next_tick(&mut self.ticker) => self.on_tick(),
+            }
+            if self.dirty {
+                self.write_state();
+            }
+        }
+        // Every way out (the socket's quit, idle, a signal) ends here: one last save, while
+        // the player still knows the position. Bounded, so a hung disk can't hold up a stop.
+        if let Some(writer) = self.writer.take() {
+            let last = self.saved();
+            if !writer.finish(last, LAST_SAVE_WAIT).await {
+                eprintln!("ytmfast: the play state was not saved in time; quitting anyway");
             }
         }
         let prefetch = self.prefetch.take().map(|(_, task)| task);
@@ -557,6 +651,12 @@ impl Engine {
             },
         };
         self.new_queue();
+        // Mixes and radios from YouTube are `RDAMVM` + a song (a lone song's radio too).
+        self.source_kind = match &request.playlist_id {
+            Some(p) if p.starts_with(RADIO_PREFIX) => SourceKind::Radio,
+            _ => SourceKind::List,
+        };
+        self.source_playlist = request.playlist_id.clone();
         match &video_id {
             Some(id) => {
                 // It plays at once, without waiting for the list.
@@ -871,6 +971,7 @@ impl Engine {
         self.loaded = false;
         self.started = false;
         self.ticker = None;
+        self.restored = false;
     }
 
     fn previous(&mut self) {
@@ -880,7 +981,8 @@ impl Engine {
             self.start_current(0.0);
             self.emit_queue();
             self.maybe_refill();
-        } else if self.loaded {
+        } else if self.loaded || self.restored {
+            // A paused song goes back to its start and stays paused.
             self.seek(0.0);
         } else if self.queue.current().is_some() {
             self.start_current(0.0);
@@ -1011,6 +1113,7 @@ impl Engine {
         self.loaded = false;
         self.started = false;
         self.replayed = false;
+        self.restored = false;
         self.ticker = None;
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
@@ -1171,6 +1274,14 @@ impl Engine {
         if self.status.state != PlayState::Paused {
             return;
         }
+        // The saved song after a restart: only now is its link fetched and its download
+        // started, at the saved second (or where a seek since moved it).
+        if self.restored {
+            let at = self.status.position;
+            self.start_current(at);
+            self.maybe_refill();
+            return;
+        }
         if self.loaded {
             self.player.play();
         }
@@ -1214,6 +1325,8 @@ impl Engine {
             seconds: at,
             seeked: true,
         });
+        self.seeked_to = Some(at);
+        self.dirty = true;
     }
 
     fn volume(&mut self, v: f32) {
@@ -1223,6 +1336,7 @@ impl Engine {
         let v = v.clamp(0.0, 1.0);
         self.player.set_volume(v);
         self.status.volume = v;
+        self.dirty = true;
         self.emit_state();
     }
 
@@ -1319,6 +1433,10 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        self.ticks_since_save += 1;
+        if self.ticks_since_save >= SAVE_EVERY_TICKS {
+            self.dirty = true;
+        }
         let seconds = self.player.position();
         self.status.position = seconds;
         self.emit(EngineEvent::Position {
@@ -1559,7 +1677,10 @@ impl Engine {
         }
     }
 
-    fn emit_queue(&self) {
+    /// Also marks the state for saving: every queue change, and every song change (which
+    /// moves the current item), comes through here.
+    fn emit_queue(&mut self) {
+        self.dirty = true;
         let QueueView {
             items,
             current_id,
@@ -1576,7 +1697,68 @@ impl Engine {
 
     fn emit_state(&mut self) {
         let status = self.snapshot();
+        // A pause or a stop is saved; Buffering and Playing are not (a song change already
+        // was, through `emit_queue`, and playing is saved every 30 s).
+        if matches!(status.state, PlayState::Paused | PlayState::Stopped) {
+            self.dirty = true;
+        }
         self.emit(EngineEvent::State(status));
+    }
+
+    /// Hands a snapshot to the writer (which writes it on its own thread).
+    fn write_state(&mut self) {
+        self.dirty = false;
+        self.ticks_since_save = 0;
+        if self.writer.is_some() {
+            let saved = self.saved();
+            if let Some(w) = &self.writer {
+                w.submit(saved);
+            }
+        }
+        self.seeked_to = None;
+    }
+
+    /// What `state.json` gets: at most `state::MAX_ITEMS` songs around the current one, and
+    /// the second to resume at.
+    fn saved(&mut self) -> Saved {
+        let status = self.snapshot();
+        let items = self.queue.items();
+        let current = self.queue.current_index();
+        let range = state::window(items.len(), current.unwrap_or(0), state::MAX_ITEMS);
+        let queue = items[range.clone()]
+            .iter()
+            .map(|i| i.song.clone())
+            .collect();
+        let original_order = self.queue.original_positions().map(|order| {
+            order
+                .into_iter()
+                .filter(|p| range.contains(p))
+                .map(|p| p - range.start)
+                .collect()
+        });
+        let position = match status.state {
+            // Stopped mid-song by an error: a play goes on from there. Stopped at the end of
+            // the queue (or before anything played): from the start.
+            PlayState::Stopped => self.resume_from.unwrap_or(0.0),
+            _ => self.seeked_to.unwrap_or(status.position),
+        };
+        Saved {
+            version: state::VERSION,
+            queue,
+            current_index: current.map_or(0, |c| c - range.start),
+            position,
+            volume: status.volume,
+            shuffle: status.shuffle,
+            original_order,
+            repeat: status.repeat,
+            source_playlist: self.source_playlist.clone(),
+            source_kind: self.source_kind,
+            continuation: self.continuation.clone(),
+            exhausted: self.exhausted,
+            saved_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
     }
 
     fn emit(&self, event: EngineEvent) {
@@ -1822,6 +2004,10 @@ mod tests {
         fast: bool,
         /// An output that can't be opened (no sound server to reach).
         no_output: bool,
+        /// A saved state the engine takes up before it runs.
+        saved: Option<Saved>,
+        /// Where it saves.
+        writer: Option<Writer>,
     }
 
     struct Rig {
@@ -1929,7 +2115,7 @@ mod tests {
             ..FakeSource::default()
         });
         let Built {
-            engine,
+            mut engine,
             cmds,
             events,
             started,
@@ -1941,6 +2127,12 @@ mod tests {
             setup.fast,
             setup.no_output,
         );
+        if let Some(saved) = setup.saved {
+            engine.restore(saved);
+        }
+        if let Some(writer) = setup.writer {
+            engine.save_with(writer);
+        }
         let events = events.subscribe();
         let task = tokio::spawn(engine.run());
         Rig {
@@ -3306,5 +3498,439 @@ mod tests {
             engine.status.position
         );
         assert!((engine.start_seconds - at).abs() < 1e-9);
+    }
+
+    /// A writer that keeps every snapshot it is asked to save, in memory.
+    fn recorder() -> (Writer, Arc<Mutex<Vec<Saved>>>) {
+        let saves = Arc::new(Mutex::new(Vec::new()));
+        let log = saves.clone();
+        let writer = Writer::with(Box::new(move |s| {
+            log.lock().unwrap().push(s.clone());
+            Ok(())
+        }));
+        (writer, saves)
+    }
+
+    /// Waits (real time, blocking: the writer is a thread of its own) until `saves` holds
+    /// `n` snapshots, then a little longer to be sure no more come.
+    fn saves_settle(saves: &Mutex<Vec<Saved>>, n: usize) -> usize {
+        let t = std::time::Instant::now();
+        while saves.lock().unwrap().len() < n && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        saves.lock().unwrap().len()
+    }
+
+    /// The next event, failing after 30 s of real time; for paused-clock tests.
+    async fn next_real(r: &mut Rig, bark: &mut oneshot::Receiver<()>) -> EngineEvent {
+        tokio::select! {
+            e = r.events.recv() => e.unwrap(),
+            _ = bark => panic!("no event within 30 s of real time"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writes_every_30_s_only_while_playing() {
+        let (writer, saves) = recorder();
+        let mut r = rig(Setup {
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        let (_dog, mut bark) = watchdog(Duration::from_secs(30));
+        r.play("AAAAAAAAAAA").await;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut r, &mut bark).await
+                && s.state == PlayState::Playing
+            {
+                break;
+            }
+        }
+        // The play itself (a new queue) was saved.
+        let base = saves_settle(&saves, 1);
+        assert!(base >= 1, "a play's new queue is saved");
+        // 29 seconds of play: no save. (The 2 s fixture plays in real time; these ticks are
+        // on the paused clock, so they take no real time.)
+        let mut ticks = 0;
+        while ticks < 29 {
+            if let EngineEvent::Position { .. } = next_real(&mut r, &mut bark).await {
+                ticks += 1;
+            }
+        }
+        assert_eq!(saves_settle(&saves, base), base, "nothing before 30 s");
+        while ticks < 30 {
+            if let EngineEvent::Position { .. } = next_real(&mut r, &mut bark).await {
+                ticks += 1;
+            }
+        }
+        assert_eq!(saves_settle(&saves, base + 1), base + 1, "one at 30 s");
+        // Pause saves once; then no timer and no more saves, however long it stays paused.
+        r.send(EngineCmd::Pause).await;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut r, &mut bark).await
+                && s.state == PlayState::Paused
+            {
+                break;
+            }
+        }
+        assert_eq!(saves_settle(&saves, base + 2), base + 2, "pause saves");
+        let paused_at = saves.lock().unwrap().last().unwrap().position;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            saves_settle(&saves, base + 2),
+            base + 2,
+            "none while paused"
+        );
+        assert_eq!(saves.lock().unwrap().last().unwrap().position, paused_at);
+        // A seek, a volume change and a queue change are each saved. (Each followed by a
+        // status round trip: `saves_settle` blocks this thread, which the engine shares.)
+        r.send(EngineCmd::Seek(0.5)).await;
+        r.status().await;
+        assert_eq!(saves_settle(&saves, base + 3), base + 3, "seek saves");
+        assert_eq!(saves.lock().unwrap().last().unwrap().position, 0.5);
+        r.send(EngineCmd::Volume(0.25)).await;
+        r.status().await;
+        assert_eq!(saves_settle(&saves, base + 4), base + 4, "volume saves");
+        r.send(EngineCmd::QueueAdd {
+            songs: vec![song('B')],
+            at: AddAt::End,
+        })
+        .await;
+        r.status().await;
+        assert_eq!(
+            saves_settle(&saves, base + 5),
+            base + 5,
+            "queue change saves"
+        );
+        let last = saves.lock().unwrap().last().unwrap().clone();
+        assert_eq!(last.volume, 0.25);
+        assert_eq!(last.queue.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_resumes_paused_near_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            writer: Some(Writer::spawn(dir.path().to_path_buf())),
+            ..Setup::default()
+        })
+        .await;
+        let (_dog, mut bark) = watchdog(Duration::from_secs(30));
+        a.play_list("PLlist", Some(1)).await;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut a, &mut bark).await
+                && s.state == PlayState::Playing
+                && s.video_id == Some(vid('B'))
+            {
+                break;
+            }
+        }
+        // Let the song really play a little (real time: the audio thread's clock).
+        std::thread::sleep(Duration::from_millis(300));
+        // 30 s of play on the paused clock: the periodic save is the one a crash relies on.
+        let mut ticks = 0;
+        while ticks < 30 {
+            if let EngineEvent::Position { .. } = next_real(&mut a, &mut bark).await {
+                ticks += 1;
+            }
+        }
+        let t = std::time::Instant::now();
+        loop {
+            if let Some(s) = crate::state::load(dir.path())
+                && s.position > 0.0
+            {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(3), "the 30 s save");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let playing_at = a.status().await.position;
+        // A crash, not a quit: no last save.
+        a.task.abort();
+        let _ = a.task.await;
+        let saved = crate::state::load(dir.path()).unwrap();
+        assert!(saved.position > 0.0);
+        assert!(
+            playing_at - saved.position < 30.0,
+            "within 30 s of where it was"
+        );
+        assert_eq!(saved.queue[saved.current_index].video_id, vid('B'));
+
+        // The new engine: B, paused at the saved second, nothing fetched or downloading.
+        let loaded = saved.clone();
+        let mut b = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            saved: Some(loaded),
+            ..Setup::default()
+        })
+        .await;
+        let s = b.status().await;
+        assert_eq!(s.state, PlayState::Paused);
+        assert_eq!(s.video_id, Some(vid('B')));
+        assert_eq!(s.position, saved.position);
+        assert_eq!(s.meta.as_ref().map(|m| m.title.as_str()), Some("Title B"));
+        let q = b.queue().await;
+        let ids: Vec<_> = q.items.iter().map(|i| i.song.video_id.clone()).collect();
+        assert_eq!(ids, [vid('A'), vid('B'), vid('C')]);
+        assert_eq!(q.current_id, Some(id_of(&q, 'B')));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(b.calls().is_empty(), "no link fetched before play");
+        assert!(b.started().is_empty(), "no download before play");
+        assert!(
+            b.source.requests().is_empty(),
+            "no queue request before play"
+        );
+
+        // Play with no id picks up there.
+        let (_dog, mut bark) = watchdog(Duration::from_secs(30));
+        b.send(EngineCmd::Play {
+            video_id: None,
+            playlist_id: None,
+            index: None,
+            start_seconds: 0.0,
+        })
+        .await;
+        let mut first = None;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut b, &mut bark).await {
+                first.get_or_insert(s.clone());
+                if s.state == PlayState::Playing {
+                    break;
+                }
+            }
+        }
+        let first = first.unwrap();
+        assert_eq!(first.state, PlayState::Buffering);
+        assert_eq!(first.video_id, Some(vid('B')));
+        assert_eq!(first.position, saved.position, "starts at the saved second");
+        assert_eq!(b.started()[0], vid('B'));
+    }
+
+    #[tokio::test]
+    async fn a_seek_before_the_first_play_moves_the_start() {
+        let saved = Saved {
+            queue: vec![song('A')],
+            position: 0.2,
+            ..Saved::default()
+        };
+        let mut r = rig(Setup {
+            saved: Some(saved),
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Seek(1.0)).await;
+        let s = r.status().await;
+        assert_eq!((s.state, s.position), (PlayState::Paused, 1.0));
+        assert!(r.calls().is_empty());
+        // Toggle plays it too, from the new second.
+        r.send(EngineCmd::Toggle).await;
+        let s = states(&r.until(PlayState::Playing).await);
+        assert_eq!(s[0].state, PlayState::Buffering);
+        assert_eq!(s[0].position, 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_radio_keeps_refilling() {
+        let saved = Saved {
+            queue: vec![song('A'), song('B')],
+            source_playlist: Some(radio_of('A')),
+            source_kind: crate::state::SourceKind::Radio,
+            continuation: Some("CONT9".into()),
+            volume: 0.3,
+            repeat: Repeat::Off,
+            ..Saved::default()
+        };
+        let mut r = rig(Setup {
+            pages: vec![ok("CONT9", 0, "CD", Some("CONT10"))],
+            saved: Some(saved),
+            ..Setup::default()
+        })
+        .await;
+        assert_eq!(r.status().await.volume, 0.3);
+        eventually("the restored volume reaches the output", || {
+            r.stats.volume() == 0.3
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(r.source.requests().is_empty(), "nothing asked before play");
+        r.send(EngineCmd::Toggle).await;
+        r.until(PlayState::Playing).await;
+        let t = std::time::Instant::now();
+        let q = loop {
+            let q = r.queue().await;
+            if q.items.len() == 4 || t.elapsed() > Duration::from_secs(3) {
+                break q;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let ids: Vec<_> = q.items.iter().map(|i| i.song.video_id.clone()).collect();
+        assert_eq!(ids, [vid('A'), vid('B'), vid('C'), vid('D')]);
+        // The radio's own next page, not a new radio of the last song.
+        assert_eq!(
+            r.source.requests()[0],
+            NextRequest {
+                continuation: Some("CONT9".into()),
+                ..NextRequest::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn previous_on_a_restored_song() {
+        let long_b = SongItem {
+            length_seconds: 300,
+            ..song('B')
+        };
+        let saved = Saved {
+            queue: vec![song('A'), long_b],
+            current_index: 1,
+            position: 100.0,
+            ..Saved::default()
+        };
+        let r = rig(Setup {
+            saved: Some(saved.clone()),
+            ..Setup::default()
+        })
+        .await;
+        // Over 3 s in: back to its start, still paused, still not loaded.
+        r.send(EngineCmd::Previous).await;
+        let s = r.status().await;
+        assert_eq!(
+            (s.state, s.video_id.clone(), s.position),
+            (PlayState::Paused, Some(vid('B')), 0.0)
+        );
+        assert!(r.calls().is_empty());
+        // Under 3 s in: the song before, which (like Next) plays.
+        r.send(EngineCmd::Previous).await;
+        let s = r.status().await;
+        assert_eq!(s.video_id, Some(vid('A')));
+        assert_ne!(s.state, PlayState::Paused);
+    }
+
+    #[tokio::test]
+    async fn quit_writes_a_last_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            writer: Some(Writer::spawn(dir.path().to_path_buf())),
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", Some(2)).await;
+        r.until_song(&vid('C'), PlayState::Playing).await;
+        r.send(EngineCmd::Shuffle(true)).await;
+        r.send(EngineCmd::Repeat(Repeat::All)).await;
+        r.send(EngineCmd::Pause).await;
+        r.until(PlayState::Paused).await;
+        let at = r.status().await.position;
+        r.send(EngineCmd::Quit).await;
+        tokio::time::timeout(Duration::from_secs(5), r.task)
+            .await
+            .unwrap()
+            .unwrap();
+        // Written before `run` returned: no waiting for the writer here.
+        let s = crate::state::load(dir.path()).unwrap();
+        assert_eq!(s.version, crate::state::VERSION);
+        assert_eq!(s.queue[s.current_index].video_id, vid('C'));
+        assert!((s.position - at).abs() < 0.05, "{} vs {at}", s.position);
+        assert!(s.shuffle);
+        assert_eq!(s.repeat, Repeat::All);
+        assert_eq!(s.source_playlist.as_deref(), Some("PLlist"));
+        assert_eq!(s.source_kind, crate::state::SourceKind::List);
+        // The current song first in the shuffled order; the original order kept.
+        assert_eq!(s.current_index, 0);
+        let original: Vec<String> = s
+            .original_order
+            .unwrap()
+            .iter()
+            .map(|&p| s.queue[p].video_id.clone())
+            .collect();
+        assert_eq!(original, [vid('A'), vid('B'), vid('C')]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_disk_holds_quit_for_2_s_at_most() {
+        let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        let held = gate.clone();
+        let writer = Writer::with(Box::new(move |_| {
+            let mut shut = held.0.lock().unwrap();
+            while *shut {
+                shut = held.1.wait(shut).unwrap();
+            }
+            Ok(())
+        }));
+        let r = rig(Setup {
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Volume(0.5)).await;
+        let t = Instant::now();
+        r.send(EngineCmd::Quit).await;
+        r.task.await.unwrap();
+        assert_eq!(t.elapsed(), Duration::from_secs(2));
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+    }
+
+    /// Every string in a JSON value, with the key it sits under.
+    fn strings<'a>(v: &'a serde_json::Value, key: &'a str, out: &mut Vec<(&'a str, &'a str)>) {
+        match v {
+            serde_json::Value::String(s) => out.push((key, s)),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, key, out)),
+            serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| strings(x, k, out)),
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn no_url_or_cookie_in_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "AB", Some("CONTX"))],
+            writer: Some(Writer::spawn(dir.path().to_path_buf())),
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let link = format!(
+            "{}:{}",
+            r.server.base.host_str().unwrap(),
+            r.server.base.port().unwrap()
+        );
+        r.send(EngineCmd::Quit).await;
+        r.task.await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join(crate::state::FILE_NAME)).unwrap();
+        // The song's link (on the test server) went nowhere near the file.
+        assert!(
+            !text.contains(&link) && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+        let lower = text.to_lowercase();
+        for word in [
+            "googlevideo",
+            "cookie",
+            "sapisid",
+            "__secure",
+            "authorization",
+            "signature",
+            "expire",
+        ] {
+            assert!(!lower.contains(word), "{word} in {text}");
+        }
+        // The only links are thumbnails, on an allowed https host.
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut all = Vec::new();
+        strings(&v, "", &mut all);
+        for (key, s) in all {
+            if s.contains("://") || s.starts_with("//") {
+                assert_eq!(key, "thumbnail", "{s}");
+                let u = Url::parse(s).unwrap();
+                assert!(crate::net::allowed_host(&u), "{s}");
+            }
+        }
     }
 }

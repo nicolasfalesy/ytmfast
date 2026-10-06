@@ -21,6 +21,7 @@ use ytmfast::error::Error;
 use ytmfast::innertube::{Innertube, clients};
 use ytmfast::paths;
 use ytmfast::solver::Solver;
+use ytmfast::state;
 use ytmfast::streams::lazy::{self, LazySession};
 use ytmfast::streams::ytdlp::{self, YtDlpCommand};
 use ytmfast::streams::{Resolver, Streams, TrackMeta};
@@ -370,7 +371,22 @@ async fn serve(
         Box::new(PipeWireSink::new())
     };
     let player = AudioPlayer::spawn(sink);
-    let (engine, cmds, events) = Engine::new(backend.clone(), backend, player);
+    let (mut engine, cmds, events) = Engine::new(backend.clone(), backend, player);
+    // The queue, song and second from before the restart (paused: resume never plays by
+    // itself), and saving from now on. Without a state folder the engine still plays; it
+    // just starts fresh each time.
+    match paths::state_dir() {
+        Ok(dir) => {
+            if let Some(saved) = state::load(&dir) {
+                engine.restore(saved);
+            }
+            engine.save_with(state::Writer::spawn(dir));
+        }
+        Err(e) => eprintln!(
+            "ytmfast: no state folder ({:?}); the queue won't survive a restart",
+            e.kind()
+        ),
+    }
     // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
     // session bus it logs one line and the socket carries on alone.
     let options = control::Options {

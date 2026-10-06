@@ -154,6 +154,54 @@ impl Queue {
         self.current()
     }
 
+    /// A queue from a saved state (`crate::state`): `songs` in play order with new ids,
+    /// `current` an index into them, and while shuffled `original` the order from before
+    /// shuffling as indexes into `songs`. An index past the end means no current song yet;
+    /// an `original` that isn't every index once falls back to the play order (shuffle stays
+    /// on).
+    pub fn restore(
+        songs: Vec<SongItem>,
+        current: Option<usize>,
+        original: Option<Vec<usize>>,
+        repeat: Repeat,
+    ) -> Queue {
+        let mut q = Queue::new();
+        q.items = q.new_items(songs);
+        q.current = current.filter(|&c| c < q.items.len());
+        q.repeat = repeat;
+        q.original = original.map(|order| {
+            let mut seen = vec![false; q.items.len()];
+            let valid = order.len() == q.items.len()
+                && order
+                    .iter()
+                    .all(|&p| p < seen.len() && !std::mem::replace(&mut seen[p], true));
+            if valid {
+                order.iter().map(|&p| q.items[p].id).collect()
+            } else {
+                q.items.iter().map(|i| i.id).collect()
+            }
+        });
+        q
+    }
+
+    /// While shuffled: the order from before shuffling, as indexes into `items()` (what
+    /// `restore` takes back). `None` while shuffle is off.
+    pub fn original_positions(&self) -> Option<Vec<usize>> {
+        let original = self.original.as_ref()?;
+        let at: HashMap<u64, usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(p, i)| (i.id, p))
+            .collect();
+        Some(
+            original
+                .iter()
+                .filter_map(|id| at.get(id).copied())
+                .collect(),
+        )
+    }
+
     pub fn current(&self) -> Option<&QueueItem> {
         self.current.and_then(|c| self.items.get(c))
     }
@@ -486,6 +534,41 @@ mod tests {
         assert!(!q.remove(6));
         q.add(vec![song("z")], AddAt::End);
         assert_eq!(id_of(&q, "z"), 9);
+    }
+
+    #[test]
+    fn restore_keeps_the_shuffled_and_the_original_order() {
+        let mut q = queue(8, 3);
+        q.set_shuffle(true);
+        q.set_repeat(Repeat::All);
+        q.next(false);
+        let played: Vec<SongItem> = q.items().iter().map(|i| i.song.clone()).collect();
+        let original = q.original_positions();
+        let mut back = Queue::restore(played, q.current_index(), original, q.repeat());
+        assert_eq!(vids(&back), vids(&q), "the shuffled order");
+        assert_eq!(cur(&back), cur(&q));
+        assert!(back.shuffle());
+        assert_eq!(back.repeat(), Repeat::All);
+        back.set_shuffle(false);
+        q.set_shuffle(false);
+        assert_eq!(vids(&back), vids(&q), "the original order");
+        assert_eq!(vids(&back), vids(&queue(8, 0)));
+        assert_eq!(cur(&back), cur(&q));
+        // New ids from 1, so later songs never collide with them.
+        let ids: Vec<u64> = back.items().iter().map(|i| i.id).collect();
+        assert_eq!(ids.iter().min(), Some(&1));
+        back.add(vec![song("x")], AddAt::End);
+        assert_eq!(id_of(&back, "x"), 9);
+
+        // A broken order keeps shuffle on, in the play order; a bad index means no current.
+        let b = Queue::restore(songs(3), Some(7), Some(vec![0, 0, 1]), Repeat::Off);
+        assert!(b.shuffle());
+        assert_eq!(b.original_positions(), Some(vec![0, 1, 2]));
+        assert_eq!(b.current(), None);
+        let off = Queue::restore(songs(2), Some(1), None, Repeat::One);
+        assert!(!off.shuffle());
+        assert_eq!(off.original_positions(), None);
+        assert_eq!(cur(&off).as_deref(), Some("s1"));
     }
 
     #[test]
