@@ -103,6 +103,11 @@ pub struct Saved {
     /// YouTube had no more songs for this queue: no more radio requests.
     #[serde(default)]
     pub exhausted: bool,
+    /// `continuation` is the next page of the radio the engine started itself after the
+    /// queue's own songs ran out, so the songs it brings after a restart are still marked
+    /// `radio`. Files written before have no such key and load with `false`.
+    #[serde(default)]
+    pub continuation_radio: bool,
     /// When this was written (seconds since 1970).
     pub saved_unix: u64,
 }
@@ -122,6 +127,7 @@ impl Default for Saved {
             source_playlist: None,
             continuation: None,
             exhausted: false,
+            continuation_radio: false,
             saved_unix: 0,
         }
     }
@@ -218,6 +224,7 @@ fn fit(saved: &Saved, cap: u64) -> Saved {
         source_playlist: saved.source_playlist.clone(),
         continuation: saved.continuation.clone(),
         exhausted: saved.exhausted,
+        continuation_radio: saved.continuation_radio,
         saved_unix: saved.saved_unix,
     };
     let mut total = json_len(&out) + sizes.iter().sum::<u64>();
@@ -611,6 +618,7 @@ mod tests {
             thumbnail: Some(format!("https://i.ytimg.com/vi/{v}/hq.jpg")),
             length_seconds: 200,
             playlist_id: Some("OLAK5uy_abc".into()),
+            radio: false,
         }
     }
 
@@ -1038,6 +1046,7 @@ mod tests {
             thumbnail: Some(format!("{host}{}", "c".repeat(MAX_TEXT - host.len()))),
             length_seconds: 200,
             playlist_id: Some(text('d')),
+            radio: false,
         }
     }
 
@@ -1153,5 +1162,37 @@ mod tests {
             let s2: Step2Song = serde_json::from_value(song.clone()).unwrap();
             assert_eq!(s2.album.as_deref(), Some("Album"));
         }
+    }
+
+    /// A song the engine's own radio brought keeps its `radio` mark across a restart, and so
+    /// does "the next page is that radio's" (`continuation_radio`). Files written before have
+    /// neither key and load unmarked; a song without the mark writes no key, so those files
+    /// and this one differ only where a mark is.
+    #[test]
+    fn radio_marks_are_saved_and_files_without_them_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = saved_of("AB", 1);
+        s.queue[1].radio = true;
+        s.continuation_radio = true;
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()), Some(s.clone()));
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert_eq!(text.matches("\"radio\":true").count(), 1, "{text}");
+        assert!(!text.contains("\"radio\":false"), "{text}");
+
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        old["queue"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("radio")
+            .unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("continuation_radio")
+            .unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), old.to_string()).unwrap();
+        let back = load(dir.path()).expect("an older file loads");
+        assert!(back.queue.iter().all(|i| !i.radio));
+        assert!(!back.continuation_radio);
     }
 }

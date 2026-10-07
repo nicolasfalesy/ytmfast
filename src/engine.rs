@@ -584,6 +584,12 @@ pub struct Engine {
     continuation: Option<String>,
     /// YouTube has no more songs for this queue: no more radio requests until a new queue.
     exhausted: bool,
+    /// `continuation` is the next page of a radio the engine started itself (once the queue's
+    /// own songs ran out), not of the list the user played: its songs get `SongItem::radio`.
+    continuation_radio: bool,
+    /// Whether the refill on its way (`refilling`) brings radio songs: fixed when it is asked
+    /// for, since `continuation` may change before it lands.
+    refill_radio: bool,
     /// The queue ran out while more songs were on the way: the next one plays when they come.
     waiting: bool,
     /// Stopped because the queue ran out (not by an error).
@@ -730,6 +736,8 @@ impl Engine {
             refilling: None,
             continuation: None,
             exhausted: false,
+            continuation_radio: false,
+            refill_radio: false,
             waiting: false,
             at_end: false,
             skip_streak: 0,
@@ -784,6 +792,7 @@ impl Engine {
         self.source_playlist = saved.source_playlist;
         self.continuation = saved.continuation;
         self.exhausted = saved.exhausted;
+        self.continuation_radio = saved.continuation_radio;
         let volume = if saved.volume.is_finite() {
             saved.volume.clamp(0.0, 1.0)
         } else {
@@ -1140,6 +1149,7 @@ impl Engine {
         self.pending = None;
         self.continuation = None;
         self.exhausted = false;
+        self.continuation_radio = false;
         self.waiting = false;
         self.at_end = false;
         self.skip_streak = 0;
@@ -1369,8 +1379,13 @@ impl Engine {
     /// More radio songs for the end of the queue arrived (or failed).
     fn on_refill(&mut self, result: Result<NextPage, Error>) {
         match result {
-            Ok(page) => {
+            Ok(mut page) => {
                 self.continuation = page.continuation;
+                // The page's next page is the same source's: the engine's radio stays radio.
+                self.continuation_radio = self.refill_radio;
+                for song in &mut page.items {
+                    song.radio = self.refill_radio;
+                }
                 let added = self.queue.append_radio(page.items);
                 if added == 0 {
                     // Nothing new (radio pages overlap): asking again could loop.
@@ -1424,6 +1439,10 @@ impl Engine {
         let Some(last) = self.queue.items().last() else {
             return;
         };
+        // The list's own next page brings its own songs; the radio of the last song (or that
+        // radio's next page) brings radio songs, which the widget shows after its "Autoplay"
+        // divider, as YouTube Music shows its autoplay picks after the queue.
+        self.refill_radio = self.continuation.is_none() || self.continuation_radio;
         let req = match &self.continuation {
             Some(c) => NextRequest {
                 continuation: Some(c.clone()),
@@ -2645,6 +2664,7 @@ impl Engine {
             source_playlist: self.source_playlist.clone(),
             continuation: self.continuation.clone(),
             exhausted: self.exhausted,
+            continuation_radio: self.continuation_radio,
             saved_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
@@ -3344,6 +3364,7 @@ mod tests {
             thumbnail: Some(format!("https://i.ytimg.com/{c}.jpg")),
             length_seconds: 2,
             playlist_id: None,
+            radio: false,
         }
     }
 
@@ -4516,6 +4537,126 @@ mod tests {
                     ..NextRequest::default()
                 },
             ]
+        );
+    }
+
+    /// The songs of the radio the engine starts once a list runs out are marked `radio`, and
+    /// so are that radio's next pages; the list's own songs (its next pages too) are not. The
+    /// widget's "Autoplay" divider goes before the first marked one.
+    #[tokio::test]
+    async fn songs_from_the_engines_own_radio_are_marked() {
+        let mut r = rig(Setup {
+            pages: vec![
+                ok("PLlist", 0, "AB", Some("LIST2")),
+                // The list's own second page.
+                ok("LIST2", 0, "C", None),
+                // Then the radio of its last song, and that radio's next page.
+                ok(&radio_of('C'), 0, "CD", Some("RAD2")),
+                ok("RAD2", 0, "E", None),
+            ],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let radio = |q: &QueueView| -> Vec<(String, bool)> {
+            q.items
+                .iter()
+                .map(|i| (i.song.video_id[..1].to_string(), i.song.radio))
+                .collect()
+        };
+        let want = |s: &[(&str, bool)]| -> Vec<(String, bool)> {
+            s.iter().map(|(v, b)| ((*v).to_string(), *b)).collect()
+        };
+        let mut q = r.queue().await;
+        for skip in 0..6 {
+            if q.items.len() == 5 {
+                break;
+            }
+            // Each step plays on, so the queue asks for its next page.
+            if skip < 4 {
+                r.send(EngineCmd::Next).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            q = r.queue().await;
+        }
+        assert_eq!(
+            radio(&q),
+            want(&[
+                ("A", false),
+                ("B", false),
+                ("C", false),
+                ("D", true),
+                ("E", true)
+            ])
+        );
+    }
+
+    /// A lone song's radio is the queue the user asked for (YouTube Music shows it as the
+    /// queue, with no Autoplay divider): its songs are not marked.
+    #[tokio::test]
+    async fn a_lone_songs_radio_is_not_marked() {
+        let mut r = rig(Setup {
+            pages: vec![ok(&radio_of('A'), 0, "ABC", Some("RAD2"))],
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        let q = loop {
+            let q = r.until_queue().await;
+            if q.items.len() == 3 {
+                break q;
+            }
+        };
+        assert!(q.items.iter().all(|i| !i.song.radio), "{q:?}");
+    }
+
+    /// A radio the engine started keeps marking its songs after a restart: its next page is
+    /// still that radio's.
+    #[tokio::test]
+    async fn a_resumed_engine_radio_keeps_marking() {
+        let saved = Saved {
+            queue: vec![
+                song('A'),
+                SongItem {
+                    radio: true,
+                    ..song('B')
+                },
+            ],
+            source_playlist: Some("PLlist".into()),
+            continuation: Some("RAD9".into()),
+            continuation_radio: true,
+            ..Saved::default()
+        };
+        let (writer, saves) = recorder();
+        let mut r = rig(Setup {
+            pages: vec![ok("RAD9", 0, "CD", Some("RAD10"))],
+            saved: Some(saved),
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        let q = r.queue().await;
+        assert!(q.items[1].song.radio, "kept from state.json");
+        r.send(EngineCmd::Toggle).await;
+        r.until(PlayState::Playing).await;
+        let t = std::time::Instant::now();
+        let q = loop {
+            let q = r.queue().await;
+            if q.items.len() == 4 || t.elapsed() > Duration::from_secs(3) {
+                break q;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let marks: Vec<bool> = q.items.iter().map(|i| i.song.radio).collect();
+        assert_eq!(marks, [false, true, true, true]);
+        // And it is saved that way (the queue change was saved; the radio's page was its last).
+        let n = saves_settle(&saves, 1);
+        let last = saves.lock().unwrap()[n - 1].clone();
+        assert!(last.continuation_radio);
+        assert_eq!(
+            last.queue.iter().map(|s| s.radio).collect::<Vec<_>>(),
+            [false, true, true, true]
         );
     }
 

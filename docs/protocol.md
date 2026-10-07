@@ -52,6 +52,7 @@ failing) arrives as events.
 | `repeat`       | `mode`: `"off"`, `"all"` or `"one"`                     | `{}`                        |
 | `like`         | `status`: `"like"`, `"dislike"` or `"none"`; `videoId` (optional) | `{}`, once YouTube took it |
 | `mute`         | `on`: `true` or `false`                                 | `{}`                        |
+| `watch`        | `queue`: `true` or `false`                              | `{}`                        |
 | `quit`         | none                                                    | `{}`, then the engine stops |
 | `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
@@ -102,7 +103,7 @@ song even after the queue changes around it.
 ```json
 {"id": 3, "cmd": "queue.add", "args": {"at": "next", "songs": [
   {"videoId": "dQw4w9WgXcQ", "title": "...", "artists": ["..."], "album": "...",
-   "thumbnail": "https://...", "lengthSeconds": 213}]}}
+   "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213}]}}
 {"id": 4, "cmd": "queue.add", "args": {"videoIds": ["dQw4w9WgXcQ"]}}
 ```
 
@@ -110,6 +111,9 @@ song even after the queue changes around it.
   `album` and each artist are at most 4 KiB, with at most 20 `artists`; longer is a
   `bad_request`. A `thumbnail` that isn't an https link on YouTube's or Google's image hosts
   is dropped (the song is still added). `lengthSeconds` is a whole number from 0 up.
+  `albumId` is the song's album `browseId` (for the cover click), checked as a `browseId`
+  is (see Browsing); a malformed one is taken as `""` (no album), and the song is still
+  added.
 - With `videoIds`, the songs join without details; the engine fills them in when they play.
 - `at` is `"next"` (right after the current song) or `"end"` (the default). While shuffle
   is on, `"end"` songs are shuffled into the songs still to come (they go at the end of the
@@ -321,7 +325,8 @@ never hold what was sent, a link or a token.
 
 ## Events
 
-Events have no `id`. Every connected client gets every event.
+Events have no `id`. Every connected client gets every event, except `queue` events for a
+client that turned them off (see `watch` below).
 
 The state, on every change (and as the `status` reply's data, without `"event"`):
 
@@ -340,8 +345,8 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
 - `album` is the current song's album, from its queue item; `null` when it has none.
 - `albumId` is that album's `browseId` (`MPREb_...`), from the same queue item, for opening
   the album with `browse` (the cover, clicked). It is a string, `""` when there is none: a
-  song with no album link (a user upload), one added with `queue.add` (which takes no album
-  id), or nothing current. It is checked as a `browseId` is (see Browsing); a malformed one
+  song with no album link (a user upload), one added with `queue.add` without an `albumId`,
+  or nothing current. It is checked as a `browseId` is (see Browsing); a malformed one
   is `""`.
 - `queueId` is the current song's id in the queue; `null` when there is none.
 - `position` is in seconds; `volume` is a percent. `shuffle` and `repeat` are as in the
@@ -372,7 +377,9 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
 ```json
 {"event": "queue", "items": [
   {"queueId": 7, "videoId": "dQw4w9WgXcQ", "title": "...", "artists": ["..."],
-   "album": "...", "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213}],
+   "album": "...", "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213},
+  {"queueId": 8, "videoId": "...", "title": "...", "artists": ["..."], "album": null,
+   "albumId": "", "thumbnail": "https://...", "lengthSeconds": 187, "radio": true}],
  "currentId": 7, "shuffle": false, "repeat": "off"}
 ```
 
@@ -380,6 +387,11 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
 - A song added by id alone has `title`, `album`, `thumbnail` and `lengthSeconds` `null`
   and `artists` empty, until it plays.
 - `albumId` is as in the state: the song's album `browseId`, or `""` (never `null`).
+- `radio: true` marks a song from the radio the engine starts by itself once the queue's own
+  songs run out (the radio of the last song, and that radio's next pages): a widget's
+  "Autoplay" divider goes before the first one. Other songs have no `radio` key, including
+  the songs of a radio the user started (a song played by `videoId` alone, or a radio
+  playlist): that radio is the queue itself. The mark is kept across a restart.
 - `currentId` is the current song's `queueId`; `null` when there is none (songs added to
   an empty queue wait for `queue.jump`, `next` or `play`).
 - The whole queue comes every time. The queue holds at most 1,000 songs, so with
@@ -399,10 +411,21 @@ where it was: a playing song plays on (`stopped`, then `buffering`, then `playin
 one stays paused there (`stopped`, `buffering`, `paused`). It does this once per play; a
 second restart in the same song leaves it stopped.
 
+### Choosing events: watch
+
+`watch` with `{"queue": false}` stops `queue` events to this client; every other event still
+comes, and other clients are not affected. `{"queue": true}` turns them back on (they are on
+when a client connects): the reply is followed at once by a `queue` event with the queue as
+it is now, so nothing changed while they were off is missed. Turning them on while on sends
+nothing extra. A bar that shows only the song can leave them off, and turn them on while its
+panel shows the queue: a 1,000-song queue is about 400 KB of JSON on every change.
+`queue.get` answers as always, whatever the setting.
+
 ## Connections
 
 - A client that falls behind on events gets a fresh `state` event and a fresh `queue`
-  event in place of the ones it missed.
+  event (without the `queue` event while it has them off, see `watch`) in place of the ones
+  it missed.
 - A client that stops reading altogether is disconnected once its outgoing queue fills
   (256 lines or 4 MiB, whichever comes first), so it can never hold up the engine or other
   clients, nor much memory.

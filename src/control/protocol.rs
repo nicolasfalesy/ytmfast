@@ -117,6 +117,11 @@ pub enum Request {
     Lyrics {
         video_id: String,
     },
+    /// Which events this client gets: `queue: false` stops its `queue` events (on by
+    /// default). Handled by the client's own task, not the engine (`control::client`).
+    Watch {
+        queue: bool,
+    },
     Quit,
 }
 
@@ -184,6 +189,7 @@ impl Request {
                             "title": s.title,
                             "artists": s.artists,
                             "album": s.album,
+                            "albumId": s.album_id,
                             "thumbnail": s.thumbnail,
                             "lengthSeconds": s.length_seconds,
                         })
@@ -210,6 +216,7 @@ impl Request {
             }
             Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
             Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
+            Request::Watch { queue } => ("watch", Some(json!({ "queue": queue }))),
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -438,6 +445,12 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 _ => return Err(VIDEO_ID_RULE),
             },
         },
+        "watch" => Request::Watch {
+            queue: args
+                .get("queue")
+                .and_then(Value::as_bool)
+                .ok_or("queue must be true or false")?,
+        },
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
@@ -595,6 +608,14 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
             .filter(|s| s.len() <= MAX_TEXT),
         Some(_) => return Err("thumbnail must be a link"),
     };
+    // The album link, for the cover click on a queued song. Shape-checked as every browse id
+    // is (`browse::id_ok`, as `next`'s byline links are); a malformed one, or anything that is
+    // not a string, is "" (no album), never a refused song: as for a thumbnail, the song
+    // itself is still good, and "" is what a song with no album link has anyway.
+    let album_id = match field(song, "albumId") {
+        Some(Value::String(s)) if id_ok(s) => s.clone(),
+        _ => String::new(),
+    };
     let length_seconds = match field(song, "lengthSeconds") {
         None => 0,
         Some(v) => v
@@ -607,10 +628,12 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         title,
         artists,
         album,
-        album_id: String::new(),
+        album_id,
         thumbnail,
         length_seconds,
         playlist_id: None,
+        // A client's song is the user's own pick, never the engine's radio.
+        radio: false,
     })
 }
 
@@ -735,6 +758,10 @@ struct WireItem<'a> {
     thumbnail: Option<&'a str>,
     /// Null when unknown (0), as in a state.
     length_seconds: Option<u32>,
+    /// `true` for a song the engine's own radio brought (`SongItem::radio`); left out
+    /// otherwise, so a queue line grows only where the widget's "Autoplay" divider needs it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    radio: bool,
 }
 
 /// The `queue` event's fields; `event` is left out for the `queue.get` reply.
@@ -770,6 +797,7 @@ impl<'a> WireQueue<'a> {
                     album_id: &i.song.album_id,
                     thumbnail: i.song.thumbnail.as_deref(),
                     length_seconds: Some(i.song.length_seconds).filter(|s| *s > 0),
+                    radio: i.song.radio,
                 })
                 .collect(),
             current_id,
@@ -860,6 +888,7 @@ mod tests {
             thumbnail: Some("https://lh3.googleusercontent.com/x=w544-h544".into()),
             length_seconds: 213,
             playlist_id: None,
+            radio: false,
         }
     }
 
@@ -943,6 +972,13 @@ mod tests {
                 songs: vec![song("BBBBBBBBBBB")],
                 at: AddAt::End,
             },
+            Request::QueueAdd {
+                songs: vec![SongItem {
+                    album_id: "MPREb_abc".into(),
+                    ..song("CCCCCCCCCCC")
+                }],
+                at: AddAt::End,
+            },
             Request::QueueRemove { id: 4 },
             Request::QueueJump { id: u64::MAX },
             Request::QueueMove { id: 2, index: 0 },
@@ -968,6 +1004,8 @@ mod tests {
             Request::Lyrics {
                 video_id: "dQw4w9WgXcQ".into(),
             },
+            Request::Watch { queue: false },
+            Request::Watch { queue: true },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {
@@ -1320,6 +1358,49 @@ mod tests {
     }
 
     #[test]
+    fn added_songs_keep_a_well_formed_album_id() {
+        // The cover click opens the album (`albumId`), for songs added to the queue too.
+        let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ", "albumId": "MPREb_abc-_9"}));
+        assert_eq!(song.unwrap().album_id, "MPREb_abc-_9");
+        // Checked as a browseId is everywhere (`browse::id_ok`): a malformed one is "", as in
+        // a state, and never refuses the song (it is only a link, the song is still good).
+        for bad in [
+            json!("../MPREb"),
+            json!("x"),
+            json!("x".repeat(129)),
+            json!(""),
+            json!(5),
+            json!(null),
+        ] {
+            let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ", "albumId": bad}));
+            assert_eq!(song.unwrap().album_id, "", "{bad}");
+        }
+    }
+
+    #[test]
+    fn watch_parses_and_says_what_is_wrong() {
+        assert_eq!(
+            parse(r#"{"id":1,"cmd":"watch","args":{"queue":false}}"#),
+            Ok((1, Request::Watch { queue: false }))
+        );
+        assert_eq!(
+            parse(r#"{"id":2,"cmd":"watch","args":{"queue":true}}"#),
+            Ok((2, Request::Watch { queue: true }))
+        );
+        for args in [json!({}), json!({"queue": "no"}), json!({"queue": 0})] {
+            let line = json!({"id": 3, "cmd": "watch", "args": args}).to_string();
+            assert_eq!(
+                bad(&line),
+                BadRequest {
+                    id: Some(3),
+                    message: "queue must be true or false".into()
+                },
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn added_songs_lose_the_topic_suffix() {
         // A widget's song can carry an artist straight from a channel name (a browse row's
         // byline); the queue, its status and state.json keep the artist alone.
@@ -1344,6 +1425,13 @@ mod tests {
                 },
             ),
             item(2, bare("AAAAAAAAAAA")),
+            item(
+                3,
+                SongItem {
+                    radio: true,
+                    ..bare("BBBBBBBBBBB")
+                },
+            ),
         ]
         .into();
         let event = EngineEvent::Queue {
@@ -1363,7 +1451,12 @@ mod tests {
                         "lengthSeconds": 213},
                        // A bare id: details are null until the song plays; no album id is "".
                        {"queueId": 2, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]})
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null},
+                       // A song the engine's own radio brought: `radio: true`; the others
+                       // carry no such key.
+                       {"queueId": 3, "videoId": "BBBBBBBBBBB", "title": null, "artists": [],
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null,
+                        "radio": true}]})
         );
         // `queue.get`'s data is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1413,6 +1506,7 @@ mod tests {
                         )),
                         length_seconds: 245,
                         playlist_id: Some("OLAK5uy_abcdefghijklmnopqrstuvwxyz0123456".into()),
+                        radio: false,
                     },
                 )
             })

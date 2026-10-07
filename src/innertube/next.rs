@@ -84,6 +84,13 @@ pub struct SongItem {
     pub length_seconds: u32,
     /// The playlist this item was queued from (its watch endpoint's `playlistId`).
     pub playlist_id: Option<String>,
+    /// Brought by the radio the engine starts itself once the queue's own songs run out (and
+    /// by that radio's next pages): the widget's "Autoplay" divider goes before the first
+    /// such song. YouTube's answers never set it; the engine marks a refill's songs. Kept in
+    /// `state.json` so the divider stays put across a restart; `serde(default)` loads files
+    /// written before, and an unmarked song writes no key, so those files read the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub radio: bool,
 }
 
 /// An artist name without the `" - Topic"` suffix of YouTube's auto-generated artist channels.
@@ -467,6 +474,7 @@ fn song(v: RawVideo) -> Option<SongItem> {
         thumbnail: v.thumbnail.and_then(widest_thumbnail),
         length_seconds: v.length_text.map(|t| parse_length(&t.text())).unwrap_or(0),
         playlist_id,
+        radio: false,
     })
 }
 

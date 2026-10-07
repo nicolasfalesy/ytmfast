@@ -175,6 +175,7 @@ fn full_song(id: &str) -> SongItem {
         thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
         length_seconds: 213,
         playlist_id: None,
+        radio: false,
     }
 }
 
@@ -1081,4 +1082,84 @@ async fn like_with_nothing_playing_needs_an_id_and_mute_shows_in_the_state() {
     let v = c.reply(4).await;
     assert_eq!(v["data"]["muted"], true);
     assert_eq!(v["data"]["volume"], 40);
+}
+
+/// `watch {"queue": false}` stops `queue` events to that client alone; every other event
+/// still reaches it, and the other clients get everything. Turning them back on sends the
+/// queue as it is now, so the client never misses a change made while they were off.
+#[tokio::test]
+async fn watch_turns_queue_events_off_for_one_client() {
+    let f = fake_engine(paused_status(SONG));
+    let mut quiet = connect(&f.path).await;
+    let mut other = connect(&f.path).await;
+    quiet
+        .send(r#"{"id":1,"cmd":"watch","args":{"queue":false}}"#)
+        .await;
+    assert_eq!(
+        quiet.reply(1).await,
+        json!({"id": 1, "ok": true, "data": {}})
+    );
+    other.send(r#"{"id":1,"cmd":"status"}"#).await;
+    other.reply(1).await;
+    let queue = fake_queue();
+    let _ = f.events.send(EngineEvent::Queue {
+        items: queue.items.clone(),
+        current_id: queue.current_id,
+        shuffle: queue.shuffle,
+        repeat: queue.repeat,
+    });
+    let _ = f.events.send(EngineEvent::Position {
+        seconds: 4.0,
+        seeked: false,
+    });
+    assert_eq!(other.next().await.unwrap()["event"], "queue");
+    assert_eq!(other.next().await.unwrap()["event"], "position");
+    // The queue event never comes: the position one is next.
+    assert_eq!(
+        quiet.next().await.unwrap(),
+        json!({"event": "position", "seconds": 4.0, "seeked": false})
+    );
+    // A missed-events catch-up leaves the queue out too, the state still comes.
+    for i in 0..200 {
+        let _ = f.events.send(EngineEvent::Position {
+            seconds: f64::from(i),
+            seeked: false,
+        });
+    }
+    quiet
+        .send(r#"{"id":2,"cmd":"watch","args":{"queue":true}}"#)
+        .await;
+    let mut saw_state = false;
+    let fresh = loop {
+        let v = quiet.next().await.unwrap();
+        assert_ne!(v["event"], "queue", "no queue before watching again: {v}");
+        saw_state |= v["event"] == "state";
+        if v.get("id") == Some(&json!(2)) {
+            assert_eq!(v, json!({"id": 2, "ok": true, "data": {}}));
+            break quiet.next().await.unwrap();
+        }
+    };
+    assert!(saw_state, "the catch-up's state still came");
+    // On again: the queue as it is now, at once.
+    assert_eq!(fresh["event"], "queue");
+    assert_eq!(fresh["currentId"], 3);
+    // And later queue events come as before.
+    let _ = f.events.send(EngineEvent::Queue {
+        items: queue.items.clone(),
+        current_id: None,
+        shuffle: false,
+        repeat: Repeat::Off,
+    });
+    assert_eq!(quiet.event("queue").await["currentId"], Value::Null);
+    // Turning it on while on sends nothing extra.
+    quiet
+        .send(r#"{"id":3,"cmd":"watch","args":{"queue":true}}"#)
+        .await;
+    quiet.reply(3).await;
+    let _ = f.events.send(EngineEvent::Position {
+        seconds: 9.0,
+        seeked: false,
+    });
+    assert_eq!(quiet.next().await.unwrap()["event"], "position");
+    f.serve.abort();
 }

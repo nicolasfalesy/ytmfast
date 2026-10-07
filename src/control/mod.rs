@@ -375,19 +375,26 @@ async fn query_queue(cmds: &mpsc::Sender<EngineCmd>) -> Option<QueueView> {
 }
 
 /// What a client that fell behind may have missed: the state, and the queue (a missed
-/// queue event would leave a widget's list wrong until the next change). One line each.
-async fn catch_up(cmds: &mpsc::Sender<EngineCmd>) -> Option<[String; 2]> {
+/// queue event would leave a widget's list wrong until the next change) when it watches the
+/// queue (`with_queue`). One line each.
+async fn catch_up(cmds: &mpsc::Sender<EngineCmd>, with_queue: bool) -> Option<Vec<String>> {
     let status = query_status(cmds).await?;
+    let mut lines = vec![protocol::event_line(&EngineEvent::State(status))];
+    if with_queue {
+        lines.push(queue_line(cmds).await?);
+    }
+    Some(lines)
+}
+
+/// The queue as it is now, as a `queue` event line.
+async fn queue_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
     let queue = query_queue(cmds).await?;
-    Some([
-        protocol::event_line(&EngineEvent::State(status)),
-        protocol::event_line(&EngineEvent::Queue {
-            items: queue.items,
-            current_id: queue.current_id,
-            shuffle: queue.shuffle,
-            repeat: queue.repeat,
-        }),
-    ])
+    Some(protocol::event_line(&EngineEvent::Queue {
+        items: queue.items,
+        current_id: queue.current_id,
+        shuffle: queue.shuffle,
+        repeat: queue.repeat,
+    }))
 }
 
 /// How a client's connection ends.
@@ -416,6 +423,9 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     let mut asking: HashMap<task::Id, u64> = HashMap::new();
     // False once the client closed its sending side: its browsing answers still go out.
     let mut reading = true;
+    // `watch {"queue": false}` turns this off: a bar that never shows the queue then skips
+    // its events, each up to about 400 KB of JSON for a 1,000-song queue, parsed in the shell.
+    let mut watch_queue = true;
 
     let close = loop {
         tokio::select! {
@@ -429,6 +439,26 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                         Handled::Quit(reply) => {
                             quit = true;
                             reply
+                        }
+                        Handled::Watch(id, on) => {
+                            let was = std::mem::replace(&mut watch_queue, on);
+                            if !push(&out, protocol::ok_reply(id, json!({}))) {
+                                break Close::Now;
+                            }
+                            // Back on: the queue as it is now, right after the reply, so a
+                            // change made while it was off is never missed (and the widget
+                            // needs no `queue.get` of its own).
+                            if on && !was {
+                                match queue_line(&shared.cmds).await {
+                                    Some(line) => {
+                                        if !push(&out, line) {
+                                            break Close::Now;
+                                        }
+                                    }
+                                    None => break Close::Flush,
+                                }
+                            }
+                            continue;
                         }
                         Handled::Browse(id, request, epoch) => {
                             if browsing.len() >= MAX_BROWSING {
@@ -486,9 +516,11 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                 // A big queue goes through the same bounded queue as everything else: a
                 // client that stopped reading is still dropped, never waited on.
                 let pushed = match event {
+                    // Not watching the queue: its events are skipped, never even serialized.
+                    Ok(EngineEvent::Queue { .. }) if !watch_queue => true,
                     Ok(e) => push(&out, protocol::event_line(&e)),
                     // It missed some events: a fresh state and queue cover them.
-                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds).await {
+                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds, watch_queue).await {
                         Some(lines) => lines.into_iter().all(|l| push(&out, l)),
                         None => break Close::Flush,
                     },
@@ -562,6 +594,9 @@ enum Handled {
     /// A browsing request (or a `like`), answered from a task of its own (`answer`). For
     /// `playPage`, the engine's play epoch when it came in (ruling P7).
     Browse(u64, Request, Option<u64>),
+    /// `watch`: the request id, and whether this client now gets `queue` events. Per client,
+    /// so the client's own task keeps it.
+    Watch(u64, bool),
 }
 
 /// One request.
@@ -590,6 +625,7 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
             });
         }
         Request::Quit => return Handled::Quit(protocol::ok_reply(id, json!({}))),
+        Request::Watch { queue } => return Handled::Watch(id, queue),
         // Read now, in this client's command order (through the engine's channel): any play
         // the user makes after this, from anywhere, wins over the page's (ruling P7).
         request @ Request::PlayPage { .. } => {
