@@ -7,6 +7,7 @@ pub mod control;
 pub mod engine;
 pub mod error;
 pub mod innertube;
+pub mod lyrics;
 pub mod mpris;
 pub mod net;
 pub mod paths;

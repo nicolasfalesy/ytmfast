@@ -1,0 +1,38 @@
+{
+ "song": {
+  "title": "星の手紙",
+  "artist": "架空のバンド",
+  "album": "",
+  "songDuration": 241,
+  "videoId": "fakeVidja_w"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=%E6%9E%B6%E7%A9%BA%E3%81%AE%E3%83%90%E3%83%B3%E3%83%89%20-%20%E6%98%9F%E3%81%AE%E6%89%8B%E7%B4%99&duration=241000&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": [
+     {
+      "id": 7001,
+      "accesskey": "JA77",
+      "song": "星の手紙",
+      "singer": "架空のバンド",
+      "duration": 240500
+     }
+    ]
+   }
+  },
+  "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=7001&accesskey=JA77": {
+   "json": {
+    "status": 200,
+    "content": "a3JjMTidNCaVfLYHReui3cGP1sWJewnWk+fB3ekCI6RFwKRCiJxkTJ6q/IPZPSIyiuUArQR2e2Bg0LMTwSuOzVPLRtzLsf0MOfxJoCfMwLAGd4JMcjwXNFeVHihrH2b25PHHjkJjuMevrwEtCG0vAcaIpQzKpTrellDJE5aMcYi6aIi/ZWtZspKM5zY8gYC8geDthSxcBUoBfLKkNTPKaSnEoG/iAGmml9iMoVwyY8E5LHMLfrQ7+B4rNum5dz6F33JBKSNGu3YYI0YO5FM8NTl3qH73h8OIygspM2pr0esMF4UMeNNxSSv44R5k1daGwQ7xUTl9YKQ54bts4Uq45K4629PoxUTbvx5tnkGL4HDR1oxYf3WWJOos9KUB61HfJrNpwWmJE64zRfUdKbv7gxm+xKHm+1ptwJj4gR3cLZWWlOpDekcPVdL8V+zJAhMx/F7Roakj1DcQ8zgYJ+KKa0m2cC9acXGxCsWNnzqrkIE+V9w97QjELi058dVXtJkAI+da2Zg7L83E8auKt71ApuffrW6zP4xU0tPBfLDmLslFAcw="
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=%E6%9E%B6%E7%A9%BA%E3%81%AE%E3%83%90%E3%83%B3%E3%83%89&track_name=%E6%98%9F%E3%81%AE%E6%89%8B%E7%B4%99&duration=241": {
+   "status": 404
+  },
+  "https://lrclib.net/api/search?track_name=%E6%98%9F%E3%81%AE%E6%89%8B%E7%B4%99&artist_name=%E6%9E%B6%E7%A9%BA%E3%81%AE%E3%83%90%E3%83%B3%E3%83%89": {
+   "json": []
+  }
+ },
+ "youtube": "none"
+}

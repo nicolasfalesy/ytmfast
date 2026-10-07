@@ -27,7 +27,11 @@ The power figure is step 1's (when the engine used 31.5 MB and 0.51% CPU); it wa
 Step 3 did not change how songs play, so these are step 2's figures; its own (page load times, and memory while
 browsing) are in the benchmarks file.
 
-Coming next: **step 4, the widget.** The Omarchy bar widget switches to the engine.
+Coming next: **step 4, the widget.** The Omarchy bar widget switches to the engine. Its engine side is under way:
+lyrics are now timed, word by word from KuGou and line by line from LRCLIB (both free, keyless services), with
+YouTube Music's own plain lyrics after them. Those requests go only to `lrclib.net`, `krcs.kugou.com` and
+`lyrics.kugou.com`, over https, and carry only the song's title, artists, album and length; everything else the
+engine sends goes to YouTube and Google alone. See [docs/protocol.md](docs/protocol.md) (`lyrics`).
 
 ## Resume and history
 

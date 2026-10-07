@@ -188,6 +188,13 @@ pub enum EngineCmd {
         video_id: String,
         next: SongNext,
     },
+    /// What the lyrics services are told of a song (its title, artists, album and length):
+    /// the shown song's as the state has them, else a queued song's from its item. `None` for
+    /// a song the engine doesn't have, which then gets YouTube Music's lyrics only.
+    LyricsSong {
+        video_id: String,
+        reply: oneshot::Sender<Option<crate::lyrics::SongFacts>>,
+    },
     Quit,
 }
 
@@ -1012,6 +1019,10 @@ impl Engine {
             // Neither changes what plays: no preload check below.
             EngineCmd::LyricsTab { video_id, reply } => {
                 let _ = reply.send(self.likes.tab(&video_id));
+                return;
+            }
+            EngineCmd::LyricsSong { video_id, reply } => {
+                let _ = reply.send(self.lyrics_song(&video_id));
                 return;
             }
             EngineCmd::LearnSong { video_id, next } => {
@@ -2612,6 +2623,34 @@ impl Engine {
             self.dirty = true;
         }
         self.emit(EngineEvent::State(status));
+    }
+
+    /// A song's details for the lyrics services (`EngineCmd::LyricsSong`). The shown song's
+    /// come from the state (filled from its link once resolved, for a song queued by id
+    /// alone); any other queued song's from its queue item, when it has a title.
+    fn lyrics_song(&self, video_id: &str) -> Option<crate::lyrics::SongFacts> {
+        if self.status.video_id.as_deref() == Some(video_id)
+            && let Some(meta) = self.status.meta.as_ref().filter(|m| !m.title.is_empty())
+        {
+            return Some(crate::lyrics::SongFacts {
+                title: meta.title.clone(),
+                artist: meta.artist.clone(),
+                album: self.status.album.clone(),
+                length_seconds: meta.length_seconds,
+            });
+        }
+        let item = self
+            .queue
+            .items()
+            .iter()
+            .find(|i| i.song.video_id == video_id && !i.song.title.is_empty())?;
+        Some(crate::lyrics::SongFacts {
+            title: item.song.title.clone(),
+            // As the state names them (`song_meta`).
+            artist: item.song.artists.join(", "),
+            album: item.song.album.clone(),
+            length_seconds: item.song.length_seconds,
+        })
     }
 
     /// Hands a snapshot to the writer (which writes it on its own thread).
@@ -4590,6 +4629,41 @@ mod tests {
                 ("E", true)
             ])
         );
+    }
+
+    /// What lyrics learn of a song (`EngineCmd::LyricsSong`): the shown song's details as the
+    /// state has them, any queued song's from its queue item, nothing for a song not here.
+    #[tokio::test]
+    async fn lyrics_learn_a_songs_details_from_the_state_and_the_queue() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "AB", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let ask = |id: String| {
+            let cmds = r.cmds.clone();
+            async move {
+                let (reply, rx) = oneshot::channel();
+                cmds.send(EngineCmd::LyricsSong {
+                    video_id: id,
+                    reply,
+                })
+                .await
+                .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        let facts = |c: char| crate::lyrics::SongFacts {
+            title: format!("Title {c}"),
+            artist: "One, Two".into(),
+            album: Some("Album".into()),
+            length_seconds: 2,
+        };
+        assert_eq!(ask(vid('A')).await, Some(facts('A')));
+        assert_eq!(ask(vid('B')).await, Some(facts('B')));
+        assert_eq!(ask(vid('Z')).await, None);
     }
 
     /// A lone song's radio is the queue the user asked for (YouTube Music shows it as the

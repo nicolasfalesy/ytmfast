@@ -58,7 +58,7 @@ failing) arrives as events.
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
 | `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
 | `playPage`     | `browseId`, `params` (optional)                         | `{}`, or `{"superseded": true}` |
-| `lyrics`       | `videoId`                                               | `{text, source}` or `{"none": true}` (below) |
+| `lyrics`       | `videoId`                                               | `{source, synced, words, lines}` or `{"none": true}` (below) |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -159,7 +159,7 @@ restart, as the volume is.
 ## Browsing
 
 `browse`, `search`, `more`, `playPage` and `lyrics` ask YouTube Music for pages, the ones
-the bar widget lists. They answer only the client that asked (nothing is broadcast), and they never
+the bar widget lists (`lyrics` asks KuGou and LRCLIB first, see below). They answer only the client that asked (nothing is broadcast), and they never
 start playback or change the queue, except `playPage`, whose job is to play.
 
 Each one runs on its own: a client keeps getting replies and events while a page loads, and
@@ -286,29 +286,71 @@ plays.
 
 ### lyrics
 
-`{"videoId": "dQw4w9WgXcQ"}` gives the song's lyrics as YouTube Music shows them: plain text,
-no timings.
+`{"videoId": "dQw4w9WgXcQ"}` gives the song's lyrics, timed when they can be: word by word
+from KuGou, line by line from LRCLIB, else plain text.
 
 ```json
-{"id": 8, "ok": true, "data": {"text": "First line\nSecond line\n\nChorus",
-                                 "source": "Source: Musixmatch"}}
+{"id": 8, "ok": true, "data": {"source": "KuGou", "synced": true, "words": true, "lines": [
+  {"t": 0, "text": ""},
+  {"t": 12.34, "text": "A line", "words": [
+    {"t": 12.34, "d": 0.41, "text": "A "},
+    {"t": 12.75, "d": 0.6, "text": "line", "syl": [{"t": 12.75, "d": 0.25, "n": 2},
+                                                   {"t": 13.0, "d": 0.35, "n": 2}]}]}]}}
+{"id": 9, "ok": true, "data": {"source": "Source: Musixmatch", "synced": false, "words": false,
+  "lines": [{"text": "First line"}, {"text": "Second line"}, {"text": ""}, {"text": "Chorus"}]}}
 ```
 
-- `text` is as YouTube gives it, newlines kept. It can run to a few KB; past 256 KiB it is
-  cut there, at a character's end (no real lyrics come close).
-- `source` is the line YouTube shows under them (`"Source: ..."`), or `""`.
+- `source` is `"KuGou"`, `"LRCLIB"`, or YouTube Music's own line (`"Source: ..."`, or
+  `"YouTube Music"` when it shows none).
+- `synced: true`: each line has `t`, when it starts, in seconds from the song's start (to the
+  millisecond). An empty timed line is an instrumental break (the wait before the first line
+  is one too, at 0, when that line starts more than 3 s in). `synced: false`: plain text, one
+  entry per line, no `t`; empty lines are spacing.
+- `words: true` (KuGou only): each sung line has `words`, each with `t`, its length `d` and its
+  `text`, which ends with a space when one follows it (a line is its words joined as they
+  are). Kana and CJK characters are each a word of their own; Hangul and Latin words go by
+  spaces. A word sung over two or more syllables also has `syl`: each syllable's `t`, `d` and
+  `n`, its share of the word's letters (UTF-16 units), to fill the word syllable by syllable.
+  Breaks have no `words`.
 - A song with no lyrics is `{"id": 8, "ok": true, "data": {"none": true}}`.
 
-Lyrics take two requests to YouTube: the song's `next` (whose Lyrics tab names the lyrics
-page), then that page. The engine reads the same `next` for the song playing (its queue's,
-or its like lookup's) and keeps the tab with the like status, for its last 100 songs. So
-lyrics for the song playing take one request, and a `next` made for lyrics gives the engine
-the song's like status in turn.
+Where they come from, in order (the bar widget's rules, moved into the engine unchanged):
+
+1. KuGou and LRCLIB are asked at the same time. KuGou is searched by the first artist,
+   the title (without "(feat. ...)"), and the length; only a song with the same title and
+   artist (case, accents and punctuation ignored, one inside the other allowed) and a length
+   within 3 s is taken. Its words are given LRCLIB's spelling where a line has the same words
+   (KuGou drops most punctuation); when those lines disagree on timing by more than 1.5 s,
+   KuGou timed another version of the song and its words are not used. Credit lines,
+   KuGou's notices and an opening "Artist - Title" line are left out, and evenly spread fake
+   timing counts as none. LRCLIB is asked for the exact song (artist, title, album, length),
+   else searched by title and first artist for the closest length within 3 s that has timed
+   lines.
+2. KuGou's words, else LRCLIB's timed lines, else YouTube Music's own plain lyrics, else
+   LRCLIB's plain text.
+
+The services are told the song's title, artists, album and length, nothing else. The engine
+knows these for the song playing and every queued song; for any other song (or one played by
+id, in the moment before its details arrive) only YouTube Music is asked, and that answer is
+not kept. They are reached over https only, at `krcs.kugou.com`, `lyrics.kugou.com` and
+`lrclib.net` (no other request may go to those hosts, and lyrics requests may go nowhere
+else), with no redirects followed, 8 s and 2 MiB per answer, and a KuGou answer may inflate
+to at most 1 MiB. An answer that would not fit one line (1 MiB) counts as none from that
+source.
+
+YouTube Music's lyrics take two requests: the song's `next` (whose Lyrics tab names the
+lyrics page), then that page. The engine reads the same `next` for the song playing (its
+queue's, or its like lookup's) and keeps the tab with the like status, for its last 100
+songs. So lyrics for the song playing take one request there, and a `next` made for lyrics
+gives the engine the song's like status in turn. Its text is used up to 256 KiB.
 
 The daemon keeps the last 20 answers, for every client: asking again for one of those songs
 (reopening the Lyrics tab, or another widget asking) is answered at once, with nothing sent.
-A song with no lyrics is asked about again after an hour (YouTube adds lyrics to songs
-later); found lyrics are kept while the daemon runs. A failure is never kept.
+A song with no lyrics is asked about again after an hour (lyrics are added to songs later);
+found lyrics are kept while the daemon runs. An answer found while any request on the way
+failed (no network, a timeout, a server error, an answer too big) is sent but not kept, so
+the next ask tries again. When YouTube Music's step itself fails and nothing else was found,
+the reply is that error (see Errors), not `none`.
 
 ### Errors
 

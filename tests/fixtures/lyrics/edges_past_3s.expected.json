@@ -1,0 +1,11 @@
+{
+ "res": {
+  "none": true
+ },
+ "kept": true,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=Boundary&track_name=Edge%20Case&duration=214",
+  "https://lrclib.net/api/search?track_name=Edge%20Case&artist_name=Boundary",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Boundary%20-%20Edge%20Case&duration=214000&hash="
+ ]
+}

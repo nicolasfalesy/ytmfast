@@ -1,0 +1,138 @@
+{
+ "res": {
+  "synced": true,
+  "words": true,
+  "lines": [
+   {
+    "t": 0,
+    "text": ""
+   },
+   {
+    "t": 5,
+    "e": 6.349,
+    "text": "on the very edge",
+    "words": [
+     {
+      "t": 5,
+      "e": 5.35,
+      "text": "on",
+      "gap": true,
+      "syl": [
+       {
+        "t": 5,
+        "e": 5.35,
+        "n": 2
+       }
+      ]
+     },
+     {
+      "t": 5.35,
+      "e": 5.683,
+      "text": "the",
+      "gap": true,
+      "syl": [
+       {
+        "t": 5.35,
+        "e": 5.683,
+        "n": 3
+       }
+      ]
+     },
+     {
+      "t": 5.7,
+      "e": 6.016,
+      "text": "very",
+      "gap": true,
+      "syl": [
+       {
+        "t": 5.7,
+        "e": 6.016,
+        "n": 4
+       }
+      ]
+     },
+     {
+      "t": 6.05,
+      "e": 6.349,
+      "text": "edge",
+      "gap": false,
+      "syl": [
+       {
+        "t": 6.05,
+        "e": 6.349,
+        "n": 4
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "t": 9,
+    "e": 10.349,
+    "text": "of the length rule",
+    "words": [
+     {
+      "t": 9,
+      "e": 9.35,
+      "text": "of",
+      "gap": true,
+      "syl": [
+       {
+        "t": 9,
+        "e": 9.35,
+        "n": 2
+       }
+      ]
+     },
+     {
+      "t": 9.35,
+      "e": 9.683,
+      "text": "the",
+      "gap": true,
+      "syl": [
+       {
+        "t": 9.35,
+        "e": 9.683,
+        "n": 3
+       }
+      ]
+     },
+     {
+      "t": 9.7,
+      "e": 10.016,
+      "text": "length",
+      "gap": true,
+      "syl": [
+       {
+        "t": 9.7,
+        "e": 10.016,
+        "n": 6
+       }
+      ]
+     },
+     {
+      "t": 10.05,
+      "e": 10.349,
+      "text": "rule",
+      "gap": false,
+      "syl": [
+       {
+        "t": 10.05,
+        "e": 10.349,
+        "n": 4
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "source": "KuGou"
+ },
+ "kept": true,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=Boundary&track_name=Edge%20Case&duration=214",
+  "https://lrclib.net/api/search?track_name=Edge%20Case&artist_name=Boundary",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Boundary%20-%20Edge%20Case&duration=214000&hash=",
+  "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=e1&accesskey=k1"
+ ]
+}

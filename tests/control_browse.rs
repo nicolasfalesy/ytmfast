@@ -28,6 +28,7 @@ use ytmfast::engine::{
 };
 use ytmfast::error::Error;
 use ytmfast::innertube::{MoreKind, NextPage, NextRequest, SongItem, SongNext};
+use ytmfast::lyrics::{Fetched, Found, LyricsWeb, SongFacts};
 use ytmfast::queue::Repeat;
 use ytmfast::streams::{Resolver, Stream};
 
@@ -197,7 +198,14 @@ struct Rig {
     _dir: TempDir,
 }
 
-fn rig(mut browser: FakeBrowser) -> Rig {
+/// What the engine side knows of each song for lyrics (`EngineCmd::LyricsSong`).
+type Facts = HashMap<String, SongFacts>;
+
+fn rig(browser: FakeBrowser) -> Rig {
+    rig_with(browser, Facts::new(), None)
+}
+
+fn rig_with(mut browser: FakeBrowser, facts: Facts, web: Option<Arc<dyn LyricsWeb>>) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(control::SOCKET_NAME);
     let (std, _bound) = control::bind_socket(&path).unwrap();
@@ -238,6 +246,9 @@ fn rig(mut browser: FakeBrowser) -> Rig {
                 EngineCmd::LyricsTab { video_id, reply } => {
                     let _ = reply.send(engine_known.lock().unwrap().get(&video_id).cloned());
                 }
+                EngineCmd::LyricsSong { video_id, reply } => {
+                    let _ = reply.send(facts.get(&video_id).cloned());
+                }
                 EngineCmd::LearnSong { video_id, next } => {
                     engine_known.lock().unwrap().insert(
                         video_id,
@@ -264,6 +275,7 @@ fn rig(mut browser: FakeBrowser) -> Rig {
     std::fs::write(ac.join("online"), "1\n").unwrap();
     let options = Options {
         browser: Some(Arc::new(browser)),
+        lyrics_web: web,
         power_supply_root: power,
         ..Options::default()
     };
@@ -1130,6 +1142,16 @@ fn words() -> Lyrics {
     }
 }
 
+/// YouTube Music's plain lyrics as the chain answers them.
+fn found(l: Lyrics) -> Found {
+    Found {
+        source: l.source,
+        synced: false,
+        words: false,
+        lines: ytmfast::lyrics::lrc::plain_lines(&l.text),
+    }
+}
+
 /// A browser that knows `SONG`'s Lyrics tab and its text.
 fn with_lyrics() -> FakeBrowser {
     FakeBrowser {
@@ -1150,14 +1172,15 @@ async fn lyrics_found() {
     assert_eq!(
         v,
         json!({"id": 1, "ok": true, "data": {
-            "text": "First line\nSecond line\n\nChorus",
-            "source": "Source: Musixmatch",
+            "source": "Source: Musixmatch", "synced": false, "words": false,
+            "lines": [{"text": "First line"}, {"text": "Second line"}, {"text": ""},
+                      {"text": "Chorus"}],
         }})
     );
     assert_eq!(
         serde_json::to_string(&v["data"]).unwrap(),
-        r#"{"text":"First line\nSecond line\n\nChorus","source":"Source: Musixmatch"}"#,
-        "the field order is Page.js's"
+        r#"{"source":"Source: Musixmatch","synced":false,"words":false,"lines":[{"text":"First line"},{"text":"Second line"},{"text":""},{"text":"Chorus"}]}"#,
+        "the field order is the spec's"
     );
     assert_eq!(
         r.calls(),
@@ -1350,7 +1373,7 @@ async fn lyrics_reuses_the_like_lookup_next() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let v = c.ask(3, "lyrics", json!({"videoId": SONG})).await;
-    assert_eq!(v["data"]["text"], words().text, "{v}");
+    assert_eq!(v["data"]["lines"][0]["text"], "First line", "{v}");
     assert_eq!(*calls.lock().unwrap(), [format!("lyrics {LYRICS_PAGE}")]);
 }
 
@@ -1362,6 +1385,9 @@ struct FakeTabs(Known);
 impl LyricsTabs for FakeTabs {
     async fn known(&self, video_id: &str) -> Option<KnownTab> {
         self.0.lock().unwrap().get(video_id).cloned()
+    }
+    async fn song(&self, _: &str) -> Option<SongFacts> {
+        None
     }
     async fn learn(&self, video_id: &str, next: SongNext) {
         self.0.lock().unwrap().insert(
@@ -1384,10 +1410,10 @@ async fn none_expires_after_an_hour() {
         calls: calls.clone(),
         ..with_lyrics()
     };
-    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()), None);
     let none = "AAAAAAAAAAA";
     assert_eq!(cache.get(&browser, none).await, Ok(None));
-    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(words())));
+    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(found(words()))));
     assert_eq!(calls.lock().unwrap().len(), 3);
 
     tokio::time::sleep(59 * MIN).await;
@@ -1403,7 +1429,7 @@ async fn none_expires_after_an_hour() {
     );
 
     tokio::time::sleep(5 * 60 * MIN).await;
-    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(words())));
+    assert_eq!(cache.get(&browser, SONG).await, Ok(Some(found(words()))));
     assert_eq!(calls.lock().unwrap().len(), 4, "found lyrics don't expire");
 }
 
@@ -1430,10 +1456,11 @@ async fn long_lyrics_are_cut_before_they_are_kept() {
         )]),
         ..with_lyrics()
     };
-    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()), None);
     let got = cache.get(&browser, SONG).await.unwrap().unwrap();
-    assert_eq!(got.text.len(), lyrics::MAX_TEXT - 1);
-    assert!(got.text.bytes().all(|b| b == b'a'));
+    assert_eq!(got.lines.len(), 1);
+    assert_eq!(got.lines[0].text.len(), lyrics::MAX_TEXT - 1);
+    assert!(got.lines[0].text.bytes().all(|b| b == b'a'));
     assert_eq!(got.source, "Source: Musixmatch");
     assert_eq!(cache.get(&browser, SONG).await, Ok(Some(got)));
     assert_eq!(
@@ -1453,7 +1480,140 @@ async fn long_lyrics_are_cut_before_they_are_kept() {
         )]),
         ..with_lyrics()
     };
-    let cache = LyricsCache::new(Arc::new(FakeTabs::default()));
+    let cache = LyricsCache::new(Arc::new(FakeTabs::default()), None);
     let got = cache.get(&browser, SONG).await.unwrap().unwrap();
-    assert_eq!(got.text.len(), lyrics::MAX_TEXT);
+    assert_eq!(got.lines[0].text.len(), lyrics::MAX_TEXT);
+    // No "Source: …" line: YouTube Music's own name.
+    assert_eq!(got.source, "YouTube Music");
+}
+
+/// The lyrics services, faked: answers by link, and every link asked for.
+#[derive(Default)]
+struct FakeWeb {
+    answers: HashMap<String, Fetched>,
+    asked: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl LyricsWeb for FakeWeb {
+    async fn get_json(&self, url: &str) -> Fetched {
+        self.asked.lock().unwrap().push(url.into());
+        self.answers.get(url).cloned().unwrap_or(Fetched::NotFound)
+    }
+}
+
+const LRC_GET: &str = "https://lrclib.net/api/get?artist_name=Made%20Up%2C%20Other&track_name=Song%20(feat.%20X)&album_name=Album&duration=213";
+const KUGOU_SEARCH: &str = "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Made%20Up%20-%20Song&duration=213000&hash=";
+
+fn song_facts() -> Facts {
+    Facts::from([(
+        SONG.to_string(),
+        SongFacts {
+            title: "Song (feat. X)".into(),
+            artist: "Made Up, Other".into(),
+            album: Some("Album".into()),
+            length_seconds: 213,
+        },
+    )])
+}
+
+fn timed_web(failing_search: bool) -> Arc<FakeWeb> {
+    let mut web = FakeWeb::default();
+    web.answers.insert(
+        LRC_GET.into(),
+        Fetched::Json(json!({"syncedLyrics": "[00:01.50] One\n[00:04.25] Two"})),
+    );
+    if failing_search {
+        web.answers.insert(KUGOU_SEARCH.into(), Fetched::Failed);
+    }
+    Arc::new(web)
+}
+
+/// Spec A1: with the engine knowing the song, LRCLIB's timed lines come back in the new shape,
+/// and YouTube Music is never asked (its plain text comes after any timing). The answer is kept:
+/// asked again, nothing is sent anywhere.
+#[tokio::test]
+async fn lyrics_timed_from_lrclib() {
+    let web = timed_web(false);
+    let r = rig_with(with_lyrics(), song_facts(), Some(web.clone()));
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(
+        v["data"],
+        json!({"source": "LRCLIB", "synced": true, "words": false,
+               "lines": [{"t": 1.5, "text": "One"}, {"t": 4.25, "text": "Two"}]})
+    );
+    assert!(
+        r.calls().is_empty(),
+        "YouTube Music not asked: {:?}",
+        r.calls()
+    );
+    let mut asked = web.asked.lock().unwrap().clone();
+    asked.sort();
+    assert_eq!(asked, [KUGOU_SEARCH, LRC_GET]);
+    let v2 = c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v2["data"], v["data"]);
+    assert_eq!(web.asked.lock().unwrap().len(), 2, "kept");
+}
+
+/// A failed request on the way (KuGou unreachable): what was found is shown, but not kept, so
+/// the next ask tries again.
+#[tokio::test]
+async fn lyrics_after_a_failure_are_shown_not_kept() {
+    let web = timed_web(true);
+    let r = rig_with(with_lyrics(), song_facts(), Some(web.clone()));
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["source"], "LRCLIB");
+    c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(web.asked.lock().unwrap().len(), 4, "asked again");
+}
+
+/// A song the engine knows nothing of (not playing, not queued): KuGou and LRCLIB can't be
+/// asked without its title and artist, so only YouTube Music is.
+#[tokio::test]
+async fn lyrics_of_an_unknown_song_ask_youtube_music_only() {
+    let web = Arc::new(FakeWeb::default());
+    let r = rig_with(with_lyrics(), Facts::new(), Some(web.clone()));
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["source"], "Source: Musixmatch");
+    assert!(web.asked.lock().unwrap().is_empty());
+    assert_eq!(r.calls().len(), 2);
+    // Not kept: once the engine has the song (its details land a moment after a play by id),
+    // the next ask may find its timing.
+    c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(r.calls().len(), 3, "asked again: {:?}", r.calls());
+}
+
+/// Neither KuGou nor LRCLIB timing: YouTube Music's plain lyrics come before LRCLIB's plain
+/// text (the widget's order). With YouTube's step failing and nothing else, the error is the
+/// reply, as before, and nothing is kept.
+#[tokio::test]
+async fn lyrics_plain_order_and_youtube_failures() {
+    let mut web = FakeWeb::default();
+    web.answers.insert(
+        LRC_GET.into(),
+        Fetched::Json(json!({"plainLyrics": "LRCLIB plain"})),
+    );
+    let web = Arc::new(web);
+    let r = rig_with(with_lyrics(), song_facts(), Some(web.clone()));
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["source"], "Source: Musixmatch", "{v}");
+
+    // YouTube Music failing: LRCLIB's plain text, not kept.
+    let r = rig_with(
+        FakeBrowser {
+            fail: Some(Error::SignedOut),
+            ..with_lyrics()
+        },
+        song_facts(),
+        Some(web.clone()),
+    );
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["lines"], json!([{"text": "LRCLIB plain"}]), "{v}");
+    c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(r.calls().len(), 2, "YouTube asked again: not kept");
 }

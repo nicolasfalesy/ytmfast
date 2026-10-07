@@ -1,0 +1,61 @@
+{
+ "song": {
+  "title": "Quiet Harbour [with Guest]",
+  "artist": "Imaginary Duo x Guest",
+  "album": "Sea",
+  "songDuration": 214,
+  "videoId": "fakeVidlrcl"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Imaginary%20Duo%20-%20Quiet%20Harbour&duration=214000&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": [
+     {
+      "id": "1",
+      "accesskey": "k",
+      "song": "Quiet Harbour",
+      "singer": "Imaginary Duo",
+      "duration": 230000
+     },
+     {
+      "id": "2",
+      "accesskey": "k",
+      "song": "Loud Harbour",
+      "singer": "Imaginary Duo",
+      "duration": 214000
+     }
+    ]
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=Imaginary%20Duo%20x%20Guest&track_name=Quiet%20Harbour%20%5Bwith%20Guest%5D&album_name=Sea&duration=214": {
+   "status": 404
+  },
+  "https://lrclib.net/api/search?track_name=Quiet%20Harbour&artist_name=Imaginary%20Duo": {
+   "json": [
+    {
+     "id": 10,
+     "duration": 213.0,
+     "plainLyrics": "plain only",
+     "syncedLyrics": null
+    },
+    {
+     "id": 11,
+     "duration": 219.0,
+     "syncedLyrics": "[00:01.00] too far off"
+    },
+    {
+     "id": 12,
+     "duration": "216",
+     "syncedLyrics": "[00:05.00][01:05.00] Twice stamped line\r\n[00:07.50] Second\r\n\r\n[00:09] \r\n[00:11.25]   Spaced   out   \r\n"
+    },
+    {
+     "id": 13,
+     "duration": 212.0,
+     "syncedLyrics": "[00:02.00] the closest one\n[00:30.00]\n[00:33.00] after a break"
+    }
+   ]
+  }
+ },
+ "youtube": "none"
+}

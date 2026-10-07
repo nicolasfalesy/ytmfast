@@ -107,6 +107,10 @@ pub struct Options {
     /// browse); the daemon passes the lazily loaded session, so a browse shares the session
     /// (and its one keyring read) with the resolver and the queue source.
     pub browser: Option<Arc<dyn Browser>>,
+    /// The lyrics services (KuGou, LRCLIB) for `lyrics`. `None` by default, so a test never
+    /// reaches them by accident: `lyrics` then gives YouTube Music's plain lyrics only. The
+    /// daemon passes `lyrics::HttpWeb`.
+    pub lyrics_web: Option<Arc<dyn crate::lyrics::LyricsWeb>>,
 }
 
 impl std::fmt::Debug for Options {
@@ -116,6 +120,7 @@ impl std::fmt::Debug for Options {
             .field("power_supply_root", &self.power_supply_root)
             .field("mpris", &self.mpris)
             .field("browser", &self.browser.is_some())
+            .field("lyrics_web", &self.lyrics_web.is_some())
             .finish()
     }
 }
@@ -127,6 +132,7 @@ impl Default for Options {
             power_supply_root: PathBuf::from(idle::POWER_SUPPLY_ROOT),
             mpris: None,
             browser: None,
+            lyrics_web: None,
         }
     }
 }
@@ -272,7 +278,7 @@ async fn serve_with(
     let my_uid = current_uid();
     let mut monitor = events.subscribe();
     let shared = Arc::new(Shared {
-        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone()))),
+        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone())), options.lyrics_web),
         cmds,
         events,
         hub,
@@ -743,6 +749,7 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
                 .get(browser.as_ref(), &video_id)
                 .await
                 .map(|lyrics| match lyrics {
+                    // Within a line: `lyrics::fits` held every answer to it.
                     Some(l) => protocol::data_reply(id, &l),
                     None => protocol::ok_reply(id, json!({ "none": true })),
                 }),

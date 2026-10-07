@@ -1,0 +1,44 @@
+{
+ "song": {
+  "title": "Edge Case",
+  "artist": "Boundary",
+  "album": "",
+  "songDuration": 214,
+  "videoId": "fakeVidedge"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Boundary%20-%20Edge%20Case&duration=214000&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": [
+     {
+      "id": "e1",
+      "accesskey": "k1",
+      "song": "Edge Case",
+      "singer": "Boundary",
+      "duration": 211000
+     }
+    ]
+   }
+  },
+  "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=e1&accesskey=k1": {
+   "json": {
+    "status": 200,
+    "content": "a3JjMTidHPpjOLYHQbNK7PV23iVxjntSlVjbJ3gwcqfDS4JPbL68f2ep8QCjPH+vS1BWrIy8v3sxrIMADVJNKCGYeNisvygRtq5vRQpKcRe8ODSf2ojmEZyMJJJl7Ucbo7+n9hTahkqEa24e+HcbyfbMpb1Ppxt+vmJCLkX3v9vPrxhU9klydnA5tMIsawhPnF5fS+uWcCxkUKrBobDsxcbdBobHZnjvd25apaFxf9PpFQ7M7LkrnVhxPWj4PHzi"
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=Boundary&track_name=Edge%20Case&duration=214": {
+   "status": 404
+  },
+  "https://lrclib.net/api/search?track_name=Edge%20Case&artist_name=Boundary": {
+   "json": [
+    {
+     "id": 20,
+     "duration": 217.0,
+     "syncedLyrics": "[00:05.00] on the very edge\n[00:09.00] of the length rule"
+    }
+   ]
+  }
+ },
+ "youtube": "none"
+}

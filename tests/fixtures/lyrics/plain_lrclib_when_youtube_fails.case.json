@@ -1,0 +1,28 @@
+{
+ "song": {
+  "title": "Small Talk",
+  "artist": "Nobody Real",
+  "album": "",
+  "songDuration": 0,
+  "videoId": "fakeVidplai"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Nobody%20Real%20-%20Small%20Talk&duration=0&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": []
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=Nobody%20Real&track_name=Small%20Talk": {
+   "json": {
+    "id": 5,
+    "plainLyrics": "  first plain line \nsecond\n\n  third",
+    "syncedLyrics": ""
+   }
+  },
+  "https://lrclib.net/api/search?track_name=Small%20Talk&artist_name=Nobody%20Real": {
+   "json": []
+  }
+ },
+ "youtube": "fail"
+}

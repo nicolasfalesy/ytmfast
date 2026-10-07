@@ -1,0 +1,72 @@
+{
+ "song": {
+  "title": "Paper Lanterns (feat. Someone Else)",
+  "artist": "The Made Up Band & Someone Else",
+  "album": "Fold & Float",
+  "songDuration": 200,
+  "videoId": "fakeViden_o"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=The%20Made%20Up%20Band%20-%20Paper%20Lanterns&duration=200000&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": [
+     {
+      "id": "9001",
+      "accesskey": "AAAA1111",
+      "song": "Paper Lanterns",
+      "singer": "The Made Up Band",
+      "duration": 201000
+     },
+     {
+      "id": "9002",
+      "accesskey": "BBBB2222",
+      "song": "Paper Lanterns (Live)",
+      "singer": "the made-up band",
+      "duration": 199500
+     },
+     {
+      "id": "9003",
+      "accesskey": "CCCC3333",
+      "song": "Different Song",
+      "singer": "The Made Up Band",
+      "duration": 200000
+     },
+     {
+      "id": "",
+      "accesskey": "DDDD4444",
+      "song": "Paper Lanterns",
+      "singer": "The Made Up Band",
+      "duration": 200000
+     },
+     {
+      "id": "9005",
+      "accesskey": "EEEE5555",
+      "song": "Paper Lanterns",
+      "singer": "The Made Up Band",
+      "duration": 204000
+     }
+    ]
+   }
+  },
+  "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=9002&accesskey=BBBB2222": {
+   "json": {
+    "status": 200,
+    "content": "a3JjMTidNCcTffcHQYsGxLEyjthmvGBjVkiE4YDysqAIdOlMLCb6xRWl2cOO0PCyKo0eDy1MhHet7Lj7KIruwlFnRNpbNRtB7YfEntoeVJ2k01ZcQYLxtuUkKdqo9wzvgId01sfERuov8hci5+1/F5E868fO5fPuQqwCQtr+1laKzBkEsbYgmf59Ymu1/xcKxcz/bPk4yhLOUb1+Vt4syYXQ9q/AEAznDTAZ0fc2LqngU2bIj1Vns3OSUfGyPuGGpndjGwY2/lCeDn+q9ePsUXh0zuOXZIPYTY4aLWm4nWrkGk1BAkjNGzph1Bsb+NKYJzNwZ3MoH0cZRmfaqouF36o68ZlDS5zwyTPEhZMyEaDd5Gg4GrLEg2q5prMrrLTuZvQPoeYyoiJE5PxVtQ/0EmtWqMo8aPXs1F352jsBWSaw1pkR2MkaogAHeeFhmG+Fv8/Gm5rbibJurYlGne6T2Q=="
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=The%20Made%20Up%20Band%20%26%20Someone%20Else&track_name=Paper%20Lanterns%20(feat.%20Someone%20Else)&album_name=Fold%20%26%20Float&duration=200": {
+   "json": {
+    "id": 1,
+    "trackName": "Paper Lanterns",
+    "artistName": "The Made Up Band",
+    "albumName": "Fold & Float",
+    "duration": 200.0,
+    "instrumental": false,
+    "plainLyrics": "Oh, I remember\nPaper lanterns",
+    "syncedLyrics": "[ar:The Made Up Band]\n[ti:Paper Lanterns]\n[00:12.30] Oh, I remember how you were, you were\n[00:16.10] Paper lanterns in the rain, tonight my love,\n[00:19.80] Driving down the empty road\n[00:26.20] Wait — for me\n[00:40.10] Glimmer, glimmer, glide away\n[00:44.00] Something unlike the words above\n"
+   }
+  }
+ },
+ "youtube": "none"
+}

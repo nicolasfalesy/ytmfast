@@ -462,9 +462,12 @@ async fn serve(
     // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
     // session bus it logs one line and the socket carries on alone.
     // The socket's browsing commands go through the same lazily loaded session.
+    // The lyrics services get their own client (`lyrics::web`): three hosts, nothing of the
+    // session.
     let options = control::Options {
         mpris: Some(ytmfast::mpris::Bus::Session),
         browser: Some(backend),
+        lyrics_web: Some(Arc::new(ytmfast::lyrics::HttpWeb::new())),
         ..control::Options::default()
     };
     Ok(control::run(listener, engine, cmds, events, options, shutdown).await)
