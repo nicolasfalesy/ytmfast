@@ -121,6 +121,7 @@ fn empty_queue() -> QueueView {
         current_id: None,
         shuffle: false,
         repeat: Repeat::Off,
+        rev: 0,
     }
 }
 
@@ -139,6 +140,7 @@ fn queue_of(n: u64, current: Option<u64>, repeat: Repeat) -> QueueView {
         current_id: current,
         shuffle: false,
         repeat,
+        rev: 0,
     }
 }
 
@@ -148,6 +150,7 @@ fn queue_event(q: &QueueView) -> EngineEvent {
         current_id: q.current_id,
         shuffle: q.shuffle,
         repeat: q.repeat,
+        rev: q.rev,
     }
 }
 

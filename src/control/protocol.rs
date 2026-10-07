@@ -117,10 +117,13 @@ pub enum Request {
     Lyrics {
         video_id: String,
     },
-    /// Which events this client gets: `queue: false` stops its `queue` events (on by
-    /// default). Handled by the client's own task, not the engine (`control::client`).
+    /// Which events this client gets: `queue: false` stops its `queue` events, `position:
+    /// false` its `position` events (each on by default). A field left out keeps its switch;
+    /// at least one is given. Handled by the client's own task, not the engine
+    /// (`control::client`).
     Watch {
-        queue: bool,
+        queue: Option<bool>,
+        position: Option<bool>,
     },
     Quit,
 }
@@ -216,7 +219,16 @@ impl Request {
             }
             Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
             Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
-            Request::Watch { queue } => ("watch", Some(json!({ "queue": queue }))),
+            Request::Watch { queue, position } => {
+                let mut args = Map::new();
+                if let Some(q) = queue {
+                    args.insert("queue".into(), json!(q));
+                }
+                if let Some(p) = position {
+                    args.insert("position".into(), json!(p));
+                }
+                ("watch", Some(Value::Object(args)))
+            }
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -445,12 +457,19 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 _ => return Err(VIDEO_ID_RULE),
             },
         },
-        "watch" => Request::Watch {
-            queue: args
-                .get("queue")
-                .and_then(Value::as_bool)
-                .ok_or("queue must be true or false")?,
-        },
+        "watch" => {
+            // Null counts as left out, as for every other optional field (`field`).
+            let switch = |name, rule| match field(args, name) {
+                None => Ok(None),
+                Some(v) => v.as_bool().map(Some).ok_or(rule),
+            };
+            let queue = switch("queue", "queue must be true or false")?;
+            let position = switch("position", "position must be true or false")?;
+            if queue.is_none() && position.is_none() {
+                return Err("watch needs queue or position");
+            }
+            Request::Watch { queue, position }
+        }
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
@@ -774,6 +793,9 @@ struct WireQueue<'a> {
     current_id: Option<u64>,
     shuffle: bool,
     repeat: &'static str,
+    /// The queue's revision (`EngineEvent::Queue::rev`): a widget drops a line older than the
+    /// newest it has seen.
+    rev: u64,
 }
 
 impl<'a> WireQueue<'a> {
@@ -783,6 +805,7 @@ impl<'a> WireQueue<'a> {
         current_id: Option<u64>,
         shuffle: bool,
         repeat: Repeat,
+        rev: u64,
     ) -> Self {
         WireQueue {
             event,
@@ -803,6 +826,7 @@ impl<'a> WireQueue<'a> {
             current_id,
             shuffle,
             repeat: repeat_name(repeat),
+            rev,
         }
     }
 }
@@ -815,6 +839,7 @@ pub fn queue_data(view: &QueueView) -> Value {
         view.current_id,
         view.shuffle,
         view.repeat,
+        view.rev,
     );
     // Plain strings, numbers and bools: serializing them can't fail.
     serde_json::to_value(wire).expect("a queue serializes")
@@ -839,8 +864,9 @@ pub fn event_line(event: &EngineEvent) -> String {
             current_id,
             shuffle,
             repeat,
+            rev,
         } => {
-            let wire = WireQueue::new(Some("queue"), items, *current_id, *shuffle, *repeat);
+            let wire = WireQueue::new(Some("queue"), items, *current_id, *shuffle, *repeat, *rev);
             let mut s = serde_json::to_string(&wire).expect("a queue serializes");
             s.push('\n');
             s
@@ -1004,8 +1030,18 @@ mod tests {
             Request::Lyrics {
                 video_id: "dQw4w9WgXcQ".into(),
             },
-            Request::Watch { queue: false },
-            Request::Watch { queue: true },
+            Request::Watch {
+                queue: Some(false),
+                position: None,
+            },
+            Request::Watch {
+                queue: Some(true),
+                position: Some(false),
+            },
+            Request::Watch {
+                queue: None,
+                position: Some(true),
+            },
             Request::Quit,
         ];
         for (id, req) in all.into_iter().enumerate() {
@@ -1381,19 +1417,62 @@ mod tests {
     fn watch_parses_and_says_what_is_wrong() {
         assert_eq!(
             parse(r#"{"id":1,"cmd":"watch","args":{"queue":false}}"#),
-            Ok((1, Request::Watch { queue: false }))
+            Ok((
+                1,
+                Request::Watch {
+                    queue: Some(false),
+                    position: None
+                }
+            ))
         );
         assert_eq!(
             parse(r#"{"id":2,"cmd":"watch","args":{"queue":true}}"#),
-            Ok((2, Request::Watch { queue: true }))
+            Ok((
+                2,
+                Request::Watch {
+                    queue: Some(true),
+                    position: None
+                }
+            ))
         );
-        for args in [json!({}), json!({"queue": "no"}), json!({"queue": 0})] {
+        // `position` alone, and both at once: each field is its own switch (ruling P22).
+        assert_eq!(
+            parse(r#"{"id":4,"cmd":"watch","args":{"position":false}}"#),
+            Ok((
+                4,
+                Request::Watch {
+                    queue: None,
+                    position: Some(false)
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":5,"cmd":"watch","args":{"queue":true,"position":true}}"#),
+            Ok((
+                5,
+                Request::Watch {
+                    queue: Some(true),
+                    position: Some(true)
+                }
+            ))
+        );
+        for (args, message) in [
+            (json!({}), "watch needs queue or position"),
+            (json!({"queue": null}), "watch needs queue or position"),
+            (json!({"queue": "no"}), "queue must be true or false"),
+            (json!({"queue": 0}), "queue must be true or false"),
+            (json!({"position": "no"}), "position must be true or false"),
+            (
+                json!({"queue": true, "position": 1}),
+                "position must be true or false",
+            ),
+        ] {
             let line = json!({"id": 3, "cmd": "watch", "args": args}).to_string();
             assert_eq!(
                 bad(&line),
                 BadRequest {
                     id: Some(3),
-                    message: "queue must be true or false".into()
+                    message: message.into()
                 },
                 "{line}"
             );
@@ -1439,11 +1518,13 @@ mod tests {
             current_id: Some(2),
             shuffle: true,
             repeat: Repeat::All,
+            rev: 41,
         };
         let v: Value = serde_json::from_str(&event_line(&event)).unwrap();
         assert_eq!(
             v,
             json!({"event": "queue", "currentId": 2, "shuffle": true, "repeat": "all",
+                   "rev": 41,
                    "items": [
                        {"queueId": 1, "videoId": "dQw4w9WgXcQ", "title": "Song",
                         "artists": ["A", "B"], "album": "Album", "albumId": "MPREb_abc",
@@ -1466,7 +1547,8 @@ mod tests {
                 items,
                 current_id: Some(2),
                 shuffle: true,
-                repeat: Repeat::All
+                repeat: Repeat::All,
+                rev: 41,
             }),
             Value::Object(data)
         );
@@ -1475,12 +1557,13 @@ mod tests {
             current_id: None,
             shuffle: false,
             repeat: Repeat::One,
+            rev: 0,
         };
         let v: Value = serde_json::from_str(&event_line(&empty)).unwrap();
         assert_eq!(
             v,
             json!({"event": "queue", "items": [], "currentId": null, "shuffle": false,
-                   "repeat": "one"})
+                   "repeat": "one", "rev": 0})
         );
     }
 
@@ -1516,6 +1599,7 @@ mod tests {
             current_id: Some(250),
             shuffle: false,
             repeat: Repeat::Off,
+            rev: u64::MAX,
         };
         let start = std::time::Instant::now();
         let rounds = 20;

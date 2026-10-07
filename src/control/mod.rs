@@ -400,6 +400,16 @@ async fn queue_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
         current_id: queue.current_id,
         shuffle: queue.shuffle,
         repeat: queue.repeat,
+        rev: queue.rev,
+    }))
+}
+
+/// The position as it is now, as a plain `position` event line (not a seek's).
+async fn position_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
+    let status = query_status(cmds).await?;
+    Some(protocol::event_line(&EngineEvent::Position {
+        seconds: status.position,
+        seeked: false,
     }))
 }
 
@@ -432,6 +442,9 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     // `watch {"queue": false}` turns this off: a bar that never shows the queue then skips
     // its events, each up to about 400 KB of JSON for a 1,000-song queue, parsed in the shell.
     let mut watch_queue = true;
+    // `watch {"position": false}` turns this off (ruling P22): a bar with every panel closed
+    // shows no position, and a line a second while playing would wake the shell for nothing.
+    let mut watch_position = true;
 
     let close = loop {
         tokio::select! {
@@ -446,23 +459,42 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                             quit = true;
                             reply
                         }
-                        Handled::Watch(id, on) => {
-                            let was = std::mem::replace(&mut watch_queue, on);
+                        Handled::Watch { id, queue, position } => {
+                            let queue_was = watch_queue;
+                            let position_was = watch_position;
+                            watch_queue = queue.unwrap_or(watch_queue);
+                            watch_position = position.unwrap_or(watch_position);
                             if !push(&out, protocol::ok_reply(id, json!({}))) {
                                 break Close::Now;
                             }
                             // Back on: the queue as it is now, right after the reply, so a
                             // change made while it was off is never missed (and the widget
-                            // needs no `queue.get` of its own).
-                            if on && !was {
-                                match queue_line(&shared.cmds).await {
+                            // needs no `queue.get` of its own). The position likewise: a
+                            // paused song sends no tick, so its slider would stay wrong.
+                            let mut fresh = Vec::new();
+                            if watch_queue && !queue_was {
+                                fresh.push(queue_line(&shared.cmds).await);
+                            }
+                            if watch_position && !position_was {
+                                fresh.push(position_line(&shared.cmds).await);
+                            }
+                            let mut close = None;
+                            for line in fresh {
+                                match line {
                                     Some(line) => {
                                         if !push(&out, line) {
-                                            break Close::Now;
+                                            close = Some(Close::Now);
+                                            break;
                                         }
                                     }
-                                    None => break Close::Flush,
+                                    None => {
+                                        close = Some(Close::Flush);
+                                        break;
+                                    }
                                 }
+                            }
+                            if let Some(close) = close {
+                                break close;
                             }
                             continue;
                         }
@@ -524,6 +556,9 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                 let pushed = match event {
                     // Not watching the queue: its events are skipped, never even serialized.
                     Ok(EngineEvent::Queue { .. }) if !watch_queue => true,
+                    // Nor the position (a seek's included: whoever turns it back on gets the
+                    // position as it is then).
+                    Ok(EngineEvent::Position { .. }) if !watch_position => true,
                     Ok(e) => push(&out, protocol::event_line(&e)),
                     // It missed some events: a fresh state and queue cover them.
                     Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds, watch_queue).await {
@@ -600,9 +635,14 @@ enum Handled {
     /// A browsing request (or a `like`), answered from a task of its own (`answer`). For
     /// `playPage`, the engine's play epoch when it came in (ruling P7).
     Browse(u64, Request, Option<u64>),
-    /// `watch`: the request id, and whether this client now gets `queue` events. Per client,
-    /// so the client's own task keeps it.
-    Watch(u64, bool),
+    /// `watch`: the request id, and whether this client now gets `queue` and `position`
+    /// events (`None` keeps that switch as it is). Per client, so the client's own task keeps
+    /// them.
+    Watch {
+        id: u64,
+        queue: Option<bool>,
+        position: Option<bool>,
+    },
 }
 
 /// One request.
@@ -631,7 +671,13 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
             });
         }
         Request::Quit => return Handled::Quit(protocol::ok_reply(id, json!({}))),
-        Request::Watch { queue } => return Handled::Watch(id, queue),
+        Request::Watch { queue, position } => {
+            return Handled::Watch {
+                id,
+                queue,
+                position,
+            };
+        }
         // Read now, in this client's command order (through the engine's channel): any play
         // the user makes after this, from anywhere, wins over the page's (ruling P7).
         request @ Request::PlayPage { .. } => {

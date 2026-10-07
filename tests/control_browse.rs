@@ -227,6 +227,7 @@ fn rig_with(mut browser: FakeBrowser, facts: Facts, web: Option<Arc<dyn LyricsWe
                         current_id: None,
                         shuffle: false,
                         repeat: Repeat::Off,
+                        rev: 0,
                     });
                 }
                 // No play ever comes between: a late play always goes in (the real engine's

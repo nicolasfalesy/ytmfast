@@ -199,10 +199,12 @@ async fn follow(
                 current_id,
                 shuffle,
                 repeat,
+                rev,
             }) => Update::Queue(QueueView {
                 items,
                 current_id,
                 shuffle,
+                rev,
                 repeat,
             }),
             // Read on demand only: the spec says Position never comes as PropertiesChanged

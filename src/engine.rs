@@ -255,6 +255,8 @@ pub struct QueueView {
     pub current_id: Option<u64>,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// The revision of the queue event this view matches (`Engine::queue_rev`).
+    pub rev: u64,
 }
 
 /// What the engine reports.
@@ -274,6 +276,10 @@ pub enum EngineEvent {
         current_id: Option<u64>,
         shuffle: bool,
         repeat: Repeat,
+        /// One higher than the previous queue event's (the first is 1; ruling P16). A client
+        /// can get an older queue line after a newer one (a buffered event after `watch`, an
+        /// event after a `queue.get` reply), and drops any below the newest it has seen.
+        rev: u64,
     },
     /// `code` is `Error::code()`; `message` its `Display`, which never holds a link (R6).
     Error {
@@ -586,6 +592,9 @@ pub struct Engine {
     /// Bumped by every play that makes a new queue: a queue page that comes back for an older
     /// one is dropped (the same rule as `generation`, for queues).
     queue_generation: u64,
+    /// The newest queue event's revision: bumped by every `emit_queue`, 0 before the first.
+    /// `QueueGet` answers with it too, so a reply and the event for the same queue match.
+    queue_rev: u64,
     /// The running resolve, aborted when a newer play replaces it.
     resolving: Option<AbortHandle>,
     /// The play's queue request, and what it is for.
@@ -745,6 +754,7 @@ impl Engine {
             },
             generation: 0,
             queue_generation: 0,
+            queue_rev: 0,
             resolving: None,
             loading: None,
             pending: None,
@@ -2617,6 +2627,7 @@ impl Engine {
             current_id: self.queue.current().map(|i| i.id),
             shuffle: self.queue.shuffle(),
             repeat: self.queue.repeat(),
+            rev: self.queue_rev,
         }
     }
 
@@ -2624,17 +2635,20 @@ impl Engine {
     /// moves the current item), comes through here.
     fn emit_queue(&mut self) {
         self.dirty = true;
+        self.queue_rev += 1;
         let QueueView {
             items,
             current_id,
             shuffle,
             repeat,
+            rev,
         } = self.queue_view();
         self.emit(EngineEvent::Queue {
             items,
             current_id,
             shuffle,
             repeat,
+            rev,
         });
     }
 
@@ -3410,6 +3424,7 @@ mod tests {
                     current_id,
                     shuffle,
                     repeat,
+                    rev,
                 } = self.next().await
                 {
                     return QueueView {
@@ -3417,6 +3432,7 @@ mod tests {
                         current_id,
                         shuffle,
                         repeat,
+                        rev,
                     };
                 }
             }
@@ -5791,6 +5807,46 @@ mod tests {
         let status = r.status().await;
         assert!(status.shuffle);
         assert_eq!(status.repeat, Repeat::All);
+    }
+
+    /// Every queue event carries a revision one higher than the last (ruling P16), and
+    /// `QueueGet` answers with the newest one: a widget that gets an older queue line after a
+    /// newer one (a buffered event after `watch`, or an event after a `queue.get` reply) can
+    /// tell and drop it.
+    #[tokio::test]
+    async fn queue_events_carry_a_rising_revision() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let mut revs = Vec::new();
+        let q = loop {
+            let q = r.until_queue().await;
+            revs.push(q.rev);
+            if q.items.len() == 3 {
+                break q;
+            }
+        };
+        r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
+            songs: vec![song('D')],
+            at: AddAt::End,
+        })
+        .await;
+        revs.push(r.until_queue().await.rev);
+        r.send(EngineCmd::QueueRemove(id_of(&q, 'B'))).await;
+        let last = r.until_queue().await;
+        revs.push(last.rev);
+        assert!(revs[0] > 0, "the first event is not rev 0: {revs:?}");
+        for pair in revs.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "{revs:?}");
+        }
+        // The reply holds the same queue under the same revision as the newest event.
+        let now = r.queue().await;
+        assert_eq!(now.rev, last.rev);
+        assert_eq!(now.items, last.items);
     }
 
     #[tokio::test]

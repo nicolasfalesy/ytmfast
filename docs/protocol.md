@@ -52,7 +52,7 @@ failing) arrives as events.
 | `repeat`       | `mode`: `"off"`, `"all"` or `"one"`                     | `{}`                        |
 | `like`         | `status`: `"like"`, `"dislike"` or `"none"`; `videoId` (optional) | `{}`, once YouTube took it |
 | `mute`         | `on`: `true` or `false`                                 | `{}`                        |
-| `watch`        | `queue`: `true` or `false`                              | `{}`                        |
+| `watch`        | `queue`, `position`: `true` or `false` (at least one)   | `{}`                        |
 | `quit`         | none                                                    | `{}`, then the engine stops |
 | `browse`       | `browseId`, `params` (optional)                         | a page (below)              |
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
@@ -369,8 +369,8 @@ never hold what was sent, a link or a token.
 
 ## Events
 
-Events have no `id`. Every connected client gets every event, except `queue` events for a
-client that turned them off (see `watch` below).
+Events have no `id`. Every connected client gets every event, except `queue` and `position`
+events for a client that turned them off (see `watch` below).
 
 The state, on every change (and as the `status` reply's data, without `"event"`):
 
@@ -424,7 +424,7 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
    "album": "...", "albumId": "MPREb_...", "thumbnail": "https://...", "lengthSeconds": 213},
   {"queueId": 8, "videoId": "...", "title": "...", "artists": ["..."], "album": null,
    "albumId": "", "thumbnail": "https://...", "lengthSeconds": 187, "radio": true}],
- "currentId": 7, "shuffle": false, "repeat": "off"}
+ "currentId": 7, "shuffle": false, "repeat": "off", "rev": 42}
 ```
 
 - `items` are in play order: the shuffled order while shuffle is on.
@@ -440,6 +440,12 @@ repeat), and as the `queue.get` reply's data, without `"event"`:
   an empty queue wait for `queue.jump`, `next` or `play`).
 - The whole queue comes every time. The queue holds at most 1,000 songs, so with
   real-sized details the line is at most about 405 KB.
+- `rev` is the queue's revision: each `queue` event's is one higher than the one before (the
+  first is 1), and the `queue.get` reply carries the newest event's. A client can get an
+  older queue after a newer one (an event already on its way when a `watch` turns them back
+  on, or one sent before a `queue.get` reply it reads after), so it keeps the highest `rev`
+  it has seen and drops any line below it; an equal one holds the same queue. A restarted
+  engine counts from 1 again, so a client starts over when its connection closes.
 
 An error:
 
@@ -464,6 +470,16 @@ it is now, so nothing changed while they were off is missed. Turning them on whi
 nothing extra. A bar that shows only the song can leave them off, and turn them on while its
 panel shows the queue: a 1,000-song queue is about 400 KB of JSON on every change.
 `queue.get` answers as always, whatever the setting.
+
+`{"position": false}` stops `position` events the same way, a seek's included: a bar that
+shows no position with its panel closed then gets no line a second while a song plays.
+`{"position": true}` turns them back on, and the reply is followed at once by a `position`
+event with the position as it is now (`"seeked": false`), so a paused song's slider is right
+without waiting for a tick. The `state` event still carries the position whatever the setting.
+
+The two fields are separate switches and can come in one request
+(`{"queue": true, "position": true}`); a field left out keeps its setting, and a request with
+neither is refused. When both come back on, the `queue` event comes first, then `position`.
 
 ## Connections
 
