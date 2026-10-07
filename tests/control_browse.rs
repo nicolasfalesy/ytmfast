@@ -246,7 +246,9 @@ fn rig_with(mut browser: FakeBrowser, facts: Facts, web: Option<Arc<dyn LyricsWe
                 EngineCmd::LyricsTab { video_id, reply } => {
                     let _ = reply.send(engine_known.lock().unwrap().get(&video_id).cloned());
                 }
-                EngineCmd::LyricsSong { video_id, reply } => {
+                EngineCmd::LyricsSong {
+                    video_id, reply, ..
+                } => {
                     let _ = reply.send(facts.get(&video_id).cloned());
                 }
                 EngineCmd::LearnSong { video_id, next } => {
@@ -1616,4 +1618,72 @@ async fn lyrics_plain_order_and_youtube_failures() {
     assert_eq!(v["data"]["lines"], json!([{"text": "LRCLIB plain"}]), "{v}");
     c.ask(2, "lyrics", json!({"videoId": SONG})).await;
     assert_eq!(r.calls().len(), 2, "YouTube asked again: not kept");
+}
+
+/// The queue of a play by id, with the song's details, a moment after the play (as YouTube's
+/// `next` answers). Until then the engine knows the song by id alone.
+struct LateDetails;
+
+#[async_trait]
+impl QueueSource for LateDetails {
+    async fn next(&self, req: NextRequest) -> Result<NextPage, Error> {
+        assert_eq!(req.video_id.as_deref(), Some(SONG));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(NextPage {
+            items: vec![SongItem {
+                video_id: SONG.into(),
+                title: "Song (feat. X)".into(),
+                artists: vec!["Made Up".into(), "Other".into()],
+                album: Some("Album".into()),
+                length_seconds: 213,
+                ..SongItem::default()
+            }],
+            ..NextPage::default()
+        })
+    }
+    async fn song_next(&self, _: &str) -> Result<SongNext, Error> {
+        std::future::pending().await
+    }
+    async fn like(&self, _: &str, _: ytmfast::browse::LikeStatus) -> Result<(), Error> {
+        std::future::pending().await
+    }
+}
+
+/// Fix round 1: a widget with its Lyrics tab open asks for the song it just played by id at
+/// once, before the engine has the song's details. The engine waits for them (they land 300 ms
+/// later here) and the answer is LRCLIB's timed lines, not YouTube Music's plain text.
+#[tokio::test]
+async fn lyrics_asked_before_the_details_land_wait_for_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(control::SOCKET_NAME);
+    let (std, _bound) = control::bind_socket(&path).unwrap();
+    let listener = UnixListener::from_std(std).unwrap();
+    let player = AudioPlayer::spawn(Box::new(NullSink::new()));
+    let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(LateDetails), player);
+    let calls = Calls::default();
+    let web = timed_web(false);
+    let options = Options {
+        browser: Some(Arc::new(FakeBrowser {
+            calls: calls.clone(),
+            ..with_lyrics()
+        })),
+        lyrics_web: Some(web.clone()),
+        ..Options::default()
+    };
+    tokio::spawn(control::run(
+        listener,
+        engine,
+        cmds,
+        events,
+        options,
+        std::future::pending(),
+    ));
+    let mut c = connect(&path).await;
+    assert_eq!(c.ask(1, "play", json!({"videoId": SONG})).await["ok"], true);
+    let started = tokio::time::Instant::now();
+    let v = c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["source"], "LRCLIB", "{v}");
+    assert_eq!(v["data"]["lines"][1]["t"], 4.25);
+    assert!(started.elapsed() >= Duration::from_millis(200), "it waited");
+    assert!(calls.lock().unwrap().is_empty(), "YouTube Music not asked");
 }

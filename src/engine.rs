@@ -191,8 +191,14 @@ pub enum EngineCmd {
     /// What the lyrics services are told of a song (its title, artists, album and length):
     /// the shown song's as the state has them, else a queued song's from its item. `None` for
     /// a song the engine doesn't have, which then gets YouTube Music's lyrics only.
+    ///
+    /// With `wait`, a song that is the current one but whose details are not known yet (a play
+    /// by id, or a list's first song, before its link or its list lands) is answered once they
+    /// are, or once another song is current; the asker bounds the wait (`control::lyrics`).
+    /// Without it, the answer is what is known now.
     LyricsSong {
         video_id: String,
+        wait: bool,
         reply: oneshot::Sender<Option<crate::lyrics::SongFacts>>,
     },
     Quit,
@@ -676,6 +682,8 @@ pub struct Engine {
     likes_sent: HashMap<String, u64>,
     /// The likes on their way, by number, aborted at quit.
     like_tasks: HashMap<u64, AbortHandle>,
+    /// `LyricsSong` asks waiting for the current song's details (see `answer_lyrics_waits`).
+    lyrics_waits: Vec<(String, oneshot::Sender<Option<crate::lyrics::SongFacts>>)>,
     like_news_tx: mpsc::UnboundedSender<LikeNews>,
     like_news_rx: mpsc::UnboundedReceiver<LikeNews>,
 }
@@ -780,6 +788,7 @@ impl Engine {
             like_seq: 0,
             likes_sent: HashMap::new(),
             like_tasks: HashMap::new(),
+            lyrics_waits: Vec::new(),
             like_news_tx,
             like_news_rx,
         };
@@ -874,6 +883,9 @@ impl Engine {
             }
             if self.dirty {
                 self.write_state();
+            }
+            if !self.lyrics_waits.is_empty() {
+                self.answer_lyrics_waits();
             }
         }
         // Every way out (the socket's quit, idle, a signal) ends here: one last save, while
@@ -1021,8 +1033,19 @@ impl Engine {
                 let _ = reply.send(self.likes.tab(&video_id));
                 return;
             }
-            EngineCmd::LyricsSong { video_id, reply } => {
-                let _ = reply.send(self.lyrics_song(&video_id));
+            EngineCmd::LyricsSong {
+                video_id,
+                wait,
+                reply,
+            } => {
+                match self.lyrics_song(&video_id) {
+                    None if wait && self.status.video_id.as_deref() == Some(&video_id) => {
+                        self.lyrics_waits.push((video_id, reply));
+                    }
+                    facts => {
+                        let _ = reply.send(facts);
+                    }
+                }
                 return;
             }
             EngineCmd::LearnSong { video_id, next } => {
@@ -2623,6 +2646,25 @@ impl Engine {
             self.dirty = true;
         }
         self.emit(EngineEvent::State(status));
+    }
+
+    /// Answers the `LyricsSong` asks waiting on the current song's details: once they are
+    /// known, or once another song is current (then with what is known of the asked one).
+    /// Run after every turn of the loop, so whatever filled the details (the link, the list)
+    /// answers them at once. An ask whose asker gave up is dropped.
+    fn answer_lyrics_waits(&mut self) {
+        let waits = std::mem::take(&mut self.lyrics_waits);
+        for (video_id, reply) in waits {
+            if reply.is_closed() {
+                continue;
+            }
+            let facts = self.lyrics_song(&video_id);
+            if facts.is_some() || self.status.video_id.as_deref() != Some(&video_id) {
+                let _ = reply.send(facts);
+            } else {
+                self.lyrics_waits.push((video_id, reply));
+            }
+        }
     }
 
     /// A song's details for the lyrics services (`EngineCmd::LyricsSong`). The shown song's
@@ -4648,6 +4690,7 @@ mod tests {
                 let (reply, rx) = oneshot::channel();
                 cmds.send(EngineCmd::LyricsSong {
                     video_id: id,
+                    wait: false,
                     reply,
                 })
                 .await
@@ -4664,6 +4707,66 @@ mod tests {
         assert_eq!(ask(vid('A')).await, Some(facts('A')));
         assert_eq!(ask(vid('B')).await, Some(facts('B')));
         assert_eq!(ask(vid('Z')).await, None);
+    }
+
+    /// Fix round 1: lyrics asked for the song just played by id, before its details land,
+    /// wait for them (here: its link resolves 300 ms later) and then get them. A song that is
+    /// not current is answered at once, and a wait ends when another song becomes current.
+    #[tokio::test]
+    async fn lyrics_wait_for_the_current_songs_details() {
+        async fn ask(
+            cmds: &mpsc::Sender<EngineCmd>,
+            id: &str,
+            wait: bool,
+        ) -> oneshot::Receiver<Option<crate::lyrics::SongFacts>> {
+            let (reply, rx) = oneshot::channel();
+            cmds.send(EngineCmd::LyricsSong {
+                video_id: id.into(),
+                wait,
+                reply,
+            })
+            .await
+            .unwrap();
+            rx
+        }
+        let mut r = rig(Setup {
+            delays: vec![("AAAAAAAAAAA", 300)],
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Buffering).await;
+        // Without waiting: nothing known yet.
+        assert_eq!(
+            ask(&r.cmds, "AAAAAAAAAAA", false).await.await.unwrap(),
+            None
+        );
+        // A song that is not current: answered at once, even when asked to wait.
+        assert_eq!(ask(&r.cmds, "BBBBBBBBBBB", true).await.await.unwrap(), None);
+        let started = std::time::Instant::now();
+        let facts = ask(&r.cmds, "AAAAAAAAAAA", true)
+            .await
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.title, "Song AAAAAAAAAAA");
+        assert_eq!(facts.artist, "Artist");
+        assert!(started.elapsed() >= Duration::from_millis(150), "it waited");
+
+        // Another song becoming current ends a wait, with what is known of the asked one.
+        let mut r = rig(Setup {
+            delays: vec![("AAAAAAAAAAA", 5_000)],
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Buffering).await;
+        let rx = ask(&r.cmds, "AAAAAAAAAAA", true).await;
+        r.play("BBBBBBBBBBB").await;
+        let got = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("answered when the song changed");
+        assert_eq!(got.unwrap(), None);
     }
 
     /// A lone song's radio is the queue the user asked for (YouTube Music shows it as the

@@ -72,7 +72,9 @@ async fn kugou_inner(
             0.0
         };
         // `off > 3` is false for NaN, as in JavaScript: a candidate with an unreadable length
-        // passes this check (and then never beats another).
+        // passes this check. It never beats a best already chosen (`NaN < b` is false), but
+        // checked first it becomes the best, and then nothing replaces it (`off < NaN` is
+        // false too). Kept as the widget had it; real KuGou lengths are always numbers.
         if off > 3.0 || !truthy(c.get("id")) || !truthy(c.get("accesskey")) {
             continue;
         }

@@ -35,9 +35,10 @@ impl LyricsWeb for Saved {
             // A body that parses to nothing (null, false, 0, "") is a failure, as in the widget.
             return Fetched::from_json(v.clone());
         }
+        // The engine's own rule for a status, so this fake can't drift from it.
         match a.get("status").and_then(Value::as_u64) {
-            Some(s) if (400..500).contains(&s) && s != 408 && s != 429 => Fetched::NotFound,
-            _ => Fetched::Failed,
+            Some(s) => Fetched::from_status(u16::try_from(s).unwrap_or(0)),
+            None => Fetched::Failed,
         }
     }
 }

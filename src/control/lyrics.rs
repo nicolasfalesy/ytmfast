@@ -43,6 +43,10 @@ pub const KEPT: usize = 20;
 /// lyrics are a few KB.
 pub const MAX_TEXT: usize = 256 * 1024;
 
+/// How long lyrics wait for the current song's details (title, artists, length) when they are
+/// not known yet: they land within about a second of a play by id.
+pub const DETAILS_WAIT: Duration = Duration::from_secs(3);
+
 /// How long a "this song has no lyrics" stands, here and in the engine's tab cache, before the
 /// song is asked about again.
 pub const NONE_FOR: Duration = Duration::from_secs(60 * 60);
@@ -84,14 +88,28 @@ impl LyricsTabs for EngineTabs {
         let _ = self.0.send(cmd).await;
     }
 
+    /// The current song's details may not be known yet (a play by id, or a list's first song,
+    /// asked about at once by a widget with its Lyrics tab open): the engine is asked to wait for
+    /// them, up to `DETAILS_WAIT`; then what it knows by then. Without this, that song would get
+    /// YouTube Music's plain lyrics only, and the widget would not ask again.
     async fn song(&self, video_id: &str) -> Option<SongFacts> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = EngineCmd::LyricsSong {
-            video_id: video_id.into(),
-            reply,
+        let ask = |wait: bool| async move {
+            let (reply, rx) = oneshot::channel();
+            let cmd = EngineCmd::LyricsSong {
+                video_id: video_id.into(),
+                wait,
+                reply,
+            };
+            self.0.send(cmd).await.ok()?;
+            Some(rx)
         };
-        self.0.send(cmd).await.ok()?;
-        rx.await.ok().flatten()
+        let rx = ask(true).await?;
+        match tokio::time::timeout(DETAILS_WAIT, rx).await {
+            Ok(answer) => answer.ok().flatten(),
+            // Gave up waiting (dropping the receiver lets the engine drop the ask): what is
+            // known now.
+            Err(_) => ask(false).await?.await.ok().flatten(),
+        }
     }
 }
 
@@ -239,4 +257,39 @@ fn capped(mut lyrics: Lyrics) -> Lyrics {
         lyrics.text.truncate(end);
     }
     lyrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A song whose details never land within `DETAILS_WAIT`: the wait is given up and the
+    /// engine is asked for what it knows now.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_details_is_bounded() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let engine = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut asks = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                if let EngineCmd::LyricsSong { wait, reply, .. } = cmd {
+                    asks.push((wait, tokio::time::Instant::now()));
+                    if wait {
+                        // Never answered: the details never land.
+                        held.push(reply);
+                    } else {
+                        let _ = reply.send(None);
+                        return asks;
+                    }
+                }
+            }
+            asks
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(EngineTabs(tx).song("AAAAAAAAAAA").await, None);
+        let asks = engine.await.unwrap();
+        assert_eq!(asks.len(), 2);
+        assert!(asks[0].0 && !asks[1].0, "waiting first, then not");
+        assert_eq!(asks[1].1 - start, DETAILS_WAIT);
+    }
 }

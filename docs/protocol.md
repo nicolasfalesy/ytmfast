@@ -330,9 +330,11 @@ Where they come from, in order (the bar widget's rules, moved into the engine un
    LRCLIB's plain text.
 
 The services are told the song's title, artists, album and length, nothing else. The engine
-knows these for the song playing and every queued song; for any other song (or one played by
-id, in the moment before its details arrive) only YouTube Music is asked, and that answer is
-not kept. They are reached over https only, at `krcs.kugou.com`, `lyrics.kugou.com` and
+knows these for the song playing and every queued song. Asked about the current song before
+its details are known (a song played by id, or a list's first song, in the second before its
+details arrive), the engine waits for them, up to 3 s, or until another song is current. For
+any other song, or when the details still are not known, only YouTube Music is asked, and
+that answer is not kept. They are reached over https only, at `krcs.kugou.com`, `lyrics.kugou.com` and
 `lrclib.net` (no other request may go to those hosts, and lyrics requests may go nowhere
 else), with no redirects followed, 8 s and 2 MiB per answer, and a KuGou answer may inflate
 to at most 1 MiB. An answer that would not fit one line (1 MiB) counts as none from that

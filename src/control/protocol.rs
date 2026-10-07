@@ -112,8 +112,8 @@ pub enum Request {
     Mute {
         on: bool,
     },
-    /// A song's plain lyrics (`control::lyrics`): answered like a browsing command, to the
-    /// asking client only.
+    /// A song's lyrics, timed when they can be (KuGou's words, LRCLIB's lines, else plain text;
+    /// `control::lyrics`): answered like a browsing command, to the asking client only.
     Lyrics {
         video_id: String,
     },
