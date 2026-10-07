@@ -40,6 +40,24 @@ fn private_env(cmd: &mut Command, root: &Path, bus: &str) {
         .env("DBUS_SESSION_BUS_ADDRESS", bus);
 }
 
+/// A fake YouTube Music for the import's account check (ruling P19), so the import never
+/// reaches YouTube: the command sends the check to it through `YTMFAST_TEST_API_BASE` (read
+/// by debug builds only). It answers with a made-up name.
+async fn fake_api() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let body = serde_json::json!({"actions": [{"openPopupAction": {"popup": {
+        "multiPageMenuRenderer": {"header": {"activeAccountHeaderRenderer": {
+            "accountName": {"runs": [{"text": "Fake Person"}]}}}}}}}]});
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/account/account_menu"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    server
+}
+
 const RIGHT: &str = "fake-right-password";
 const SCHEMA: (&str, &str) = ("xdg:schema", "chrome_libsecret_os_crypt_password_v2");
 
@@ -220,16 +238,18 @@ fn brave_origin_import_reads_the_safe_storage_key() {
     // The whole command: the wrong key is tried and passed over, the session saved.
     let profile = r.join("home/config/BraveSoftware/Brave-Origin/Default");
     brave_profile(&profile);
+    let api = runtime.block_on(fake_api());
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ytmfast"));
     cmd.args(["import-session", "--browser", "brave-origin"]);
     private_env(&mut cmd, r, &bus);
+    cmd.env("YTMFAST_TEST_API_BASE", api.uri());
     let out = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     // What follows the save depends on whether an engine runs on this machine; only the
     // import itself is this test's business.
     assert!(
-        stdout.starts_with("Imported 1 cookies\n"),
+        stdout.starts_with("Signed in as Fake Person\nImported 1 cookies\n"),
         "{stdout} {stderr}"
     );
     assert!(!format!("{stdout}{stderr}").contains("fake-sapisid"));

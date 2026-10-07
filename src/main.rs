@@ -14,7 +14,9 @@ use ytmfast::audio::fetch::{Relink, TrackBuffer};
 use ytmfast::audio::player::{AudioEvent, AudioPlayer};
 use ytmfast::audio::pw::PipeWireSink;
 use ytmfast::audio::sink::{NullSink, Sink};
-use ytmfast::auth::{KeyringStore, SafeStorageKeys, Session, SessionStore, chromium, sidhash};
+use ytmfast::auth::{
+    KeyringStore, MemoryStore, SafeStorageKeys, Session, SessionStore, chromium, sidhash,
+};
 use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
@@ -39,7 +41,8 @@ commands:
                     pear-desktop profile (default: ~/.config/YouTube Music), or with
                     --browser brave-origin from the Brave Origin profile (default:
                     ~/.config/BraveSoftware/Brave-Origin/Default), opening its cookies
-                    with the keyring's \"Brave Safe Storage\" key
+                    with the keyring's \"Brave Safe Storage\" key; it checks the
+                    session with YouTube Music and prints the account's name first
   play <videoId> [--null-sink] [--seconds N]
                     play one song to the default output and exit (debug helper);
                     --null-sink plays in real time into nothing (benchmarks),
@@ -172,9 +175,10 @@ fn config_dir_in(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
-/// Imports the session from the profile and saves it in the login keyring, then stops a
-/// running engine so it can't write its old session back over the new one. Prints only the
-/// cookie count: never a value.
+/// Imports the session from the profile, checks it with YouTube Music and prints the
+/// account's name, saves it in the login keyring, then stops a running engine so it can't
+/// write its old session back over the new one. Prints the name and the cookie count: never a
+/// value.
 fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
     let env = |k: &str| std::env::var_os(k);
     let default = match source {
@@ -212,7 +216,7 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
         eprintln!("ytmfast: {not_signed_in}");
         return ExitCode::from(1);
     }
-    // One small runtime for the keyring calls; the daemon builds its own.
+    // One small runtime for the account check and the keyring calls; the daemon builds its own.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -220,6 +224,25 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
         Ok(r) => r,
         Err(_) => {
             eprintln!("ytmfast: could not start the async runtime");
+            return ExitCode::from(1);
+        }
+    };
+    // Spec A2 (ruling P19): the session must sign someone in before it replaces the saved
+    // one, and the account's name shows which Google account it is (a browser signed in to
+    // another one would otherwise swap the library silently). Any failure saves nothing: a
+    // session that can't be checked is not known to work.
+    let session = match runtime.block_on(check_account(session)) {
+        Ok((session, name)) => {
+            // The bar widget reads this line as it is ("Signed in as <name>").
+            println!("Signed in as {name}");
+            session
+        }
+        Err(Error::SignedOut) => {
+            eprintln!("ytmfast: {not_signed_in}");
+            return ExitCode::from(1);
+        }
+        Err(_) => {
+            eprintln!("ytmfast: {CHECK_FAILED}");
             return ExitCode::from(1);
         }
     };
@@ -255,6 +278,38 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
 }
 
 const NOT_SIGNED_IN: &str = "no YouTube sign-in in that profile; sign in to the app first";
+/// The account check could not be made (no network, an error answer). The bar widget shows it
+/// as it is.
+const CHECK_FAILED: &str = "could not check the sign-in with YouTube Music; try again";
+
+/// Asks YouTube Music for the session's account name (`Innertube::account_name`). Returns the
+/// session as it is after the answer (a cookie the answer rotated is kept, so the copy saved
+/// is the newest) and the name.
+///
+/// The check's own client saves rotations to a throwaway store: the keyring is written once,
+/// by the caller, and only after the check passed.
+async fn check_account(session: Session) -> Result<(Session, String), Error> {
+    let shared = Arc::new(Mutex::new(session));
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let name = account_api(shared.clone(), store).account_name().await?;
+    let session = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok((session, name))
+}
+
+/// The client the account check goes through: production's (https, the allowlist). A debug
+/// build alone also reads `YTMFAST_TEST_API_BASE`, the import tests' local fake server, so no
+/// test reaches YouTube; a release build never looks at it, so nothing can send a real
+/// session's check anywhere else.
+fn account_api(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>) -> Innertube {
+    #[cfg(debug_assertions)]
+    if let Some(base) = std::env::var("YTMFAST_TEST_API_BASE")
+        .ok()
+        .and_then(|b| url::Url::parse(&b).ok())
+    {
+        return Innertube::new(session, store, base);
+    }
+    Innertube::production(session, store)
+}
 /// The bar widget shows it as it is.
 const BRAVE_NOT_SIGNED_IN: &str = "Brave Origin isn't signed in to YouTube Music";
 

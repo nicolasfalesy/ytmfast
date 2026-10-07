@@ -19,6 +19,24 @@ use ytmfast::error::Error;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// A fake YouTube Music for the import's account check (ruling P19), so the import never
+/// reaches YouTube: the command sends the check to it through `YTMFAST_TEST_API_BASE` (read
+/// by debug builds only). It answers with a made-up name.
+async fn fake_api() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let body = serde_json::json!({"actions": [{"openPopupAction": {"popup": {
+        "multiPageMenuRenderer": {"header": {"activeAccountHeaderRenderer": {
+            "accountName": {"runs": [{"text": "Fake Person"}]}}}}}}}]});
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/account/account_menu"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// Kills a child process when the test ends, pass or panic.
 struct Reap(Child);
 
@@ -167,9 +185,11 @@ async fn import_stops_the_running_engine() {
 
     let p = r.join("profile");
     profile(&p);
+    let api = fake_api().await;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ytmfast"));
     cmd.args(["import-session", "--profile"]).arg(&p);
     private_env(&mut cmd, r, &bus);
+    cmd.env("YTMFAST_TEST_API_BASE", api.uri());
     let out = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -178,6 +198,7 @@ async fn import_stops_the_running_engine() {
         return;
     }
     assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("Signed in as Fake Person"), "{stdout}");
     assert!(stdout.contains("Imported 2 cookies"), "{stdout}");
     assert!(stdout.contains("Restarted the running engine"), "{stdout}");
     assert!(!format!("{stdout}{stderr}").contains("fake-new"));
@@ -202,6 +223,7 @@ async fn import_stops_the_running_engine() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ytmfast"));
     cmd.args(["import-session", "--profile"]).arg(&p);
     private_env(&mut cmd, r, &bus);
+    cmd.env("YTMFAST_TEST_API_BASE", api.uri());
     let out = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());

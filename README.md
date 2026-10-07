@@ -62,9 +62,11 @@ From the desktop app (close it first):
 ytmfast import-session
 ```
 
-Either way, it copies only the YouTube and Google sign-in cookies into the login keyring (never into a plain file)
-and prints how many it took, never a value. It refuses a profile that isn't signed in. If the engine is running, it
-is stopped, so the next play starts it with the new session.
+Either way, it first asks YouTube Music whose session it is and prints `Signed in as <name>`, so a browser signed
+in to another Google account is seen at once. It refuses a profile that isn't signed in, or whose sign-in YouTube
+Music no longer takes, and saves nothing when that check can't be made. Then it copies only the YouTube and Google
+sign-in cookies into the login keyring (never into a plain file) and prints how many it took, never a value. If the
+engine is running, it is stopped, so the next play starts it with the new session.
 
 ## Build
 

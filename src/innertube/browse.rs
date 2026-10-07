@@ -171,6 +171,26 @@ impl Innertube {
             .map(|l| (l.text, l.source)))
     }
 
+    /// The signed-in account's name, as YouTube Music's account button shows it: one
+    /// `account/account_menu` request. `import-session` asks it before saving a session, so a
+    /// session that signs nobody in is never saved and a wrong Google account is seen at once
+    /// (spec A2, ruling P19).
+    ///
+    /// The name is cleaned for a terminal and the bar (`account_name_from`). Errors:
+    /// `SignedOut` for no session, a 401 or 403, or an answer with no account in it (YouTube
+    /// answers a dead session with the signed-out menu, not an error); otherwise as for
+    /// `browse`. Not logged here: the one caller prints its own fixed line, and a log line
+    /// before it would only push it off the last line the bar widget reads.
+    pub async fn account_name(&self) -> Result<String, Error> {
+        const ENDPOINT: &str = "account/account_menu";
+        let bytes = self
+            .post_with(&clients::WEB_REMIX, ENDPOINT, &body(Map::new()), true)
+            .await?;
+        let answer: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Internal(format!("the {ENDPOINT} answer could not be read")))?;
+        account_name_from(&answer).ok_or(Error::SignedOut)
+    }
+
     /// POSTs the music web context plus `fields` to `endpoint` and reads the answer as JSON.
     async fn post_json(
         &self,
@@ -297,6 +317,31 @@ fn invisible(c: char) -> bool {
     )
 }
 
+/// The longest account name kept, in characters: Google's own limit is far shorter, and a
+/// line in a terminal or a label in the bar has no room for more.
+const MAX_ACCOUNT_NAME: usize = 100;
+
+/// The account's name in an `account/account_menu` answer (its header's `accountName` runs,
+/// joined), or `None` when the answer names no account. Control and invisible characters are
+/// dropped (an escape sequence or a bidi override must reach neither a terminal nor the bar),
+/// the ends trimmed, and the name cut to `MAX_ACCOUNT_NAME` characters; an empty result is no
+/// name.
+fn account_name_from(answer: &Value) -> Option<String> {
+    let runs = answer
+        .pointer("/actions/0/openPopupAction/popup/multiPageMenuRenderer/header")?
+        .pointer("/activeAccountHeaderRenderer/accountName/runs")?
+        .as_array()?;
+    let joined: String = runs
+        .iter()
+        .filter_map(|r| r.get("text")?.as_str())
+        .flat_map(str::chars)
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .collect();
+    let name: String = joined.trim().chars().take(MAX_ACCOUNT_NAME).collect();
+    let name = name.trim_end().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 fn check_video_id(id: &str) -> Result<(), Error> {
     if is_video_id(id) {
         Ok(())
@@ -392,6 +437,42 @@ mod tests {
         assert_eq!(check_params(Some("")), Ok(None));
         assert_eq!(check_params(Some("ab+/=")), Ok(Some("ab+/=")));
         assert!(check_params(Some("a b")).is_err());
+    }
+
+    #[test]
+    fn account_name_reads_the_header_only() {
+        let menu = |header: Value| {
+            json!({"actions": [{"openPopupAction": {"popup": {"multiPageMenuRenderer": {
+                "header": header}}}}]})
+        };
+        let named = |runs: Value| {
+            menu(json!({"activeAccountHeaderRenderer": {"accountName": {"runs": runs}}}))
+        };
+        assert_eq!(
+            account_name_from(&named(json!([{"text": "Fake"}, {"text": " Person"}]))),
+            Some("Fake Person".into())
+        );
+        // A run without text is skipped, not the whole name.
+        assert_eq!(
+            account_name_from(&named(json!([{"text": "Fake"}, {"bold": true}]))),
+            Some("Fake".into())
+        );
+        for none in [
+            json!({}),
+            json!({"actions": []}),
+            menu(json!({"someOtherHeaderRenderer": {}})),
+            named(json!("Fake Person")),
+            named(json!([])),
+            named(json!([{"text": "\u{200F}\t"}])),
+        ] {
+            assert_eq!(account_name_from(&none), None, "{none}");
+        }
+        // Cut at the cap, and never left ending in a space.
+        let long = format!("{} b", "a".repeat(MAX_ACCOUNT_NAME - 1));
+        assert_eq!(
+            account_name_from(&named(json!([{ "text": long }]))),
+            Some("a".repeat(MAX_ACCOUNT_NAME - 1))
+        );
     }
 
     #[test]
