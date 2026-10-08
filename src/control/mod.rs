@@ -96,7 +96,9 @@ pub fn peer_allowed(peer_uid: u32, my_uid: u32) -> bool {
 /// How the daemon behaves.
 #[derive(Clone)]
 pub struct Options {
-    pub idle: IdlePolicy,
+    /// When to quit with nothing playing. `None` (`daemon --stay`): never; the engine stays
+    /// up from login, for a user who'd rather keep it running than start it on demand.
+    pub idle: Option<IdlePolicy>,
     /// `/sys/class/power_supply` in production; tests point it at a folder they fill.
     pub power_supply_root: PathBuf,
     /// Where to serve MPRIS, if anywhere. Off by default, so a test (or any other caller)
@@ -128,7 +130,7 @@ impl std::fmt::Debug for Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            idle: IdlePolicy::default(),
+            idle: Some(IdlePolicy::default()),
             power_supply_root: PathBuf::from(idle::POWER_SUPPLY_ROOT),
             mpris: None,
             browser: None,
@@ -294,7 +296,9 @@ async fn serve_with(
     // waking the hub. It first fires at the shorter (battery) limit, then at the limit for
     // the power source of that moment: unplugging mid-wait is noticed by then, without
     // polling the power supply.
-    let mut idle_timer = Some(idle_sleep(last_active + policy.earliest()));
+    // Without a policy there is never a timer: the hub sleeps until a connection or event.
+    let arm = |from: Instant| policy.map(|p| idle_sleep(from + p.earliest()));
+    let mut idle_timer = arm(last_active);
 
     loop {
         tokio::select! {
@@ -330,13 +334,13 @@ async fn serve_with(
                 if now_playing != playing {
                     playing = now_playing;
                     last_active = Instant::now();
-                    idle_timer = (!playing).then(|| idle_sleep(last_active + policy.earliest()));
+                    idle_timer = if playing { None } else { arm(last_active) };
                 }
             }
             () = shared.hub.touched() => {
                 last_active = Instant::now();
                 if !playing {
-                    idle_timer = Some(idle_sleep(last_active + policy.earliest()));
+                    idle_timer = arm(last_active);
                 }
             }
             () = shared.hub.quit_requested() => return Exit::Quit,
@@ -345,6 +349,8 @@ async fn serve_with(
             // playing there is no idle timer: without this the daemon would never exit.
             () = shared.cmds.closed() => return Exit::EngineGone,
             () = wait(&mut idle_timer) => {
+                // A timer only exists with a policy.
+                let Some(policy) = policy else { continue };
                 let on_battery = idle::on_battery_in(&root);
                 if idle::should_quit(last_active, Instant::now(), playing, on_battery, policy) {
                     return Exit::Idle;

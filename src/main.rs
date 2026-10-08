@@ -33,9 +33,11 @@ const USAGE: &str = "\
 usage: ytmfast <command>
 
 commands:
-  daemon [--null-sink]
+  daemon [--stay] [--null-sink]
                     run the engine and its control socket (systemd starts it through
-                    ytmfast.socket); --null-sink plays into nothing (benchmarks)
+                    ytmfast.socket); it quits after a few idle minutes, unless --stay
+                    keeps it running until stopped; --null-sink plays into nothing
+                    (benchmarks)
   import-session [--browser brave-origin] [--profile PATH]
                     store a YouTube Music session in the login keyring, read from the
                     pear-desktop profile (default: ~/.config/YouTube Music), or with
@@ -55,8 +57,10 @@ options:
 #[derive(Debug, PartialEq)]
 enum Command {
     /// `null_sink`: play into a real-time `NullSink` instead of PipeWire.
+    /// `stay`: never quit when idle (`--stay`).
     Daemon {
         null_sink: bool,
+        stay: bool,
     },
     /// Where the session comes from, and the profile folder when `--profile` gave one.
     ImportSession {
@@ -92,14 +96,26 @@ fn parse(args: impl IntoIterator<Item = String>) -> Command {
     let args: Vec<String> = args.into_iter().collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
-        ["daemon"] => Command::Daemon { null_sink: false },
-        ["daemon", "--null-sink"] => Command::Daemon { null_sink: true },
+        ["daemon", rest @ ..] => parse_daemon(rest).unwrap_or(Command::Usage),
         ["import-session", rest @ ..] => parse_import(rest).unwrap_or(Command::Usage),
         ["play", rest @ ..] => parse_play(rest).map_or(Command::Usage, Command::Play),
         ["-V" | "--version"] => Command::Version,
         ["-h" | "--help"] => Command::Help,
         _ => Command::Usage,
     }
+}
+
+/// `daemon`'s options, in any order, each at most once.
+fn parse_daemon(args: &[&str]) -> Option<Command> {
+    let (mut null_sink, mut stay) = (false, false);
+    for a in args {
+        match *a {
+            "--null-sink" if !null_sink => null_sink = true,
+            "--stay" if !stay => stay = true,
+            _ => return None,
+        }
+    }
+    Some(Command::Daemon { null_sink, stay })
 }
 
 /// `import-session`'s options, in any order, each at most once.
@@ -413,8 +429,8 @@ fn backend() -> Result<Arc<LazySession>, String> {
     Ok(Arc::new(LazySession::new(store, build)))
 }
 
-/// Runs the engine behind the control socket until `quit` or idle.
-fn daemon(null_sink: bool) -> ExitCode {
+/// Runs the engine behind the control socket until `quit` or idle (never idle with `stay`).
+fn daemon(null_sink: bool, stay: bool) -> ExitCode {
     // First, while this is the only thread: taking systemd's socket clears the LISTEN_*
     // variables, and changing the environment is only sound before other threads exist.
     // SAFETY: `main` calls this before anything has started a thread.
@@ -444,7 +460,7 @@ fn daemon(null_sink: bool) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(runtime) => match runtime.block_on(serve(listener, null_sink)) {
+        Ok(runtime) => match runtime.block_on(serve(listener, null_sink, stay)) {
             Ok(Exit::Idle) => {
                 eprintln!("ytmfast: nothing played for a while; quitting");
                 ExitCode::SUCCESS
@@ -477,6 +493,7 @@ fn daemon(null_sink: bool) -> ExitCode {
 async fn serve(
     listener: std::os::unix::net::UnixListener,
     null_sink: bool,
+    stay: bool,
 ) -> Result<Exit, String> {
     // First, so a stop that comes while anything below starts still ends cleanly.
     let shutdown =
@@ -523,6 +540,7 @@ async fn serve(
         mpris: Some(ytmfast::mpris::Bus::Session),
         browser: Some(backend),
         lyrics_web: Some(Arc::new(ytmfast::lyrics::HttpWeb::new())),
+        idle: (!stay).then(control::idle::IdlePolicy::default),
         ..control::Options::default()
     };
     Ok(control::run(listener, engine, cmds, events, options, shutdown).await)
@@ -617,7 +635,7 @@ fn main() -> ExitCode {
     // Read once, before anything can play.
     ytmfast::trace::init_from_env();
     match parse(std::env::args().skip(1)) {
-        Command::Daemon { null_sink } => daemon(null_sink),
+        Command::Daemon { null_sink, stay } => daemon(null_sink, stay),
         Command::ImportSession { source, profile } => import_session(source, profile),
         Command::Play(args) => play(args),
         Command::Version => {
@@ -645,11 +663,14 @@ mod tests {
 
     #[test]
     fn cli_parses_subcommands() {
-        assert_eq!(p(&["daemon"]), Command::Daemon { null_sink: false });
-        assert_eq!(
-            p(&["daemon", "--null-sink"]),
-            Command::Daemon { null_sink: true }
-        );
+        let d = |null_sink, stay| Command::Daemon { null_sink, stay };
+        assert_eq!(p(&["daemon"]), d(false, false));
+        assert_eq!(p(&["daemon", "--null-sink"]), d(true, false));
+        assert_eq!(p(&["daemon", "--stay"]), d(false, true));
+        assert_eq!(p(&["daemon", "--stay", "--null-sink"]), d(true, true));
+        assert_eq!(p(&["daemon", "--null-sink", "--stay"]), d(true, true));
+        assert_eq!(p(&["daemon", "--stay", "--stay"]), Command::Usage);
+        assert_eq!(p(&["daemon", "--wat"]), Command::Usage);
         assert_eq!(p(&["import-session"]), import(Source::PearDesktop, None));
         assert_eq!(
             p(&["import-session", "--profile", "/x/YouTube Music"]),

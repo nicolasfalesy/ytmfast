@@ -94,6 +94,23 @@ systemctl --user enable --now ytmfast.socket
 The first connection to `$XDG_RUNTIME_DIR/ytmfast/socket` then starts `ytmfast daemon`. The
 socket protocol is described in [docs/protocol.md](docs/protocol.md).
 
+### Keep it running
+
+To start the engine at login and keep it up instead (`ytmfast daemon --stay`; paused, it uses
+no CPU and about 8 MB of memory), add the drop-in and have the login target pull it in:
+
+```sh
+mkdir -p ~/.config/systemd/user/ytmfast.service.d
+cp dist/systemd/ytmfast.service.d/stay.conf ~/.config/systemd/user/ytmfast.service.d/
+systemctl --user daemon-reload
+systemctl --user add-wants default.target ytmfast.service
+systemctl --user restart ytmfast.service
+```
+
+It restarts after a crash. To undo, delete
+`~/.config/systemd/user/default.target.wants/ytmfast.service` and the drop-in, then run
+`systemctl --user daemon-reload`.
+
 ## Startup trace
 
 With `YTMFAST_TRACE=1` in its environment, the engine prints one line to stderr per phase of

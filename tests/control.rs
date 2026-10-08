@@ -81,12 +81,18 @@ struct Daemon {
 }
 
 fn daemon(on_ac: bool) -> Daemon {
+    daemon_with(on_ac, Options::default().idle)
+}
+
+/// `daemon` with its own idle rule (`None`: never quits when idle, `daemon --stay`).
+fn daemon_with(on_ac: bool, idle: Option<control::idle::IdlePolicy>) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let power = power(on_ac);
     let (listener, path) = listener(dir.path());
     let player = AudioPlayer::spawn(Box::new(NullSink::new()));
     let (engine, cmds, events) = Engine::new(Arc::new(Hang), Arc::new(Hang), player);
     let options = Options {
+        idle,
         power_supply_root: power.path().to_path_buf(),
         ..Options::default()
     };
@@ -481,6 +487,21 @@ async fn daemon_never_quits_while_playing() {
     let w = Window::around(&mut c, 2, r#"{"id":2,"cmd":"pause"}"#).await;
     assert_eq!(d.task.await.unwrap(), Exit::Idle);
     w.assert_quit_after(Instant::now(), 5 * MIN);
+}
+
+/// `daemon --stay`: no idle quit on either power source, while `quit` still ends it.
+#[tokio::test(start_paused = true)]
+async fn daemon_with_no_idle_rule_stays_on() {
+    for on_ac in [true, false] {
+        let d = daemon_with(on_ac, None);
+        let mut c = connect(&d.path).await;
+        Window::around(&mut c, 1, r#"{"id":1,"cmd":"status"}"#).await;
+        tokio::time::sleep(24 * 60 * MIN).await;
+        assert!(!d.task.is_finished(), "quit while idle (on AC: {on_ac})");
+        c.send(r#"{"id":2,"cmd":"quit"}"#).await;
+        assert_eq!(c.reply(2).await["ok"], true);
+        assert_eq!(d.task.await.unwrap(), Exit::Quit);
+    }
 }
 
 #[tokio::test(start_paused = true)]
