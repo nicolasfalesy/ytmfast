@@ -66,6 +66,7 @@ mod tests {
     fn sidhash_vector() {
         let session = Session {
             cookies: vec![yt("SAPISID", "abc")],
+            account: None,
         };
         let expected = format!(
             "SAPISIDHASH 1700000000_{}",
@@ -85,6 +86,7 @@ mod tests {
                 yt("SAPISID", "plain"),
                 yt("__Secure-1PAPISID", "one"),
             ],
+            account: None,
         };
         let ts = 1_700_000_000;
         let part = |sid: &str| format!("{ts}_{}", sha1_hex(&format!("{ts} {sid} {ORIGIN}")));
@@ -103,6 +105,7 @@ mod tests {
     fn sapisid_falls_back_to_3papisid() {
         let session = Session {
             cookies: vec![yt("__Secure-3PAPISID", "three")],
+            account: None,
         };
         let ts = 1_700_000_000;
         let part = format!("{ts}_{}", sha1_hex(&format!("{ts} three {ORIGIN}")));
@@ -117,7 +120,10 @@ mod tests {
         // A google.com SAPISID is not the one youtube.com requests are signed with.
         let mut g = yt("SAPISID", "google");
         g.domain = ".google.com".into();
-        let session = Session { cookies: vec![g] };
+        let session = Session {
+            cookies: vec![g],
+            account: None,
+        };
         assert_eq!(authorization(&session, ORIGIN, 1), None);
         assert_eq!(authorization(&Session::default(), ORIGIN, 1), None);
         assert_eq!(authorization(&session, "not a url", 1), None);
@@ -127,7 +133,10 @@ mod tests {
     fn expired_sid_is_ignored() {
         let mut c = yt("SAPISID", "abc");
         c.expires_utc = Some(1_000);
-        let session = Session { cookies: vec![c] };
+        let session = Session {
+            cookies: vec![c],
+            account: None,
+        };
         assert_eq!(authorization(&session, ORIGIN, 1_000), None);
     }
 }

@@ -182,13 +182,23 @@ impl Innertube {
     /// `browse`. Not logged here: the one caller prints its own fixed line, and a log line
     /// before it would only push it off the last line the bar widget reads.
     pub async fn account_name(&self) -> Result<String, Error> {
+        Ok(self.account().await?.name)
+    }
+
+    /// The signed-in account: its name (as `account_name`) and its channel id, from the same
+    /// one `account/account_menu` request. The id is what a renewed session is matched on
+    /// (`Session::account`): unlike the name, two Google accounts can't share it.
+    pub async fn account(&self) -> Result<Account, Error> {
         const ENDPOINT: &str = "account/account_menu";
         let bytes = self
             .post_with(&clients::WEB_REMIX, ENDPOINT, &body(Map::new()), true)
             .await?;
         let answer: Value = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Internal(format!("the {ENDPOINT} answer could not be read")))?;
-        account_name_from(&answer).ok_or(Error::SignedOut)
+        Ok(Account {
+            name: account_name_from(&answer).ok_or(Error::SignedOut)?,
+            channel_id: account_channel_from(&answer),
+        })
     }
 
     /// POSTs the music web context plus `fields` to `endpoint` and reads the answer as JSON.
@@ -342,6 +352,52 @@ fn account_name_from(answer: &Value) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The signed-in account, as `Innertube::account` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub name: String,
+    /// The account's own YouTube channel (`UC` and 22 more characters), or `None` when the
+    /// menu links to none.
+    pub channel_id: Option<String>,
+}
+
+/// The account's channel id in an `account/account_menu` answer: the first `browseEndpoint`
+/// in the menu's sections that opens a channel (`UC…`). In the answers seen (2026-10-07) that
+/// is the menu's first item, "Your channel"; the search does not depend on its position, only
+/// on the menu linking to one channel before any other, which the menu (the account's own
+/// links) does.
+fn account_channel_from(answer: &Value) -> Option<String> {
+    fn first_channel(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(o) => {
+                if let Some(id) = o
+                    .get("browseEndpoint")
+                    .and_then(|b| b.get("browseId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| is_channel_id(id))
+                {
+                    return Some(id.to_owned());
+                }
+                o.values().find_map(first_channel)
+            }
+            Value::Array(a) => a.iter().find_map(first_channel),
+            _ => None,
+        }
+    }
+    first_channel(
+        answer.pointer("/actions/0/openPopupAction/popup/multiPageMenuRenderer/sections")?,
+    )
+}
+
+/// A YouTube channel id: `UC` and 22 characters of the URL-safe base64 alphabet.
+fn is_channel_id(id: &str) -> bool {
+    id.len() == 24
+        && id.starts_with("UC")
+        && id[2..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn check_video_id(id: &str) -> Result<(), Error> {
     if is_video_id(id) {
         Ok(())
@@ -437,6 +493,37 @@ mod tests {
         assert_eq!(check_params(Some("")), Ok(None));
         assert_eq!(check_params(Some("ab+/=")), Ok(Some("ab+/=")));
         assert!(check_params(Some("a b")).is_err());
+    }
+
+    #[test]
+    fn account_channel_is_the_first_channel_link_in_the_sections() {
+        let menu = |sections: Value| {
+            json!({"actions": [{"openPopupAction": {"popup": {"multiPageMenuRenderer": {
+                "header": {"activeAccountHeaderRenderer": {
+                    "settingsEndpoint": {"browseEndpoint": {"browseId": "UCheaderheaderheaderhead"}}}},
+                "sections": sections}}}}]})
+        };
+        let link = |id: &str| json!({"compactLinkRenderer": {"navigationEndpoint": {"browseEndpoint": {"browseId": id}}}});
+        let section = |items: Vec<Value>| json!({"multiPageMenuSectionRenderer": {"items": items}});
+        assert_eq!(
+            account_channel_from(&menu(json!([section(vec![
+                link("FEmusic_library"),
+                link("UCfake0fake1fake2fake3fa"),
+                link("UCsecondsecondsecondseco"),
+            ])]))),
+            Some("UCfake0fake1fake2fake3fa".into())
+        );
+        for none in [
+            json!({}),
+            // Only the header links a channel: the header is not searched.
+            menu(json!([])),
+            // Not a channel id: too short, or a character outside the alphabet.
+            menu(json!([section(vec![link("UCshort")])])),
+            menu(json!([section(vec![link("UCfake0fake1fake2fake3/a")])])),
+            menu(json!([section(vec![link("VLAABaXVryaMi-_t2HXKVEQw")])])),
+        ] {
+            assert_eq!(account_channel_from(&none), None, "{none}");
+        }
     }
 
     #[test]

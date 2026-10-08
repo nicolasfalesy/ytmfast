@@ -124,6 +124,13 @@ fn has_prefix(name: &str, prefix: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub cookies: Vec<Cookie>,
+    /// The YouTube channel id of the account the session signs in (`UC…`), as the import's
+    /// account check saw it. The engine renews a session YouTube signed out only with one for
+    /// this same account (`innertube::Renew`), so a browser now signed in to another Google
+    /// account never swaps the library silently. `None` for a session saved before it was
+    /// kept, or when the check found no channel: such a session is never renewed on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl Session {
@@ -626,6 +633,7 @@ mod tests {
     fn debug_redacts_cookie_values() {
         let session = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "s3cr3t-value", "/", true)],
+            account: None,
         };
         let shown = format!("{session:?}");
         assert!(!shown.contains("s3cr3t-value"), "{shown}");
@@ -650,6 +658,7 @@ mod tests {
                 expired,
                 later,
             ],
+            account: None,
         };
         let h = session.cookie_header_at(&url("https://music.youtube.com/youtubei/v1/player"), NOW);
         // Longer paths first (RFC 6265 5.4), then stored order.
@@ -666,6 +675,7 @@ mod tests {
     fn set_cookie_rotation_updates_value() {
         let mut session = Session {
             cookies: vec![cookie(".youtube.com", "__Secure-3PSIDTS", "old", "/", true)],
+            account: None,
         };
         let u = url("https://music.youtube.com/youtubei/v1/player");
         let h = "__Secure-3PSIDTS=new; Domain=.youtube.com; Path=/; \
@@ -740,6 +750,7 @@ mod tests {
                 cookie(".youtube.com", "GONE", "x", "/", true),
                 cookie(".youtube.com", "KEPT", "y", "/", true),
             ],
+            account: None,
         };
         let u = url("https://www.youtube.com/");
         assert!(session.apply_set_cookie_at(
@@ -789,7 +800,10 @@ mod tests {
     fn session_json_roundtrip() {
         let mut c = cookie(".youtube.com", "SAPISID", "v", "/", true);
         c.expires_utc = Some(NOW);
-        let s = Session { cookies: vec![c] };
+        let s = Session {
+            cookies: vec![c],
+            account: None,
+        };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), s);
     }
@@ -799,6 +813,7 @@ mod tests {
         let store = MemoryStore::new();
         let s = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "v", "/", true)],
+            account: None,
         };
         store.save(&s).await.unwrap();
         assert_eq!(store.load().await.unwrap(), s);
@@ -813,6 +828,7 @@ mod tests {
         let store = MemoryStore::new();
         let s = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "v", "/", true)],
+            account: None,
         };
         store.save_without_prompt(&s).await.unwrap();
         assert_eq!(store.load().await.unwrap(), s);

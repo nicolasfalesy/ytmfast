@@ -9,12 +9,15 @@ pub mod clients;
 mod next;
 mod player;
 
-pub use browse::{MAX_QUERY, MoreKind, check_params, check_query};
+pub use browse::{Account, MAX_QUERY, MoreKind, check_params, check_query};
 pub use next::{NextPage, NextRequest, SongItem, SongNext, clean_artist};
 pub use player::{AudioFormat, PlayerResponse, Tracking};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
 
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use url::{Host, Url};
@@ -42,6 +45,41 @@ enum Target {
     Fixed(Url),
 }
 
+/// The shortest time between two tries at renewing a signed-out session (his pick, 2026-10-07:
+/// once per 10 minutes). One try reads the browser's cookies and asks YouTube who they sign
+/// in; when that fails, every request until the next try is signed out at once, and the bar
+/// shows its Sign in again screen, whose button imports by hand at any time.
+pub const RENEW_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// How long one renewal may take: the browser's cookie key comes from the keyring, which can
+/// hold a lookup behind an unlock prompt with no timeout of its own.
+const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A way to get a new session when YouTube no longer accepts the one the engine has.
+///
+/// YouTube can drop a copied browser session at any time, and it does it silently: the
+/// answers stay 200, as a guest's (2026-10-07: home page generic, library and history empty,
+/// the music looked like "another Google account"). `Innertube` notices that (`SignedOut`)
+/// and asks this once per `RENEW_EVERY`.
+#[async_trait]
+pub trait Renew: Send + Sync {
+    /// A session for the same account as `current` (`Session::account`), checked to sign it
+    /// in; or why there is none, as fixed text for the log (never a cookie or a name).
+    async fn renew(&self, current: &Session) -> Result<Session, String>;
+}
+
+struct Renewal {
+    hook: Arc<dyn Renew>,
+    every: Duration,
+    /// Held across one try, so requests signed out at the same moment make one try between
+    /// them, not one each.
+    last_try: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    /// How many tries succeeded. A request reads it before it is sent: when it changed by the
+    /// time the request came back signed out, another request already renewed the session,
+    /// and this one is sent again with it instead of trying too.
+    renewed: AtomicU64,
+}
+
 pub struct Innertube {
     http: reqwest::Client,
     session: Arc<Mutex<Session>>,
@@ -50,6 +88,9 @@ pub struct Innertube {
     /// Held across "copy the session, save it" by each background save, so two answers that
     /// both rotate a cookie can't save out of order and leave the older copy in the store.
     save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Renews a session YouTube signed out; `None` never renews (the import's own account
+    /// check, and tests that don't ask for it).
+    renewal: Option<Renewal>,
 }
 
 impl Innertube {
@@ -78,7 +119,20 @@ impl Innertube {
             store,
             target,
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            renewal: None,
         }
+    }
+
+    /// Renews a session YouTube signed out with `hook`, at most once per `every`
+    /// (`RENEW_EVERY` in production; tests pass their own).
+    pub fn with_renew(mut self, hook: Arc<dyn Renew>, every: Duration) -> Self {
+        self.renewal = Some(Renewal {
+            hook,
+            every,
+            last_try: tokio::sync::Mutex::new(None),
+            renewed: AtomicU64::new(0),
+        });
+        self
     }
 
     /// Where `client`'s `endpoint` request goes:
@@ -192,7 +246,84 @@ impl Innertube {
     /// actions (a like): YouTube refuses those with a 403 when the session no longer counts
     /// as signed in, and the fix is the same as for a 401, signing in again. A 403 on a read
     /// stays a network error, as before.
+    ///
+    /// A request signed out (the session was refused, or answered as a guest's) renews the
+    /// session when it may (`Renew`) and is sent once more with the new one.
     async fn post_with(
+        &self,
+        client: &ClientInfo,
+        endpoint: &str,
+        body: &serde_json::Value,
+        forbidden_is_signed_out: bool,
+    ) -> Result<Vec<u8>, Error> {
+        let seen = self.renewals();
+        match self
+            .post_once(client, endpoint, body, forbidden_is_signed_out)
+            .await
+        {
+            Err(Error::SignedOut) if self.renew(seen).await => {
+                self.post_once(client, endpoint, body, forbidden_is_signed_out)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    fn renewals(&self) -> u64 {
+        self.renewal
+            .as_ref()
+            .map_or(0, |r| r.renewed.load(Ordering::Acquire))
+    }
+
+    /// Renews the session after a request that was sent when `seen` renewals had been made
+    /// came back signed out. True when the request should be sent again: this try renewed
+    /// the session, or another one did while the request was out.
+    async fn renew(&self, seen: u64) -> bool {
+        let Some(r) = &self.renewal else {
+            return false;
+        };
+        let mut last_try = r.last_try.lock().await;
+        if r.renewed.load(Ordering::Acquire) != seen {
+            return true;
+        }
+        if last_try.is_some_and(|t| t.elapsed() < r.every) {
+            return false;
+        }
+        *last_try = Some(tokio::time::Instant::now());
+        let current = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match tokio::time::timeout(RENEW_TIMEOUT, r.hook.renew(&current)).await {
+            Ok(Ok(session)) => {
+                *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+                r.renewed.fetch_add(1, Ordering::Release);
+                // In the background, as a cookie rotation is: the keyring keeps the new
+                // session for the next start, and this request doesn't wait on the save.
+                self.save_in_background();
+                eprintln!(
+                    "ytmfast: YouTube signed the session out; signed in again from the browser"
+                );
+                true
+            }
+            Ok(Err(why)) => {
+                eprintln!(
+                    "ytmfast: YouTube signed the session out; could not sign in again: {why}"
+                );
+                false
+            }
+            Err(_) => {
+                eprintln!(
+                    "ytmfast: YouTube signed the session out; signing in again took too long"
+                );
+                false
+            }
+        }
+    }
+
+    /// One `post_with` request, without renewing.
+    async fn post_once(
         &self,
         client: &ClientInfo,
         endpoint: &str,
@@ -281,7 +412,14 @@ impl Innertube {
                 status.as_u16()
             )));
         }
-        net::read_capped(resp, net::MAX_ANSWER).await
+        let bytes = net::read_capped(resp, net::MAX_ANSWER).await?;
+        // A session YouTube no longer accepts gets a 200 and a guest's answer, not a 401: the
+        // music client's answers say which in their tracking data, so a guest's answer is
+        // `SignedOut` here (and renewed) instead of a library that is silently empty.
+        if client.sends_auth_user && answered_as_guest(&bytes) {
+            return Err(Error::SignedOut);
+        }
+        Ok(bytes)
     }
 
     /// Applies the answer's `Set-Cookie` headers to the in-memory session at once (when the
@@ -356,6 +494,16 @@ fn cookie_source_allowed(url: &Url, base: Option<&Url>) -> bool {
     google || base.is_some_and(|b| url.origin() == b.origin())
 }
 
+/// Whether a music client's answer was made for a guest: its `responseContext` tracking says
+/// `{"key":"logged_in","value":"0"}` (GFEEDBACK), as every answer to a session YouTube dropped
+/// did on 2026-10-07; a signed-in one says `"1"`. Matched on the bytes, as YouTube writes
+/// them (`prettyPrint=false`, no spaces): the answer is parsed later by its own reader, and
+/// a reorder that stops this matching only brings back the old silent guest answers.
+fn answered_as_guest(answer: &[u8]) -> bool {
+    const GUEST: &[u8] = br#""key":"logged_in","value":"0""#;
+    answer.windows(GUEST.len()).any(|w| w == GUEST)
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -386,6 +534,19 @@ mod tests {
             let api = url(&format!("https://{}/youtubei/v1/player", c.api_host));
             assert!(net::allowed_host(&api), "{} api host", c.name);
         }
+    }
+
+    #[test]
+    fn a_guest_answer_is_told_apart() {
+        let tracking = |v: &str| {
+            format!(
+                r#"{{"responseContext":{{"serviceTrackingParams":[{{"service":"GFEEDBACK","params":[{{"key":"logged_in","value":"{v}"}}]}}]}}}}"#
+            )
+        };
+        assert!(answered_as_guest(tracking("0").as_bytes()));
+        assert!(!answered_as_guest(tracking("1").as_bytes()));
+        assert!(!answered_as_guest(b"{}"));
+        assert!(!answered_as_guest(b""));
     }
 
     #[test]

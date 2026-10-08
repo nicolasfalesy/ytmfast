@@ -68,6 +68,13 @@ Music no longer takes, and saves nothing when that check can't be made. Then it 
 sign-in cookies into the login keyring (never into a plain file) and prints how many it took, never a value. If the
 engine is running, it is stopped, so the next play starts it with the new session.
 
+YouTube can drop a copied session at any time without an error: its answers just turn into a guest's (a generic home
+page, an empty library and history). The engine notices that and reports `signed_out`. When a Brave Origin profile is
+there, it first reads Brave's sign-in again on its own, at most once every 10 minutes, and takes it only when it is the
+same account the import saw (its YouTube channel, which two accounts can't share, unlike a name). A session imported
+before this was kept has no account with it, so import it once by hand. A renewal is one line in the engine's log, never
+a notice.
+
 ## Build
 
 ```sh

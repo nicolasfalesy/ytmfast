@@ -326,6 +326,7 @@ mod tests {
                 cookie(".youtube.com", "EVIL", "x\n.evil.example\tTRUE"),
                 cookie(".youtube.com", "", "v"),
             ],
+            account: None,
         };
         assert_eq!(
             netscape_cookies(&s),

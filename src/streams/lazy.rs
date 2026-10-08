@@ -232,6 +232,7 @@ mod tests {
                 secure: true,
                 expires_utc: None,
             }],
+            account: None,
         }
     }
 

@@ -150,7 +150,10 @@ fn read_session(db_path: &Path, mut keys: Keys) -> Result<Session, Error> {
         // No YouTube or Google cookies at all: that profile was never signed in.
         return Err(Error::SignedOut);
     }
-    Ok(Session { cookies })
+    Ok(Session {
+        cookies,
+        account: None,
+    })
 }
 
 /// One fixed message for any database failure: rusqlite's text adds nothing the user can act on.

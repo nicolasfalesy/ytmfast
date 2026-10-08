@@ -54,6 +54,7 @@ fn session() -> Session {
             cookie(".youtube.com", "SAPISID", "fake-sapisid", true),
             cookie("127.0.0.1", "SAPISID", "fake-sapisid", false),
         ],
+        account: None,
     }
 }
 

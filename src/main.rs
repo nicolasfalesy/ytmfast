@@ -20,7 +20,7 @@ use ytmfast::auth::{
 use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
-use ytmfast::innertube::{Innertube, clients};
+use ytmfast::innertube::{self, Account, Innertube, Renew, clients};
 use ytmfast::paths;
 use ytmfast::report::Reporter;
 use ytmfast::solver::Solver;
@@ -248,9 +248,11 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
     // another one would otherwise swap the library silently). Any failure saves nothing: a
     // session that can't be checked is not known to work.
     let session = match runtime.block_on(check_account(session)) {
-        Ok((session, name)) => {
+        Ok((mut session, account)) => {
             // The bar widget reads this line as it is ("Signed in as <name>").
-            println!("Signed in as {name}");
+            println!("Signed in as {}", account.name);
+            // Kept with the session: the engine renews it on its own only for this account.
+            session.account = account.channel_id;
             session
         }
         Err(Error::SignedOut) => {
@@ -298,18 +300,73 @@ const NOT_SIGNED_IN: &str = "no YouTube sign-in in that profile; sign in to the 
 /// as it is.
 const CHECK_FAILED: &str = "could not check the sign-in with YouTube Music; try again";
 
-/// Asks YouTube Music for the session's account name (`Innertube::account_name`). Returns the
-/// session as it is after the answer (a cookie the answer rotated is kept, so the copy saved
-/// is the newest) and the name.
+/// Asks YouTube Music who the session signs in (`Innertube::account`). Returns the session as
+/// it is after the answer (a cookie the answer rotated is kept, so the copy saved is the
+/// newest) and the account.
 ///
 /// The check's own client saves rotations to a throwaway store: the keyring is written once,
-/// by the caller, and only after the check passed.
-async fn check_account(session: Session) -> Result<(Session, String), Error> {
+/// by the caller, and only after the check passed. It never renews (`Renew`): it is the check
+/// a renewal itself makes.
+async fn check_account(session: Session) -> Result<(Session, Account), Error> {
     let shared = Arc::new(Mutex::new(session));
     let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
-    let name = account_api(shared.clone(), store).account_name().await?;
+    let account = account_api(shared.clone(), store).account().await?;
     let session = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    Ok((session, name))
+    Ok((session, account))
+}
+
+/// Renews a session YouTube dropped from the Brave Origin profile, as `import-session
+/// --browser brave-origin` would, but only for the same account (his picks, 2026-10-07: on
+/// its own, same account only, a log line and no notice). Another account in the browser,
+/// or a session with no account kept, is refused: the bar then shows Sign in again, and the
+/// person decides.
+struct BraveRenew {
+    profile: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Renew for BraveRenew {
+    async fn renew(&self, current: &Session) -> Result<Session, String> {
+        let Some(want) = current.account.clone() else {
+            return Err("the session has no account kept; import it once by hand".into());
+        };
+        // On a thread of its own, not `spawn_blocking`: the cookie key lookup starts a
+        // runtime of its own, which can't be done on a thread inside this one.
+        let profile = self.profile.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(chromium::import_brave_origin(
+                &profile,
+                &SafeStorageKeys::brave(),
+            ));
+        });
+        let imported = match rx.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(Error::SignedOut)) => return Err(BRAVE_NOT_SIGNED_IN.into()),
+            // The import's errors are fixed texts (no cookie, no path).
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("the Brave Origin import stopped".into()),
+        };
+        if !has_sign_in(&imported) {
+            return Err(BRAVE_NOT_SIGNED_IN.into());
+        }
+        let (session, account) = check_account(imported).await.map_err(|e| match e {
+            Error::SignedOut => BRAVE_NOT_SIGNED_IN.to_string(),
+            _ => CHECK_FAILED.to_string(),
+        })?;
+        same_account(session, &account, &want)
+    }
+}
+
+/// `session` (whose account check found `account`) when that is the account `want`, with the
+/// account kept; refused otherwise. A check that found no channel can't be matched, so it is
+/// refused too.
+fn same_account(mut session: Session, account: &Account, want: &str) -> Result<Session, String> {
+    if account.channel_id.as_deref() != Some(want) {
+        return Err("Brave Origin is signed in to another account".into());
+    }
+    session.account = Some(want.to_owned());
+    Ok(session)
 }
 
 /// The client the account check goes through: production's (https, the allowlist). A debug
@@ -408,9 +465,14 @@ fn backend() -> Result<Arc<LazySession>, String> {
     let cache = paths::cache_dir().map_err(|_| "no cache folder".to_string())?;
     let runtime_dir = paths::runtime_dir().map_err(|_| "no runtime folder".to_string())?;
     let api_store = store.clone();
+    let brave_profile = default_brave_origin_profile_in(&|k: &str| std::env::var_os(k));
     let build: lazy::Build = Box::new(move |session| {
         let session = Arc::new(Mutex::new(session));
-        let api = Arc::new(Innertube::production(session.clone(), api_store.clone()));
+        let mut api = Innertube::production(session.clone(), api_store.clone());
+        if let Some(profile) = brave_profile.clone() {
+            api = api.with_renew(Arc::new(BraveRenew { profile }), innertube::RENEW_EVERY);
+        }
+        let api = Arc::new(api);
         let resolver = Arc::new(Streams::new(
             api.clone(),
             session,
@@ -843,17 +905,35 @@ mod tests {
                 cookie(".youtube.com", "VISITOR_INFO1_LIVE"),
                 cookie(".youtube.com", "YSC"),
             ],
+            account: None,
         };
         assert!(!has_sign_in(&visitor));
         // A SAPISID for another domain doesn't sign youtube.com requests.
         let google_only = Session {
             cookies: vec![cookie(".google.com", "SAPISID")],
+            account: None,
         };
         assert!(!has_sign_in(&google_only));
         let signed_in = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID")],
+            account: None,
         };
         assert!(has_sign_in(&signed_in));
+    }
+
+    #[test]
+    fn a_renewed_session_must_be_the_same_account() {
+        let account = |id: Option<&str>| Account {
+            name: "Fake Person".into(),
+            channel_id: id.map(str::to_owned),
+        };
+        let want = "UCfakefakefakefakefake00";
+        let renewed = same_account(Session::default(), &account(Some(want)), want).unwrap();
+        assert_eq!(renewed.account.as_deref(), Some(want));
+        // Another account (a name can be shared, the channel can't), or none found.
+        for other in [Some("UCotherotherotherother00"), None] {
+            assert!(same_account(Session::default(), &account(other), want).is_err());
+        }
     }
 
     #[test]
