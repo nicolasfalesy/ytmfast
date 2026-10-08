@@ -109,7 +109,7 @@ async fn player_request_shape() {
     assert_eq!(header(req, "x-origin"), "https://www.youtube.com");
     assert_eq!(
         header(req, "user-agent"),
-        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+        "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1"
     );
     assert_eq!(header(req, "content-type"), "application/json");
     // Step 1's TV request never sent it; the music client's does (innertube_next.rs).
@@ -125,9 +125,12 @@ async fn player_request_shape() {
     assert_eq!(client["clientVersion"], "5.20260707");
     assert_eq!(
         client["userAgent"],
-        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+        "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1"
     );
     assert_eq!(client["hl"], "en");
+    // The device, without which YouTube answers "The page needs to be reloaded." (clients.rs).
+    assert_eq!(client["deviceMake"], "Samsung");
+    assert_eq!(client["osName"], "Tizen");
     assert_eq!(client["timeZone"], "UTC");
     assert_eq!(client["utcOffsetMinutes"], 0);
     assert_eq!(body["videoId"], "FAKEVID0001");
@@ -533,7 +536,7 @@ fn client_table() {
     assert_eq!(tv.name_id, 7);
     assert_eq!(
         tv.user_agent,
-        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+        "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1"
     );
     assert_eq!(tv.origin, "https://www.youtube.com");
     assert_eq!(tv.api_host, "www.youtube.com");

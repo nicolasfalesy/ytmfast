@@ -1,6 +1,7 @@
 //! The YouTube Music session: its cookies, where it is stored, and how it is kept fresh.
 //!
-//! The session is imported once from the `pear-desktop` profile (`chromium::import`), stored in
+//! The session is imported once from the `pear-desktop` profile (`chromium::import`) or the
+//! Brave Origin one (`chromium::import_brave_origin`, its key from `SafeStorageKeys`), stored in
 //! the login keyring (`KeyringStore`), sent on every request (`Session::cookie_header`) and kept
 //! up to date from `Set-Cookie` answers (`Session::apply_set_cookie`), because Google rotates
 //! some of these cookies.
@@ -518,6 +519,86 @@ async fn keyring_save(s: &Session, prompt: bool) -> Result<(), Error> {
         .await
         .map_err(keyring_unavailable)?;
     Ok(())
+}
+
+/// Chromium's libsecret schema for its "Safe Storage" password
+/// (`components/os_crypt/sync/key_storage_libsecret.cc`, `kKeystoreSchemaV2`). libsecret
+/// stores the schema's name as the `xdg:schema` attribute; the schema's one attribute is
+/// `application`.
+const SAFE_STORAGE_SCHEMA: &str = "chrome_libsecret_os_crypt_password_v2";
+
+/// A Chromium browser's cookie password in the Secret Service: the `v11` key's source.
+///
+/// Found as Chromium finds it, by its attributes, in every collection. Only when nothing has
+/// them is it looked up by its label, which also finds an item an older Chromium saved
+/// without them. Every item found is returned, as the cookies decide which one is right.
+pub struct SafeStorageKeys {
+    /// The `application` attribute: Chromium's `--password-store` app name.
+    application: &'static str,
+    /// The item's label (`KeyStorageLinux::kKey`'s value for this browser).
+    label: &'static str,
+}
+
+impl SafeStorageKeys {
+    /// Brave's (Brave Origin shares it): `application` = `brave`, labelled
+    /// "Brave Safe Storage".
+    pub fn brave() -> Self {
+        SafeStorageKeys {
+            application: "brave",
+            label: "Brave Safe Storage",
+        }
+    }
+
+    async fn find(&self) -> Result<Vec<oo7::Secret>, Error> {
+        let service = oo7::dbus::Service::new()
+            .await
+            .map_err(keyring_unavailable)?;
+        let collections = service.collections().await.map_err(keyring_unavailable)?;
+        let attributes = [
+            ("xdg:schema", SAFE_STORAGE_SCHEMA),
+            ("application", self.application),
+        ];
+        let mut items = Vec::new();
+        for c in &collections {
+            items.extend(
+                c.search_items(&attributes)
+                    .await
+                    .map_err(keyring_unavailable)?,
+            );
+        }
+        if items.is_empty() {
+            for c in &collections {
+                // A locked collection's labels can't be read: unlocking it is what Chromium's
+                // own lookup (`SECRET_SEARCH_UNLOCK`) would ask for too.
+                unlock(c).await?;
+                for item in c.items().await.map_err(keyring_unavailable)? {
+                    if item.label().await.map_err(keyring_unavailable)? == self.label {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+        let mut secrets = Vec::with_capacity(items.len());
+        for item in &items {
+            if item.is_locked().await.map_err(keyring_unavailable)? {
+                item.unlock(None).await.map_err(keyring_unavailable)?;
+            }
+            secrets.push(item.secret().await.map_err(keyring_unavailable)?);
+        }
+        Ok(secrets)
+    }
+}
+
+impl chromium::KeySource for SafeStorageKeys {
+    /// Runs the lookup on a runtime of its own: the import is plain blocking code, run before
+    /// `main` starts any runtime (one can't be started inside another).
+    fn passwords(&self) -> Result<Vec<oo7::Secret>, Error> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| Error::Internal("could not start the async runtime".into()))?;
+        runtime.block_on(self.find())
+    }
 }
 
 #[cfg(test)]

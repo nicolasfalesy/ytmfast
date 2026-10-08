@@ -1,0 +1,11 @@
+{
+ "res": {
+  "none": true
+ },
+ "kept": false,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=Nobody&track_name=Silence&duration=60",
+  "https://lrclib.net/api/search?track_name=Silence&artist_name=Nobody",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Nobody%20-%20Silence&duration=60000&hash="
+ ]
+}

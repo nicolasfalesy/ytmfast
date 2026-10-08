@@ -671,3 +671,113 @@ async fn set_cookie_from_browse_and_like_is_kept() {
     rig.api.like("fakeV000001", LikeStatus::Like).await.unwrap();
     rotation_kept(&rig, "like").await;
 }
+
+// ---- the account check (import-session, ruling P19) ---------------------------------------
+
+/// The account menu's answer for a signed-in session: the shape YouTube Music's own account
+/// button reads (ytmusicapi's `get_account_info` reads the same path). A made-up name.
+fn account_menu(name_runs: Value) -> String {
+    json!({"actions": [{"openPopupAction": {"popup": {"multiPageMenuRenderer": {
+        "header": {"activeAccountHeaderRenderer": {
+            "accountName": {"runs": name_runs},
+            "channelHandle": {"runs": [{"text": "@fake-handle"}]}}},
+        "sections": []}}}}]})
+    .to_string()
+}
+
+/// A signed-out session's answer: a menu with no account header (a "Sign in" item instead).
+const SIGNED_OUT_MENU: &str = r#"{"actions":[{"openPopupAction":{"popup":{"multiPageMenuRenderer":{"sections":[{"multiPageMenuSectionRenderer":{"items":[{"compactLinkRenderer":{"title":{"runs":[{"text":"Sign in"}]}}}]}}]}}}}]}"#;
+
+#[tokio::test]
+async fn account_name_request_shape() {
+    let rig = rig().await;
+    endpoint(
+        "account/account_menu",
+        json_answer(&account_menu(json!([{"text": "Fake Person"}]))),
+    )
+    .mount(&rig.server)
+    .await;
+    assert_eq!(rig.api.account_name().await.unwrap(), "Fake Person");
+    let reqs = requests(&rig).await;
+    assert_eq!(reqs.len(), 1);
+    // Signed like every other browsing request; the body is the context alone.
+    let body = web_remix(&reqs[0], "account/account_menu");
+    assert!(keys(&body).is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn account_name_joins_runs_and_drops_control_and_invisible_characters() {
+    let rig = rig().await;
+    // A name is printed to a terminal and shown in the bar: an escape sequence, a newline or
+    // a bidi override in it must not reach either.
+    endpoint(
+        "account/account_menu",
+        json_answer(&account_menu(json!([
+            {"text": " Fake\u{1b}[2J "},
+            {"text": "Per\u{202E}son\n"}
+        ]))),
+    )
+    .mount(&rig.server)
+    .await;
+    assert_eq!(rig.api.account_name().await.unwrap(), "Fake[2J Person");
+}
+
+#[tokio::test]
+async fn account_name_is_capped() {
+    let rig = rig().await;
+    endpoint(
+        "account/account_menu",
+        json_answer(&account_menu(json!([{"text": "é".repeat(500)}]))),
+    )
+    .mount(&rig.server)
+    .await;
+    let name = rig.api.account_name().await.unwrap();
+    assert_eq!(name.chars().count(), 100);
+}
+
+#[tokio::test]
+async fn account_name_of_a_signed_out_session_is_signed_out() {
+    // No account header: the cookies are there but no longer sign anyone in.
+    let rig = rig().await;
+    endpoint("account/account_menu", json_answer(SIGNED_OUT_MENU))
+        .mount(&rig.server)
+        .await;
+    assert_eq!(rig.api.account_name().await, Err(Error::SignedOut));
+
+    // A header with an empty name is no account either.
+    let rig = self::rig().await;
+    endpoint(
+        "account/account_menu",
+        json_answer(&account_menu(json!([{"text": " \u{200B} "}]))),
+    )
+    .mount(&rig.server)
+    .await;
+    assert_eq!(rig.api.account_name().await, Err(Error::SignedOut));
+
+    // A 401, and a 403 (an account page refused), are signed out too.
+    for status in [401, 403] {
+        let rig = self::rig().await;
+        endpoint("account/account_menu", ResponseTemplate::new(status))
+            .mount(&rig.server)
+            .await;
+        assert_eq!(
+            rig.api.account_name().await,
+            Err(Error::SignedOut),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_name_failures_keep_their_code() {
+    let rig = rig().await;
+    endpoint("account/account_menu", ResponseTemplate::new(500))
+        .mount(&rig.server)
+        .await;
+    assert_eq!(rig.api.account_name().await.unwrap_err().code(), "network");
+    let rig = self::rig().await;
+    endpoint("account/account_menu", json_answer("not json"))
+        .mount(&rig.server)
+        .await;
+    assert_eq!(rig.api.account_name().await.unwrap_err().code(), "internal");
+}

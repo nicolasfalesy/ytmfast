@@ -1,7 +1,12 @@
-//! The socket's `lyrics {videoId}`: YouTube Music's plain lyrics for a song, as `Page.js` gave
-//! them (`{text, source}`, or `{none: true}` on the wire).
+//! The socket's `lyrics {videoId}`: the song's lyrics through the whole chain (`crate::lyrics`:
+//! KuGou's word timing, LRCLIB's timed lines, YouTube Music's plain lyrics, LRCLIB's plain
+//! text), as `{source, synced, words, lines}`, or `{none: true}` on the wire.
 //!
-//! Lyrics take two requests: the song's `next`, whose Lyrics tab names the lyrics page
+//! The lyrics services are told the song's title, artists, album and length, which the engine
+//! knows for the song playing and every queued one (`LyricsTabs::song`). YouTube Music's step
+//! is asked last, and only when neither service has timing for the song.
+//!
+//! YouTube Music's lyrics take two requests: the song's `next`, whose Lyrics tab names the lyrics page
 //! (`MPLYt…`), then a browse of that page. The engine already makes that `next` for the song
 //! playing (its queue's, or its like lookup's), so it keeps the tab with the like status, and
 //! lyrics ask it first (`LyricsTabs`): lyrics for the current song cost only the browse. A
@@ -10,8 +15,9 @@
 //!
 //! The answers themselves are kept here, in the daemon, for every client: the last `KEPT`
 //! songs, so reopening the Lyrics tab costs nothing. A kept "none" lasts `NONE_FOR` only
-//! (YouTube adds lyrics to songs later); found lyrics are kept for the daemon's life.
-//! Failures are never kept: the next ask tries again.
+//! (YouTube and LRCLIB add lyrics to songs later); found lyrics are kept for the daemon's life.
+//! Failures are never kept, nor anything found while one request failed: the next ask tries
+//! again.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -25,15 +31,21 @@ use crate::browse::{Browser, Lyrics};
 use crate::engine::{EngineCmd, KnownTab};
 use crate::error::Error;
 use crate::innertube::SongNext;
+use crate::lyrics::{self, Found, LyricsWeb, SongFacts};
 use crate::streams::is_video_id;
 
 /// Lyrics answers kept, by song. A widget's Lyrics tab follows the song playing; 20 covers
-/// going back and forth through a stretch of the queue. Each is a few KB.
+/// going back and forth through a stretch of the queue. Each is a few KB (word timing: tens of
+/// KB), and none passes `lyrics::MAX_ANSWER_BYTES`.
 pub const KEPT: usize = 20;
 
-/// The most lyrics text kept (and sent): 256 KiB. Real lyrics are a few KB, and a song's whole
-/// answer must fit one socket line (`protocol::MAX_LINE`, 1 MiB) with room for JSON escapes.
+/// The most of YouTube Music's lyrics text used: 256 KiB, cut before it becomes lines. Real
+/// lyrics are a few KB.
 pub const MAX_TEXT: usize = 256 * 1024;
+
+/// How long lyrics wait for the current song's details (title, artists, length) when they are
+/// not known yet: they land within about a second of a play by id.
+pub const DETAILS_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a "this song has no lyrics" stands, here and in the engine's tab cache, before the
 /// song is asked about again.
@@ -47,6 +59,8 @@ pub trait LyricsTabs: Send + Sync {
     async fn known(&self, video_id: &str) -> Option<KnownTab>;
     /// A song's own `next`, made for lyrics: kept for the like lookup and later lyrics.
     async fn learn(&self, video_id: &str, next: SongNext);
+    /// What the lyrics services are told of the song; `None` when the engine doesn't have it.
+    async fn song(&self, video_id: &str) -> Option<SongFacts>;
 }
 
 /// The engine's per-song cache, through its command channel (`EngineCmd::LyricsTab`,
@@ -73,46 +87,109 @@ impl LyricsTabs for EngineTabs {
         };
         let _ = self.0.send(cmd).await;
     }
+
+    /// The current song's details may not be known yet (a play by id, or a list's first song,
+    /// asked about at once by a widget with its Lyrics tab open): the engine is asked to wait for
+    /// them, up to `DETAILS_WAIT`; then what it knows by then. Without this, that song would get
+    /// YouTube Music's plain lyrics only, and the widget would not ask again.
+    async fn song(&self, video_id: &str) -> Option<SongFacts> {
+        let ask = |wait: bool| async move {
+            let (reply, rx) = oneshot::channel();
+            let cmd = EngineCmd::LyricsSong {
+                video_id: video_id.into(),
+                wait,
+                reply,
+            };
+            self.0.send(cmd).await.ok()?;
+            Some(rx)
+        };
+        let rx = ask(true).await?;
+        match tokio::time::timeout(DETAILS_WAIT, rx).await {
+            Ok(answer) => answer.ok().flatten(),
+            // Gave up waiting (dropping the receiver lets the engine drop the ask): what is
+            // known now.
+            Err(_) => ask(false).await?.await.ok().flatten(),
+        }
+    }
 }
 
-/// The daemon's lyrics: the kept answers, and the way to the engine's tabs.
+/// The daemon's lyrics: the kept answers, the way to the engine's tabs and song details, and
+/// the lyrics services.
 pub struct LyricsCache {
     tabs: Arc<dyn LyricsTabs>,
+    /// KuGou and LRCLIB. `None` (tests that don't fake them, and the default options) asks
+    /// YouTube Music only: nothing here ever reaches the network unless the daemon passed it.
+    web: Option<Arc<dyn LyricsWeb>>,
     /// Oldest used first. A std mutex: never held across an await.
     kept: Mutex<VecDeque<Kept>>,
 }
 
 struct Kept {
     video_id: String,
-    answer: Option<Lyrics>,
+    answer: Option<Found>,
     /// When a "none" was learned (for `NONE_FOR`).
     at: Instant,
 }
 
 impl LyricsCache {
-    pub fn new(tabs: Arc<dyn LyricsTabs>) -> LyricsCache {
+    pub fn new(tabs: Arc<dyn LyricsTabs>, web: Option<Arc<dyn LyricsWeb>>) -> LyricsCache {
         LyricsCache {
             tabs,
+            web,
             kept: Mutex::new(VecDeque::new()),
         }
     }
 
     /// The song's lyrics, `None` when it has none. Errors: `BadRequest` for a malformed id
-    /// (nothing is sent), else the request's own (`SignedOut`, `Network`, ...), not kept.
+    /// (nothing is sent); YouTube Music's own error (`SignedOut`, `Network`, ...) when its step
+    /// failed and nothing else was found. Neither is kept, nor an answer found while any
+    /// request failed (the widget's rule: shown, not kept), nor one for a song the engine had
+    /// no details of.
     ///
     /// Two clients asking for one song at the same moment both fetch it: rare (the Lyrics tab
     /// is one widget's), and both answers agree.
-    pub async fn get(
-        &self,
-        browser: &dyn Browser,
-        video_id: &str,
-    ) -> Result<Option<Lyrics>, Error> {
+    pub async fn get(&self, browser: &dyn Browser, video_id: &str) -> Result<Option<Found>, Error> {
         if !is_video_id(video_id) {
             return Err(Error::BadRequest("not a video id".into()));
         }
         if let Some(answer) = self.kept(video_id) {
             return Ok(answer);
         }
+        // Without the services, the song's details are not even looked up.
+        let (web, song): (&dyn LyricsWeb, _) = match &self.web {
+            Some(web) => (web.as_ref(), self.tabs.song(video_id).await),
+            None => (&NoWeb, None),
+        };
+        // When YouTube Music's step ran and found nothing, its "none" dates from when that was
+        // learned (it may be the engine's older "no tab").
+        let none_at = &Mutex::new(Instant::now());
+        let youtube = move || async move {
+            let (lyrics, at) = self.youtube(browser, video_id).await?;
+            *none_at.lock().unwrap_or_else(|e| e.into_inner()) = at;
+            Ok(lyrics)
+        };
+        let outcome = lyrics::find(web, song.as_ref(), youtube).await;
+        if outcome.answer.is_none()
+            && let Some(e) = outcome.youtube_error
+        {
+            return Err(e);
+        }
+        // Nor when the services are there but the engine had no details for the song (a play by
+        // id asks before they land): that answer may lack timing the song has.
+        let partial = self.web.is_some() && song.is_none();
+        if !outcome.failed && !partial {
+            let at = *none_at.lock().unwrap_or_else(|e| e.into_inner());
+            self.keep(video_id, outcome.answer.clone(), at);
+        }
+        Ok(outcome.answer)
+    }
+
+    /// YouTube Music's plain lyrics (cut to `MAX_TEXT`), and for a "none" when it was learned.
+    async fn youtube(
+        &self,
+        browser: &dyn Browser,
+        video_id: &str,
+    ) -> Result<(Option<Lyrics>, Instant), Error> {
         let (page, at) = match self.tabs.known(video_id).await {
             Some(KnownTab { page: Some(p), at }) => (Some(p), at),
             Some(KnownTab { page: None, at }) if at.elapsed() < NONE_FOR => (None, at),
@@ -126,16 +203,14 @@ impl LyricsCache {
         };
         // A "none" because the engine knew of no tab dates from when it learned that, so it
         // isn't kept here for longer than there.
-        let (answer, at) = match page {
+        Ok(match page {
             Some(p) => (browser.lyrics_page(&p).await?.map(capped), Instant::now()),
             None => (None, at),
-        };
-        self.keep(video_id, answer.clone(), at);
-        Ok(answer)
+        })
     }
 
     /// A kept answer, now the newest used; `None` when there is none, or only a stale "none".
-    fn kept(&self, video_id: &str) -> Option<Option<Lyrics>> {
+    fn kept(&self, video_id: &str) -> Option<Option<Found>> {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let at = kept.iter().position(|k| k.video_id == video_id)?;
         let entry = kept.remove(at)?;
@@ -147,7 +222,7 @@ impl LyricsCache {
         Some(answer)
     }
 
-    fn keep(&self, video_id: &str, answer: Option<Lyrics>, at: Instant) {
+    fn keep(&self, video_id: &str, answer: Option<Found>, at: Instant) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         kept.retain(|k| k.video_id != video_id);
         kept.push_back(Kept {
@@ -161,9 +236,18 @@ impl LyricsCache {
     }
 }
 
-/// The lyrics with their text cut to `MAX_TEXT`, at the last character boundary at or before it.
-/// Cut here, before the cache: an answer too long for a socket line would otherwise be kept
-/// (20 of them) only for `control::answer` to refuse it every time it is asked for.
+/// No lyrics services (`LyricsCache::web` is `None`): never asked, since the chain gets no song.
+struct NoWeb;
+
+#[async_trait]
+impl LyricsWeb for NoWeb {
+    async fn get_json(&self, _: &str) -> lyrics::Fetched {
+        lyrics::Fetched::Failed
+    }
+}
+
+/// The lyrics with their text cut to `MAX_TEXT`, at the last character boundary at or before it,
+/// before they become lines: real lyrics are a few KB, and this bounds what one answer costs.
 fn capped(mut lyrics: Lyrics) -> Lyrics {
     if lyrics.text.len() > MAX_TEXT {
         let mut end = MAX_TEXT;
@@ -173,4 +257,39 @@ fn capped(mut lyrics: Lyrics) -> Lyrics {
         lyrics.text.truncate(end);
     }
     lyrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A song whose details never land within `DETAILS_WAIT`: the wait is given up and the
+    /// engine is asked for what it knows now.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_details_is_bounded() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let engine = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut asks = Vec::new();
+            while let Some(cmd) = rx.recv().await {
+                if let EngineCmd::LyricsSong { wait, reply, .. } = cmd {
+                    asks.push((wait, tokio::time::Instant::now()));
+                    if wait {
+                        // Never answered: the details never land.
+                        held.push(reply);
+                    } else {
+                        let _ = reply.send(None);
+                        return asks;
+                    }
+                }
+            }
+            asks
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(EngineTabs(tx).song("AAAAAAAAAAA").await, None);
+        let asks = engine.await.unwrap();
+        assert_eq!(asks.len(), 2);
+        assert!(asks[0].0 && !asks[1].0, "waiting first, then not");
+        assert_eq!(asks[1].1 - start, DETAILS_WAIT);
+    }
 }

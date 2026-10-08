@@ -1,0 +1,41 @@
+{
+ "res": {
+  "synced": true,
+  "lines": [
+   {
+    "t": 0,
+    "text": ""
+   },
+   {
+    "t": 12.3,
+    "text": "Oh, I remember how you were, you were"
+   },
+   {
+    "t": 16.1,
+    "text": "Paper lanterns in the rain, tonight my love,"
+   },
+   {
+    "t": 19.8,
+    "text": "Driving down the empty road"
+   },
+   {
+    "t": 26.2,
+    "text": "Wait — for me"
+   },
+   {
+    "t": 40.1,
+    "text": "Glimmer, glimmer, glide away"
+   },
+   {
+    "t": 44,
+    "text": "Something unlike the words above"
+   }
+  ],
+  "source": "LRCLIB"
+ },
+ "kept": false,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=The%20Made%20Up%20Band%20%26%20Someone%20Else&track_name=Paper%20Lanterns%20(feat.%20Someone%20Else)&album_name=Fold%20%26%20Float&duration=200",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=The%20Made%20Up%20Band%20-%20Paper%20Lanterns&duration=200000&hash="
+ ]
+}

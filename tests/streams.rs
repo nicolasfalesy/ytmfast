@@ -1206,6 +1206,28 @@ async fn details_come_from_oembed_when_the_answer_has_none() {
     assert!(oembed.headers.get("authorization").is_none());
 }
 
+/// oEmbed's `author_name` is the channel's name: for most songs YouTube's auto-made
+/// "<artist> - Topic" channel. It is seen live for the first second of a list play, before the
+/// queue's own details arrive; the bar must never show the suffix.
+#[tokio::test]
+async fn oembed_channel_names_lose_the_topic_suffix() {
+    let expire = now() + 6 * 3600;
+    let mut a = answer(url_format(&stream_url(expire, "")));
+    a.as_object_mut().unwrap().remove("videoDetails");
+    let r = rig(Some(a), FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    Mock::given(method("GET"))
+        .and(path("/oembed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Oembed Song",
+            "author_name": "Oembed Artist - Topic",
+            "type": "video"
+        })))
+        .mount(&r.server)
+        .await;
+    let s = r.streams.resolve(VIDEO).await.unwrap();
+    assert_eq!(s.meta.artist, "Oembed Artist");
+}
+
 #[tokio::test]
 async fn details_missing_everywhere_still_plays() {
     let expire = now() + 6 * 3600;

@@ -41,6 +41,7 @@ fn song(id: &str, title: &str) -> SongItem {
         thumbnail: Some(format!("https://i.ytimg.com/vi/{id}/hq.jpg")),
         length_seconds: 240,
         playlist_id: Some("OLAK5uy_example".into()),
+        radio: false,
     }
 }
 

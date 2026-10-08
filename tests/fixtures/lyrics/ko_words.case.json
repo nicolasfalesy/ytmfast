@@ -1,0 +1,39 @@
+{
+ "song": {
+  "title": "푸른 우산",
+  "artist": "가상 밴드, Someone",
+  "album": "First Rain",
+  "songDuration": 187,
+  "videoId": "fakeVidko_w"
+ },
+ "answers": {
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=%EA%B0%80%EC%83%81%20%EB%B0%B4%EB%93%9C%20-%20%ED%91%B8%EB%A5%B8%20%EC%9A%B0%EC%82%B0&duration=187000&hash=": {
+   "json": {
+    "status": 200,
+    "candidates": [
+     {
+      "id": "8001",
+      "accesskey": "KO88",
+      "song": "푸른 우산",
+      "singer": "가상 밴드",
+      "duration": 187000
+     }
+    ]
+   }
+  },
+  "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=krc&charset=utf8&id=8001&accesskey=KO88": {
+   "json": {
+    "status": 200,
+    "content": "a3JjMTidLOfhfPcXRbFGv3DR7UqDppPQHpya3WksKmTJmke5dOJ0a4Z+p1Ah5pmkoORfgABUZ/vd3Sd377TWcYRHbxeffobpUcqNuyPVoF7KKQVB+ZnUBLC/dr4zuKHoMRKhdPwAP21nUAQNyfDQoVBZ60EmDucCFPsM21evuX6hxLARIadljof2E0ENaytd9EuV6kFbAihpMmCSA1f5bK9Kj4276YPjRhHemHuv2jX7AwL3S5kmFfiSEYY8PSWujjREAeCvjKujuN9981C4AGFdU6D1Bs3CBatMEy6aCQhow4PjG9M46vJs4vve8uswJd90uevOuI3jdtchwqvp2jLOZf+d+iNl/2BBwkLBoN4hyUaEZazsu5Mxms12WC6Ft/NnlE30jBl1ZjSgPSj7szrZGPXGuA=="
+   }
+  },
+  "https://lrclib.net/api/get?artist_name=%EA%B0%80%EC%83%81%20%EB%B0%B4%EB%93%9C%2C%20Someone&track_name=%ED%91%B8%EB%A5%B8%20%EC%9A%B0%EC%82%B0&album_name=First%20Rain&duration=187": {
+   "json": {
+    "id": 3,
+    "plainLyrics": "푸른 우산 아래\n비가 내리면",
+    "syncedLyrics": "[00:04.40] 푸른 우산 아래\n[00:09.10] 비가 내리면 baby oh\n[00:16.00] 우리 같이 걸어\n"
+   }
+  }
+ },
+ "youtube": "none"
+}

@@ -101,6 +101,19 @@ landing page, Liked playlists, Liked albums, Library artists, Liked songs, a sea
 and its next page), an album, an artist and its "Show all" page, a playlist search, a 140-song playlist and its next
 page, and a podcast page. Lyrics matched too (checked before the fix, which did not touch them).
 
+## ytmfast step 4 (timed lyrics), 2026-10-06
+
+The widget's lyrics chain (KuGou word timing, LRCLIB lines, YouTube Music's plain lyrics) moved
+into the engine. Its JavaScript was run by deno and the Rust port on the same answers, and the
+results compared field by field (every line, word, syllable and time, the links asked for, and
+whether the answer is kept):
+
+- 20 made-up cases (`tests/fixtures/lyrics`, in CI): 0 differences.
+- 10 real songs, answers recorded live from lrclib.net and KuGou (not committed): 0
+  differences. English, Japanese (YOASOBI, Kenshi Yonezu, Official HIGE DANdism) and Korean
+  (NewJeans) songs; 9 came out with KuGou's word timing, 1 with LRCLIB's lines. Their answers
+  are 3.7 to 31 KB of JSON each.
+
 ## Power (CPU package energy), 2026-10-05, on AC power
 
 Measured with the processor's own energy counter (Intel RAPL, `intel-rapl:0` package) over 240 s of playback after

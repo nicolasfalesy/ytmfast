@@ -24,6 +24,16 @@ pbkdf2 = { version = "0.12", features = ["hmac"] }
 async-trait = "0.1.92"
 # getuid() for the /run/user/$UID fallback; libc is already in the tree through reqwest.
 libc = "0.2"
+# Lyrics: KuGou's KRC is zlib (`lyrics::krc`). miniz_oxide is pure Rust and has a decompress
+# with an output limit, the inflate-bomb cap. Its default `with-alloc` only.
+miniz_oxide = "0.8"
+# Lyrics: `nameKey`'s `normalize("NFD")`. Already in the tree (and built with its compiled
+# data) through url's idna, so no new crate comes in for it.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+# Lyrics: the widget's JavaScript regexes, ported pattern for pattern. regex-lite is already
+# in the tree (symphonia), small, and its ASCII-only case folding and \b are JavaScript's
+# (non-`u` regexes); JavaScript's wider \s is spelled out (`lyrics::js::SPACE_CLASS`).
+regex-lite = "0.1"
 # The session lives in the login keyring over the Secret Service D-Bus API. Default features = tokio +
 # native_crypto (no async-std, no OpenSSL).
 oo7 = "0.6"

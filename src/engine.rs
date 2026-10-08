@@ -188,6 +188,19 @@ pub enum EngineCmd {
         video_id: String,
         next: SongNext,
     },
+    /// What the lyrics services are told of a song (its title, artists, album and length):
+    /// the shown song's as the state has them, else a queued song's from its item. `None` for
+    /// a song the engine doesn't have, which then gets YouTube Music's lyrics only.
+    ///
+    /// With `wait`, a song that is the current one but whose details are not known yet (a play
+    /// by id, or a list's first song, before its link or its list lands) is answered once they
+    /// are, or once another song is current; the asker bounds the wait (`control::lyrics`).
+    /// Without it, the answer is what is known now.
+    LyricsSong {
+        video_id: String,
+        wait: bool,
+        reply: oneshot::Sender<Option<crate::lyrics::SongFacts>>,
+    },
     Quit,
 }
 
@@ -242,6 +255,8 @@ pub struct QueueView {
     pub current_id: Option<u64>,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// The revision of the queue event this view matches (`Engine::queue_rev`).
+    pub rev: u64,
 }
 
 /// What the engine reports.
@@ -261,6 +276,10 @@ pub enum EngineEvent {
         current_id: Option<u64>,
         shuffle: bool,
         repeat: Repeat,
+        /// One higher than the previous queue event's (the first is 1; ruling P16). A client
+        /// can get an older queue line after a newer one (a buffered event after `watch`, an
+        /// event after a `queue.get` reply), and drops any below the newest it has seen.
+        rev: u64,
     },
     /// `code` is `Error::code()`; `message` its `Display`, which never holds a link (R6).
     Error {
@@ -573,6 +592,9 @@ pub struct Engine {
     /// Bumped by every play that makes a new queue: a queue page that comes back for an older
     /// one is dropped (the same rule as `generation`, for queues).
     queue_generation: u64,
+    /// The newest queue event's revision: bumped by every `emit_queue`, 0 before the first.
+    /// `QueueGet` answers with it too, so a reply and the event for the same queue match.
+    queue_rev: u64,
     /// The running resolve, aborted when a newer play replaces it.
     resolving: Option<AbortHandle>,
     /// The play's queue request, and what it is for.
@@ -584,6 +606,12 @@ pub struct Engine {
     continuation: Option<String>,
     /// YouTube has no more songs for this queue: no more radio requests until a new queue.
     exhausted: bool,
+    /// `continuation` is the next page of a radio the engine started itself (once the queue's
+    /// own songs ran out), not of the list the user played: its songs get `SongItem::radio`.
+    continuation_radio: bool,
+    /// Whether the refill on its way (`refilling`) brings radio songs: fixed when it is asked
+    /// for, since `continuation` may change before it lands.
+    refill_radio: bool,
     /// The queue ran out while more songs were on the way: the next one plays when they come.
     waiting: bool,
     /// Stopped because the queue ran out (not by an error).
@@ -663,6 +691,8 @@ pub struct Engine {
     likes_sent: HashMap<String, u64>,
     /// The likes on their way, by number, aborted at quit.
     like_tasks: HashMap<u64, AbortHandle>,
+    /// `LyricsSong` asks waiting for the current song's details (see `answer_lyrics_waits`).
+    lyrics_waits: Vec<(String, oneshot::Sender<Option<crate::lyrics::SongFacts>>)>,
     like_news_tx: mpsc::UnboundedSender<LikeNews>,
     like_news_rx: mpsc::UnboundedReceiver<LikeNews>,
 }
@@ -724,12 +754,15 @@ impl Engine {
             },
             generation: 0,
             queue_generation: 0,
+            queue_rev: 0,
             resolving: None,
             loading: None,
             pending: None,
             refilling: None,
             continuation: None,
             exhausted: false,
+            continuation_radio: false,
+            refill_radio: false,
             waiting: false,
             at_end: false,
             skip_streak: 0,
@@ -765,6 +798,7 @@ impl Engine {
             like_seq: 0,
             likes_sent: HashMap::new(),
             like_tasks: HashMap::new(),
+            lyrics_waits: Vec::new(),
             like_news_tx,
             like_news_rx,
         };
@@ -784,6 +818,7 @@ impl Engine {
         self.source_playlist = saved.source_playlist;
         self.continuation = saved.continuation;
         self.exhausted = saved.exhausted;
+        self.continuation_radio = saved.continuation_radio;
         let volume = if saved.volume.is_finite() {
             saved.volume.clamp(0.0, 1.0)
         } else {
@@ -858,6 +893,9 @@ impl Engine {
             }
             if self.dirty {
                 self.write_state();
+            }
+            if !self.lyrics_waits.is_empty() {
+                self.answer_lyrics_waits();
             }
         }
         // Every way out (the socket's quit, idle, a signal) ends here: one last save, while
@@ -1005,6 +1043,21 @@ impl Engine {
                 let _ = reply.send(self.likes.tab(&video_id));
                 return;
             }
+            EngineCmd::LyricsSong {
+                video_id,
+                wait,
+                reply,
+            } => {
+                match self.lyrics_song(&video_id) {
+                    None if wait && self.status.video_id.as_deref() == Some(&video_id) => {
+                        self.lyrics_waits.push((video_id, reply));
+                    }
+                    facts => {
+                        let _ = reply.send(facts);
+                    }
+                }
+                return;
+            }
             EngineCmd::LearnSong { video_id, next } => {
                 self.likes.learn_tab(&video_id, next.lyrics_tab);
                 if let Some(status) = next.like {
@@ -1140,6 +1193,7 @@ impl Engine {
         self.pending = None;
         self.continuation = None;
         self.exhausted = false;
+        self.continuation_radio = false;
         self.waiting = false;
         self.at_end = false;
         self.skip_streak = 0;
@@ -1369,8 +1423,13 @@ impl Engine {
     /// More radio songs for the end of the queue arrived (or failed).
     fn on_refill(&mut self, result: Result<NextPage, Error>) {
         match result {
-            Ok(page) => {
+            Ok(mut page) => {
                 self.continuation = page.continuation;
+                // The page's next page is the same source's: the engine's radio stays radio.
+                self.continuation_radio = self.refill_radio;
+                for song in &mut page.items {
+                    song.radio = self.refill_radio;
+                }
                 let added = self.queue.append_radio(page.items);
                 if added == 0 {
                     // Nothing new (radio pages overlap): asking again could loop.
@@ -1424,6 +1483,10 @@ impl Engine {
         let Some(last) = self.queue.items().last() else {
             return;
         };
+        // The list's own next page brings its own songs; the radio of the last song (or that
+        // radio's next page) brings radio songs, which the widget shows after its "Autoplay"
+        // divider, as YouTube Music shows its autoplay picks after the queue.
+        self.refill_radio = self.continuation.is_none() || self.continuation_radio;
         let req = match &self.continuation {
             Some(c) => NextRequest {
                 continuation: Some(c.clone()),
@@ -2564,6 +2627,7 @@ impl Engine {
             current_id: self.queue.current().map(|i| i.id),
             shuffle: self.queue.shuffle(),
             repeat: self.queue.repeat(),
+            rev: self.queue_rev,
         }
     }
 
@@ -2571,17 +2635,20 @@ impl Engine {
     /// moves the current item), comes through here.
     fn emit_queue(&mut self) {
         self.dirty = true;
+        self.queue_rev += 1;
         let QueueView {
             items,
             current_id,
             shuffle,
             repeat,
+            rev,
         } = self.queue_view();
         self.emit(EngineEvent::Queue {
             items,
             current_id,
             shuffle,
             repeat,
+            rev,
         });
     }
 
@@ -2593,6 +2660,53 @@ impl Engine {
             self.dirty = true;
         }
         self.emit(EngineEvent::State(status));
+    }
+
+    /// Answers the `LyricsSong` asks waiting on the current song's details: once they are
+    /// known, or once another song is current (then with what is known of the asked one).
+    /// Run after every turn of the loop, so whatever filled the details (the link, the list)
+    /// answers them at once. An ask whose asker gave up is dropped.
+    fn answer_lyrics_waits(&mut self) {
+        let waits = std::mem::take(&mut self.lyrics_waits);
+        for (video_id, reply) in waits {
+            if reply.is_closed() {
+                continue;
+            }
+            let facts = self.lyrics_song(&video_id);
+            if facts.is_some() || self.status.video_id.as_deref() != Some(&video_id) {
+                let _ = reply.send(facts);
+            } else {
+                self.lyrics_waits.push((video_id, reply));
+            }
+        }
+    }
+
+    /// A song's details for the lyrics services (`EngineCmd::LyricsSong`). The shown song's
+    /// come from the state (filled from its link once resolved, for a song queued by id
+    /// alone); any other queued song's from its queue item, when it has a title.
+    fn lyrics_song(&self, video_id: &str) -> Option<crate::lyrics::SongFacts> {
+        if self.status.video_id.as_deref() == Some(video_id)
+            && let Some(meta) = self.status.meta.as_ref().filter(|m| !m.title.is_empty())
+        {
+            return Some(crate::lyrics::SongFacts {
+                title: meta.title.clone(),
+                artist: meta.artist.clone(),
+                album: self.status.album.clone(),
+                length_seconds: meta.length_seconds,
+            });
+        }
+        let item = self
+            .queue
+            .items()
+            .iter()
+            .find(|i| i.song.video_id == video_id && !i.song.title.is_empty())?;
+        Some(crate::lyrics::SongFacts {
+            title: item.song.title.clone(),
+            // As the state names them (`song_meta`).
+            artist: item.song.artists.join(", "),
+            album: item.song.album.clone(),
+            length_seconds: item.song.length_seconds,
+        })
     }
 
     /// Hands a snapshot to the writer (which writes it on its own thread).
@@ -2645,6 +2759,7 @@ impl Engine {
             source_playlist: self.source_playlist.clone(),
             continuation: self.continuation.clone(),
             exhausted: self.exhausted,
+            continuation_radio: self.continuation_radio,
             saved_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
@@ -3309,6 +3424,7 @@ mod tests {
                     current_id,
                     shuffle,
                     repeat,
+                    rev,
                 } = self.next().await
                 {
                     return QueueView {
@@ -3316,6 +3432,7 @@ mod tests {
                         current_id,
                         shuffle,
                         repeat,
+                        rev,
                     };
                 }
             }
@@ -3344,6 +3461,7 @@ mod tests {
             thumbnail: Some(format!("https://i.ytimg.com/{c}.jpg")),
             length_seconds: 2,
             playlist_id: None,
+            radio: false,
         }
     }
 
@@ -4519,6 +4637,222 @@ mod tests {
         );
     }
 
+    /// The songs of the radio the engine starts once a list runs out are marked `radio`, and
+    /// so are that radio's next pages; the list's own songs (its next pages too) are not. The
+    /// widget's "Autoplay" divider goes before the first marked one.
+    #[tokio::test]
+    async fn songs_from_the_engines_own_radio_are_marked() {
+        let mut r = rig(Setup {
+            pages: vec![
+                ok("PLlist", 0, "AB", Some("LIST2")),
+                // The list's own second page.
+                ok("LIST2", 0, "C", None),
+                // Then the radio of its last song, and that radio's next page.
+                ok(&radio_of('C'), 0, "CD", Some("RAD2")),
+                ok("RAD2", 0, "E", None),
+            ],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let radio = |q: &QueueView| -> Vec<(String, bool)> {
+            q.items
+                .iter()
+                .map(|i| (i.song.video_id[..1].to_string(), i.song.radio))
+                .collect()
+        };
+        let want = |s: &[(&str, bool)]| -> Vec<(String, bool)> {
+            s.iter().map(|(v, b)| ((*v).to_string(), *b)).collect()
+        };
+        let mut q = r.queue().await;
+        for skip in 0..6 {
+            if q.items.len() == 5 {
+                break;
+            }
+            // Each step plays on, so the queue asks for its next page.
+            if skip < 4 {
+                r.send(EngineCmd::Next).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            q = r.queue().await;
+        }
+        assert_eq!(
+            radio(&q),
+            want(&[
+                ("A", false),
+                ("B", false),
+                ("C", false),
+                ("D", true),
+                ("E", true)
+            ])
+        );
+    }
+
+    /// What lyrics learn of a song (`EngineCmd::LyricsSong`): the shown song's details as the
+    /// state has them, any queued song's from its queue item, nothing for a song not here.
+    #[tokio::test]
+    async fn lyrics_learn_a_songs_details_from_the_state_and_the_queue() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "AB", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let ask = |id: String| {
+            let cmds = r.cmds.clone();
+            async move {
+                let (reply, rx) = oneshot::channel();
+                cmds.send(EngineCmd::LyricsSong {
+                    video_id: id,
+                    wait: false,
+                    reply,
+                })
+                .await
+                .unwrap();
+                rx.await.unwrap()
+            }
+        };
+        let facts = |c: char| crate::lyrics::SongFacts {
+            title: format!("Title {c}"),
+            artist: "One, Two".into(),
+            album: Some("Album".into()),
+            length_seconds: 2,
+        };
+        assert_eq!(ask(vid('A')).await, Some(facts('A')));
+        assert_eq!(ask(vid('B')).await, Some(facts('B')));
+        assert_eq!(ask(vid('Z')).await, None);
+    }
+
+    /// Fix round 1: lyrics asked for the song just played by id, before its details land,
+    /// wait for them (here: its link resolves 300 ms later) and then get them. A song that is
+    /// not current is answered at once, and a wait ends when another song becomes current.
+    #[tokio::test]
+    async fn lyrics_wait_for_the_current_songs_details() {
+        async fn ask(
+            cmds: &mpsc::Sender<EngineCmd>,
+            id: &str,
+            wait: bool,
+        ) -> oneshot::Receiver<Option<crate::lyrics::SongFacts>> {
+            let (reply, rx) = oneshot::channel();
+            cmds.send(EngineCmd::LyricsSong {
+                video_id: id.into(),
+                wait,
+                reply,
+            })
+            .await
+            .unwrap();
+            rx
+        }
+        let mut r = rig(Setup {
+            delays: vec![("AAAAAAAAAAA", 300)],
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Buffering).await;
+        // Without waiting: nothing known yet.
+        assert_eq!(
+            ask(&r.cmds, "AAAAAAAAAAA", false).await.await.unwrap(),
+            None
+        );
+        // A song that is not current: answered at once, even when asked to wait.
+        assert_eq!(ask(&r.cmds, "BBBBBBBBBBB", true).await.await.unwrap(), None);
+        let started = std::time::Instant::now();
+        let facts = ask(&r.cmds, "AAAAAAAAAAA", true)
+            .await
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.title, "Song AAAAAAAAAAA");
+        assert_eq!(facts.artist, "Artist");
+        assert!(started.elapsed() >= Duration::from_millis(150), "it waited");
+
+        // Another song becoming current ends a wait, with what is known of the asked one.
+        let mut r = rig(Setup {
+            delays: vec![("AAAAAAAAAAA", 5_000)],
+            ..Setup::default()
+        })
+        .await;
+        r.play("AAAAAAAAAAA").await;
+        r.until(PlayState::Buffering).await;
+        let rx = ask(&r.cmds, "AAAAAAAAAAA", true).await;
+        r.play("BBBBBBBBBBB").await;
+        let got = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("answered when the song changed");
+        assert_eq!(got.unwrap(), None);
+    }
+
+    /// A lone song's radio is the queue the user asked for (YouTube Music shows it as the
+    /// queue, with no Autoplay divider): its songs are not marked.
+    #[tokio::test]
+    async fn a_lone_songs_radio_is_not_marked() {
+        let mut r = rig(Setup {
+            pages: vec![ok(&radio_of('A'), 0, "ABC", Some("RAD2"))],
+            ..Setup::default()
+        })
+        .await;
+        r.play(&vid('A')).await;
+        let q = loop {
+            let q = r.until_queue().await;
+            if q.items.len() == 3 {
+                break q;
+            }
+        };
+        assert!(q.items.iter().all(|i| !i.song.radio), "{q:?}");
+    }
+
+    /// A radio the engine started keeps marking its songs after a restart: its next page is
+    /// still that radio's.
+    #[tokio::test]
+    async fn a_resumed_engine_radio_keeps_marking() {
+        let saved = Saved {
+            queue: vec![
+                song('A'),
+                SongItem {
+                    radio: true,
+                    ..song('B')
+                },
+            ],
+            source_playlist: Some("PLlist".into()),
+            continuation: Some("RAD9".into()),
+            continuation_radio: true,
+            ..Saved::default()
+        };
+        let (writer, saves) = recorder();
+        let mut r = rig(Setup {
+            pages: vec![ok("RAD9", 0, "CD", Some("RAD10"))],
+            saved: Some(saved),
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        let q = r.queue().await;
+        assert!(q.items[1].song.radio, "kept from state.json");
+        r.send(EngineCmd::Toggle).await;
+        r.until(PlayState::Playing).await;
+        let t = std::time::Instant::now();
+        let q = loop {
+            let q = r.queue().await;
+            if q.items.len() == 4 || t.elapsed() > Duration::from_secs(3) {
+                break q;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let marks: Vec<bool> = q.items.iter().map(|i| i.song.radio).collect();
+        assert_eq!(marks, [false, true, true, true]);
+        // And it is saved that way (the queue change was saved; the radio's page was its last).
+        let n = saves_settle(&saves, 1);
+        let last = saves.lock().unwrap()[n - 1].clone();
+        assert!(last.continuation_radio);
+        assert_eq!(
+            last.queue.iter().map(|s| s.radio).collect::<Vec<_>>(),
+            [false, true, true, true]
+        );
+    }
+
     #[tokio::test]
     async fn unavailable_song_is_skipped() {
         let mut r = rig(Setup {
@@ -5473,6 +5807,46 @@ mod tests {
         let status = r.status().await;
         assert!(status.shuffle);
         assert_eq!(status.repeat, Repeat::All);
+    }
+
+    /// Every queue event carries a revision one higher than the last (ruling P16), and
+    /// `QueueGet` answers with the newest one: a widget that gets an older queue line after a
+    /// newer one (a buffered event after `watch`, or an event after a `queue.get` reply) can
+    /// tell and drop it.
+    #[tokio::test]
+    async fn queue_events_carry_a_rising_revision() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let mut revs = Vec::new();
+        let q = loop {
+            let q = r.until_queue().await;
+            revs.push(q.rev);
+            if q.items.len() == 3 {
+                break q;
+            }
+        };
+        r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
+            songs: vec![song('D')],
+            at: AddAt::End,
+        })
+        .await;
+        revs.push(r.until_queue().await.rev);
+        r.send(EngineCmd::QueueRemove(id_of(&q, 'B'))).await;
+        let last = r.until_queue().await;
+        revs.push(last.rev);
+        assert!(revs[0] > 0, "the first event is not rev 0: {revs:?}");
+        for pair in revs.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "{revs:?}");
+        }
+        // The reply holds the same queue under the same revision as the newest event.
+        let now = r.queue().await;
+        assert_eq!(now.rev, last.rev);
+        assert_eq!(now.items, last.items);
     }
 
     #[tokio::test]

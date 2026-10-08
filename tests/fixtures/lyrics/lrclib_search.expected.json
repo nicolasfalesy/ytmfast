@@ -1,0 +1,38 @@
+{
+ "res": {
+  "synced": true,
+  "lines": [
+   {
+    "t": 0,
+    "text": ""
+   },
+   {
+    "t": 5,
+    "text": "Twice stamped line"
+   },
+   {
+    "t": 7.5,
+    "text": "Second"
+   },
+   {
+    "t": 9,
+    "text": ""
+   },
+   {
+    "t": 11.25,
+    "text": "Spaced   out"
+   },
+   {
+    "t": 65,
+    "text": "Twice stamped line"
+   }
+  ],
+  "source": "LRCLIB"
+ },
+ "kept": true,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=Imaginary%20Duo%20x%20Guest&track_name=Quiet%20Harbour%20%5Bwith%20Guest%5D&album_name=Sea&duration=214",
+  "https://lrclib.net/api/search?track_name=Quiet%20Harbour&artist_name=Imaginary%20Duo",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Imaginary%20Duo%20-%20Quiet%20Harbour&duration=214000&hash="
+ ]
+}

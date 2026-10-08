@@ -107,6 +107,10 @@ pub struct Options {
     /// browse); the daemon passes the lazily loaded session, so a browse shares the session
     /// (and its one keyring read) with the resolver and the queue source.
     pub browser: Option<Arc<dyn Browser>>,
+    /// The lyrics services (KuGou, LRCLIB) for `lyrics`. `None` by default, so a test never
+    /// reaches them by accident: `lyrics` then gives YouTube Music's plain lyrics only. The
+    /// daemon passes `lyrics::HttpWeb`.
+    pub lyrics_web: Option<Arc<dyn crate::lyrics::LyricsWeb>>,
 }
 
 impl std::fmt::Debug for Options {
@@ -116,6 +120,7 @@ impl std::fmt::Debug for Options {
             .field("power_supply_root", &self.power_supply_root)
             .field("mpris", &self.mpris)
             .field("browser", &self.browser.is_some())
+            .field("lyrics_web", &self.lyrics_web.is_some())
             .finish()
     }
 }
@@ -127,6 +132,7 @@ impl Default for Options {
             power_supply_root: PathBuf::from(idle::POWER_SUPPLY_ROOT),
             mpris: None,
             browser: None,
+            lyrics_web: None,
         }
     }
 }
@@ -272,7 +278,7 @@ async fn serve_with(
     let my_uid = current_uid();
     let mut monitor = events.subscribe();
     let shared = Arc::new(Shared {
-        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone()))),
+        lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone())), options.lyrics_web),
         cmds,
         events,
         hub,
@@ -375,19 +381,36 @@ async fn query_queue(cmds: &mpsc::Sender<EngineCmd>) -> Option<QueueView> {
 }
 
 /// What a client that fell behind may have missed: the state, and the queue (a missed
-/// queue event would leave a widget's list wrong until the next change). One line each.
-async fn catch_up(cmds: &mpsc::Sender<EngineCmd>) -> Option<[String; 2]> {
+/// queue event would leave a widget's list wrong until the next change) when it watches the
+/// queue (`with_queue`). One line each.
+async fn catch_up(cmds: &mpsc::Sender<EngineCmd>, with_queue: bool) -> Option<Vec<String>> {
     let status = query_status(cmds).await?;
+    let mut lines = vec![protocol::event_line(&EngineEvent::State(status))];
+    if with_queue {
+        lines.push(queue_line(cmds).await?);
+    }
+    Some(lines)
+}
+
+/// The queue as it is now, as a `queue` event line.
+async fn queue_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
     let queue = query_queue(cmds).await?;
-    Some([
-        protocol::event_line(&EngineEvent::State(status)),
-        protocol::event_line(&EngineEvent::Queue {
-            items: queue.items,
-            current_id: queue.current_id,
-            shuffle: queue.shuffle,
-            repeat: queue.repeat,
-        }),
-    ])
+    Some(protocol::event_line(&EngineEvent::Queue {
+        items: queue.items,
+        current_id: queue.current_id,
+        shuffle: queue.shuffle,
+        repeat: queue.repeat,
+        rev: queue.rev,
+    }))
+}
+
+/// The position as it is now, as a plain `position` event line (not a seek's).
+async fn position_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
+    let status = query_status(cmds).await?;
+    Some(protocol::event_line(&EngineEvent::Position {
+        seconds: status.position,
+        seeked: false,
+    }))
 }
 
 /// How a client's connection ends.
@@ -416,6 +439,12 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     let mut asking: HashMap<task::Id, u64> = HashMap::new();
     // False once the client closed its sending side: its browsing answers still go out.
     let mut reading = true;
+    // `watch {"queue": false}` turns this off: a bar that never shows the queue then skips
+    // its events, each up to about 400 KB of JSON for a 1,000-song queue, parsed in the shell.
+    let mut watch_queue = true;
+    // `watch {"position": false}` turns this off (ruling P22): a bar with every panel closed
+    // shows no position, and a line a second while playing would wake the shell for nothing.
+    let mut watch_position = true;
 
     let close = loop {
         tokio::select! {
@@ -429,6 +458,45 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                         Handled::Quit(reply) => {
                             quit = true;
                             reply
+                        }
+                        Handled::Watch { id, queue, position } => {
+                            let queue_was = watch_queue;
+                            let position_was = watch_position;
+                            watch_queue = queue.unwrap_or(watch_queue);
+                            watch_position = position.unwrap_or(watch_position);
+                            if !push(&out, protocol::ok_reply(id, json!({}))) {
+                                break Close::Now;
+                            }
+                            // Back on: the queue as it is now, right after the reply, so a
+                            // change made while it was off is never missed (and the widget
+                            // needs no `queue.get` of its own). The position likewise: a
+                            // paused song sends no tick, so its slider would stay wrong.
+                            let mut fresh = Vec::new();
+                            if watch_queue && !queue_was {
+                                fresh.push(queue_line(&shared.cmds).await);
+                            }
+                            if watch_position && !position_was {
+                                fresh.push(position_line(&shared.cmds).await);
+                            }
+                            let mut close = None;
+                            for line in fresh {
+                                match line {
+                                    Some(line) => {
+                                        if !push(&out, line) {
+                                            close = Some(Close::Now);
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        close = Some(Close::Flush);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(close) = close {
+                                break close;
+                            }
+                            continue;
                         }
                         Handled::Browse(id, request, epoch) => {
                             if browsing.len() >= MAX_BROWSING {
@@ -486,9 +554,14 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                 // A big queue goes through the same bounded queue as everything else: a
                 // client that stopped reading is still dropped, never waited on.
                 let pushed = match event {
+                    // Not watching the queue: its events are skipped, never even serialized.
+                    Ok(EngineEvent::Queue { .. }) if !watch_queue => true,
+                    // Nor the position (a seek's included: whoever turns it back on gets the
+                    // position as it is then).
+                    Ok(EngineEvent::Position { .. }) if !watch_position => true,
                     Ok(e) => push(&out, protocol::event_line(&e)),
                     // It missed some events: a fresh state and queue cover them.
-                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds).await {
+                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds, watch_queue).await {
                         Some(lines) => lines.into_iter().all(|l| push(&out, l)),
                         None => break Close::Flush,
                     },
@@ -562,6 +635,14 @@ enum Handled {
     /// A browsing request (or a `like`), answered from a task of its own (`answer`). For
     /// `playPage`, the engine's play epoch when it came in (ruling P7).
     Browse(u64, Request, Option<u64>),
+    /// `watch`: the request id, and whether this client now gets `queue` and `position`
+    /// events (`None` keeps that switch as it is). Per client, so the client's own task keeps
+    /// them.
+    Watch {
+        id: u64,
+        queue: Option<bool>,
+        position: Option<bool>,
+    },
 }
 
 /// One request.
@@ -590,6 +671,13 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
             });
         }
         Request::Quit => return Handled::Quit(protocol::ok_reply(id, json!({}))),
+        Request::Watch { queue, position } => {
+            return Handled::Watch {
+                id,
+                queue,
+                position,
+            };
+        }
         // Read now, in this client's command order (through the engine's channel): any play
         // the user makes after this, from anywhere, wins over the page's (ruling P7).
         request @ Request::PlayPage { .. } => {
@@ -707,6 +795,7 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
                 .get(browser.as_ref(), &video_id)
                 .await
                 .map(|lyrics| match lyrics {
+                    // Within a line: `lyrics::fits` held every answer to it.
                     Some(l) => protocol::data_reply(id, &l),
                     None => protocol::ok_reply(id, json!({ "none": true })),
                 }),

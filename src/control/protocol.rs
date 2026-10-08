@@ -112,10 +112,18 @@ pub enum Request {
     Mute {
         on: bool,
     },
-    /// A song's plain lyrics (`control::lyrics`): answered like a browsing command, to the
-    /// asking client only.
+    /// A song's lyrics, timed when they can be (KuGou's words, LRCLIB's lines, else plain text;
+    /// `control::lyrics`): answered like a browsing command, to the asking client only.
     Lyrics {
         video_id: String,
+    },
+    /// Which events this client gets: `queue: false` stops its `queue` events, `position:
+    /// false` its `position` events (each on by default). A field left out keeps its switch;
+    /// at least one is given. Handled by the client's own task, not the engine
+    /// (`control::client`).
+    Watch {
+        queue: Option<bool>,
+        position: Option<bool>,
     },
     Quit,
 }
@@ -184,6 +192,7 @@ impl Request {
                             "title": s.title,
                             "artists": s.artists,
                             "album": s.album,
+                            "albumId": s.album_id,
                             "thumbnail": s.thumbnail,
                             "lengthSeconds": s.length_seconds,
                         })
@@ -210,6 +219,16 @@ impl Request {
             }
             Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
             Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
+            Request::Watch { queue, position } => {
+                let mut args = Map::new();
+                if let Some(q) = queue {
+                    args.insert("queue".into(), json!(q));
+                }
+                if let Some(p) = position {
+                    args.insert("position".into(), json!(p));
+                }
+                ("watch", Some(Value::Object(args)))
+            }
             Request::Quit => ("quit", None),
         };
         let mut msg = json!({ "id": id, "cmd": cmd });
@@ -438,6 +457,19 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 _ => return Err(VIDEO_ID_RULE),
             },
         },
+        "watch" => {
+            // Null counts as left out, as for every other optional field (`field`).
+            let switch = |name, rule| match field(args, name) {
+                None => Ok(None),
+                Some(v) => v.as_bool().map(Some).ok_or(rule),
+            };
+            let queue = switch("queue", "queue must be true or false")?;
+            let position = switch("position", "position must be true or false")?;
+            if queue.is_none() && position.is_none() {
+                return Err("watch needs queue or position");
+            }
+            Request::Watch { queue, position }
+        }
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
@@ -577,7 +609,9 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         Some(Value::Array(list)) if list.len() <= MAX_ARTISTS => list
             .iter()
             .map(|a| match a {
-                Value::String(s) if s.len() <= MAX_TEXT => Ok(s.clone()),
+                // A widget may pass an artist straight from a channel name (a browse row's
+                // byline): cleaned like `next`'s, so the queue never holds " - Topic".
+                Value::String(s) if s.len() <= MAX_TEXT => Ok(crate::innertube::clean_artist(s)),
                 _ => Err(TEXT),
             })
             .collect::<Result<_, _>>()?,
@@ -593,6 +627,14 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
             .filter(|s| s.len() <= MAX_TEXT),
         Some(_) => return Err("thumbnail must be a link"),
     };
+    // The album link, for the cover click on a queued song. Shape-checked as every browse id
+    // is (`browse::id_ok`, as `next`'s byline links are); a malformed one, or anything that is
+    // not a string, is "" (no album), never a refused song: as for a thumbnail, the song
+    // itself is still good, and "" is what a song with no album link has anyway.
+    let album_id = match field(song, "albumId") {
+        Some(Value::String(s)) if id_ok(s) => s.clone(),
+        _ => String::new(),
+    };
     let length_seconds = match field(song, "lengthSeconds") {
         None => 0,
         Some(v) => v
@@ -605,10 +647,12 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
         title,
         artists,
         album,
-        album_id: String::new(),
+        album_id,
         thumbnail,
         length_seconds,
         playlist_id: None,
+        // A client's song is the user's own pick, never the engine's radio.
+        radio: false,
     })
 }
 
@@ -733,6 +777,10 @@ struct WireItem<'a> {
     thumbnail: Option<&'a str>,
     /// Null when unknown (0), as in a state.
     length_seconds: Option<u32>,
+    /// `true` for a song the engine's own radio brought (`SongItem::radio`); left out
+    /// otherwise, so a queue line grows only where the widget's "Autoplay" divider needs it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    radio: bool,
 }
 
 /// The `queue` event's fields; `event` is left out for the `queue.get` reply.
@@ -745,6 +793,9 @@ struct WireQueue<'a> {
     current_id: Option<u64>,
     shuffle: bool,
     repeat: &'static str,
+    /// The queue's revision (`EngineEvent::Queue::rev`): a widget drops a line older than the
+    /// newest it has seen.
+    rev: u64,
 }
 
 impl<'a> WireQueue<'a> {
@@ -754,6 +805,7 @@ impl<'a> WireQueue<'a> {
         current_id: Option<u64>,
         shuffle: bool,
         repeat: Repeat,
+        rev: u64,
     ) -> Self {
         WireQueue {
             event,
@@ -768,11 +820,13 @@ impl<'a> WireQueue<'a> {
                     album_id: &i.song.album_id,
                     thumbnail: i.song.thumbnail.as_deref(),
                     length_seconds: Some(i.song.length_seconds).filter(|s| *s > 0),
+                    radio: i.song.radio,
                 })
                 .collect(),
             current_id,
             shuffle,
             repeat: repeat_name(repeat),
+            rev,
         }
     }
 }
@@ -785,6 +839,7 @@ pub fn queue_data(view: &QueueView) -> Value {
         view.current_id,
         view.shuffle,
         view.repeat,
+        view.rev,
     );
     // Plain strings, numbers and bools: serializing them can't fail.
     serde_json::to_value(wire).expect("a queue serializes")
@@ -809,8 +864,9 @@ pub fn event_line(event: &EngineEvent) -> String {
             current_id,
             shuffle,
             repeat,
+            rev,
         } => {
-            let wire = WireQueue::new(Some("queue"), items, *current_id, *shuffle, *repeat);
+            let wire = WireQueue::new(Some("queue"), items, *current_id, *shuffle, *repeat, *rev);
             let mut s = serde_json::to_string(&wire).expect("a queue serializes");
             s.push('\n');
             s
@@ -858,6 +914,7 @@ mod tests {
             thumbnail: Some("https://lh3.googleusercontent.com/x=w544-h544".into()),
             length_seconds: 213,
             playlist_id: None,
+            radio: false,
         }
     }
 
@@ -941,6 +998,13 @@ mod tests {
                 songs: vec![song("BBBBBBBBBBB")],
                 at: AddAt::End,
             },
+            Request::QueueAdd {
+                songs: vec![SongItem {
+                    album_id: "MPREb_abc".into(),
+                    ..song("CCCCCCCCCCC")
+                }],
+                at: AddAt::End,
+            },
             Request::QueueRemove { id: 4 },
             Request::QueueJump { id: u64::MAX },
             Request::QueueMove { id: 2, index: 0 },
@@ -965,6 +1029,18 @@ mod tests {
             Request::Mute { on: false },
             Request::Lyrics {
                 video_id: "dQw4w9WgXcQ".into(),
+            },
+            Request::Watch {
+                queue: Some(false),
+                position: None,
+            },
+            Request::Watch {
+                queue: Some(true),
+                position: Some(false),
+            },
+            Request::Watch {
+                queue: None,
+                position: Some(true),
             },
             Request::Quit,
         ];
@@ -1317,6 +1393,102 @@ mod tests {
         assert!(parse(&line.to_string()).is_ok());
     }
 
+    #[test]
+    fn added_songs_keep_a_well_formed_album_id() {
+        // The cover click opens the album (`albumId`), for songs added to the queue too.
+        let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ", "albumId": "MPREb_abc-_9"}));
+        assert_eq!(song.unwrap().album_id, "MPREb_abc-_9");
+        // Checked as a browseId is everywhere (`browse::id_ok`): a malformed one is "", as in
+        // a state, and never refuses the song (it is only a link, the song is still good).
+        for bad in [
+            json!("../MPREb"),
+            json!("x"),
+            json!("x".repeat(129)),
+            json!(""),
+            json!(5),
+            json!(null),
+        ] {
+            let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ", "albumId": bad}));
+            assert_eq!(song.unwrap().album_id, "", "{bad}");
+        }
+    }
+
+    #[test]
+    fn watch_parses_and_says_what_is_wrong() {
+        assert_eq!(
+            parse(r#"{"id":1,"cmd":"watch","args":{"queue":false}}"#),
+            Ok((
+                1,
+                Request::Watch {
+                    queue: Some(false),
+                    position: None
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":2,"cmd":"watch","args":{"queue":true}}"#),
+            Ok((
+                2,
+                Request::Watch {
+                    queue: Some(true),
+                    position: None
+                }
+            ))
+        );
+        // `position` alone, and both at once: each field is its own switch (ruling P22).
+        assert_eq!(
+            parse(r#"{"id":4,"cmd":"watch","args":{"position":false}}"#),
+            Ok((
+                4,
+                Request::Watch {
+                    queue: None,
+                    position: Some(false)
+                }
+            ))
+        );
+        assert_eq!(
+            parse(r#"{"id":5,"cmd":"watch","args":{"queue":true,"position":true}}"#),
+            Ok((
+                5,
+                Request::Watch {
+                    queue: Some(true),
+                    position: Some(true)
+                }
+            ))
+        );
+        for (args, message) in [
+            (json!({}), "watch needs queue or position"),
+            (json!({"queue": null}), "watch needs queue or position"),
+            (json!({"queue": "no"}), "queue must be true or false"),
+            (json!({"queue": 0}), "queue must be true or false"),
+            (json!({"position": "no"}), "position must be true or false"),
+            (
+                json!({"queue": true, "position": 1}),
+                "position must be true or false",
+            ),
+        ] {
+            let line = json!({"id": 3, "cmd": "watch", "args": args}).to_string();
+            assert_eq!(
+                bad(&line),
+                BadRequest {
+                    id: Some(3),
+                    message: message.into()
+                },
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_songs_lose_the_topic_suffix() {
+        // A widget's song can carry an artist straight from a channel name (a browse row's
+        // byline); the queue, its status and state.json keep the artist alone.
+        let song = parse_song(&json!({"videoId": "dQw4w9WgXcQ",
+            "artists": ["One - Topic", "Topic", "Two"]}))
+        .unwrap();
+        assert_eq!(song.artists, ["One", "Topic", "Two"]);
+    }
+
     fn item(id: u64, song: SongItem) -> QueueItem {
         QueueItem { id, song }
     }
@@ -1332,6 +1504,13 @@ mod tests {
                 },
             ),
             item(2, bare("AAAAAAAAAAA")),
+            item(
+                3,
+                SongItem {
+                    radio: true,
+                    ..bare("BBBBBBBBBBB")
+                },
+            ),
         ]
         .into();
         let event = EngineEvent::Queue {
@@ -1339,11 +1518,13 @@ mod tests {
             current_id: Some(2),
             shuffle: true,
             repeat: Repeat::All,
+            rev: 41,
         };
         let v: Value = serde_json::from_str(&event_line(&event)).unwrap();
         assert_eq!(
             v,
             json!({"event": "queue", "currentId": 2, "shuffle": true, "repeat": "all",
+                   "rev": 41,
                    "items": [
                        {"queueId": 1, "videoId": "dQw4w9WgXcQ", "title": "Song",
                         "artists": ["A", "B"], "album": "Album", "albumId": "MPREb_abc",
@@ -1351,7 +1532,12 @@ mod tests {
                         "lengthSeconds": 213},
                        // A bare id: details are null until the song plays; no album id is "".
                        {"queueId": 2, "videoId": "AAAAAAAAAAA", "title": null, "artists": [],
-                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null}]})
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null},
+                       // A song the engine's own radio brought: `radio: true`; the others
+                       // carry no such key.
+                       {"queueId": 3, "videoId": "BBBBBBBBBBB", "title": null, "artists": [],
+                        "album": null, "albumId": "", "thumbnail": null, "lengthSeconds": null,
+                        "radio": true}]})
         );
         // `queue.get`'s data is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1361,7 +1547,8 @@ mod tests {
                 items,
                 current_id: Some(2),
                 shuffle: true,
-                repeat: Repeat::All
+                repeat: Repeat::All,
+                rev: 41,
             }),
             Value::Object(data)
         );
@@ -1370,12 +1557,13 @@ mod tests {
             current_id: None,
             shuffle: false,
             repeat: Repeat::One,
+            rev: 0,
         };
         let v: Value = serde_json::from_str(&event_line(&empty)).unwrap();
         assert_eq!(
             v,
             json!({"event": "queue", "items": [], "currentId": null, "shuffle": false,
-                   "repeat": "one"})
+                   "repeat": "one", "rev": 0})
         );
     }
 
@@ -1401,6 +1589,7 @@ mod tests {
                         )),
                         length_seconds: 245,
                         playlist_id: Some("OLAK5uy_abcdefghijklmnopqrstuvwxyz0123456".into()),
+                        radio: false,
                     },
                 )
             })
@@ -1410,6 +1599,7 @@ mod tests {
             current_id: Some(250),
             shuffle: false,
             repeat: Repeat::Off,
+            rev: u64::MAX,
         };
         let start = std::time::Instant::now();
         let rounds = 20;

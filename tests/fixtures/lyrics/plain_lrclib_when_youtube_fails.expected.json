@@ -1,0 +1,30 @@
+{
+ "res": {
+  "synced": false,
+  "lines": [
+   {
+    "t": -1,
+    "text": "first plain line"
+   },
+   {
+    "t": -1,
+    "text": "second"
+   },
+   {
+    "t": -1,
+    "text": ""
+   },
+   {
+    "t": -1,
+    "text": "third"
+   }
+  ],
+  "source": "LRCLIB"
+ },
+ "kept": false,
+ "asked": [
+  "https://lrclib.net/api/get?artist_name=Nobody%20Real&track_name=Small%20Talk",
+  "https://lrclib.net/api/search?track_name=Small%20Talk&artist_name=Nobody%20Real",
+  "https://krcs.kugou.com/search?ver=1&man=yes&client=mobi&keyword=Nobody%20Real%20-%20Small%20Talk&duration=0&hash="
+ ]
+}

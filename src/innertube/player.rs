@@ -205,7 +205,7 @@ fn parse_tracking(answer: &[u8], allowed: impl Fn(&Url) -> bool) -> Result<Track
 
 /// The request body, as yt-dlp 2026.08.19 sends it for this client.
 fn request_body(client: &clients::ClientInfo, video_id: &str, sts: u32) -> serde_json::Value {
-    json!({
+    let mut body = json!({
         "context": {
             "client": {
                 "clientName": client.name,
@@ -226,7 +226,15 @@ fn request_body(client: &clients::ClientInfo, video_id: &str, sts: u32) -> serde
         // Skip the "this may be inappropriate" interstitials; the user picked the song.
         "contentCheckOk": true,
         "racyCheckOk": true,
-    })
+    });
+    if let Some(d) = client.device {
+        let c = &mut body["context"]["client"];
+        c["deviceMake"] = d.make.into();
+        c["deviceModel"] = d.model.into();
+        c["osName"] = d.os_name.into();
+        c["osVersion"] = d.os_version.into();
+    }
+    body
 }
 
 // The answer, only the parts we read. Everything is optional so one odd field doesn't sink
@@ -430,8 +438,11 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     };
     let present = |s: Option<String>| s.filter(|s| !s.is_empty());
     let title = present(title).or(present(micro_title)).unwrap_or_default();
+    // Both name the uploading channel, which for most songs is YouTube's auto-made
+    // "<artist> - Topic" one: the artist alone is what the bar shows.
     let author = present(author)
         .or(present(micro_author))
+        .map(|a| super::clean_artist(&a))
         .unwrap_or_default();
     let length_seconds = length_seconds.or(micro_length).unwrap_or_default();
 
@@ -703,6 +714,37 @@ mod tests {
     }
 
     #[test]
+    fn channel_names_lose_the_topic_suffix() {
+        // The TV answer names the uploading channel, and a song's channel is often YouTube's
+        // auto-made "<artist> - Topic" one: the bar must show the artist alone.
+        for (details, micro) in [
+            (
+                json!({"videoId": "x", "title": "Song", "author": "Artist - Topic"}),
+                json!({}),
+            ),
+            (
+                json!({"videoId": "x", "title": "Song"}),
+                json!({"ownerChannelName": "Artist - Topic"}),
+            ),
+        ] {
+            let a = answer(json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": details,
+                "microformat": {"playerMicroformatRenderer": micro}
+            }));
+            assert_eq!(parse(&a, "x").unwrap().author, "Artist");
+        }
+        // Only the exact trailing suffix: "Topic" as part of a name stays.
+        for name in ["Topic", "The Topic", "Artist -Topic", "Topic - Artist"] {
+            let a = answer(json!({
+                "playabilityStatus": {"status": "OK"},
+                "videoDetails": {"videoId": "x", "title": "Song", "author": name}
+            }));
+            assert_eq!(parse(&a, "x").unwrap().author, name);
+        }
+    }
+
+    #[test]
     fn shape_names_keys_never_values() {
         let a = json!({
             "playabilityStatus": {"status": "OK"},
@@ -858,6 +900,19 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_tv_body_names_its_device_and_the_music_body_none() {
+        let b = request_body(&clients::TV, "abc", 20731);
+        let c = &b["context"]["client"];
+        assert_eq!(c["deviceMake"], "Samsung");
+        assert_eq!(c["deviceModel"], "UKS9800");
+        assert_eq!(c["osName"], "Tizen");
+        assert_eq!(c["osVersion"], "2.4.0");
+        assert_eq!(c["userAgent"], clients::TV.user_agent);
+        let b = request_body(&clients::WEB_REMIX, "abc", 20731);
+        assert!(b["context"]["client"].get("deviceMake").is_none());
     }
 
     #[test]

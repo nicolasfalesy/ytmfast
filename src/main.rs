@@ -14,7 +14,9 @@ use ytmfast::audio::fetch::{Relink, TrackBuffer};
 use ytmfast::audio::player::{AudioEvent, AudioPlayer};
 use ytmfast::audio::pw::PipeWireSink;
 use ytmfast::audio::sink::{NullSink, Sink};
-use ytmfast::auth::{KeyringStore, Session, SessionStore, chromium, sidhash};
+use ytmfast::auth::{
+    KeyringStore, MemoryStore, SafeStorageKeys, Session, SessionStore, chromium, sidhash,
+};
 use ytmfast::control::{self, Exit, stop};
 use ytmfast::engine::Engine;
 use ytmfast::error::Error;
@@ -34,9 +36,13 @@ commands:
   daemon [--null-sink]
                     run the engine and its control socket (systemd starts it through
                     ytmfast.socket); --null-sink plays into nothing (benchmarks)
-  import-session [--profile PATH]
+  import-session [--browser brave-origin] [--profile PATH]
                     store a YouTube Music session in the login keyring, read from the
-                    pear-desktop profile (default: ~/.config/YouTube Music)
+                    pear-desktop profile (default: ~/.config/YouTube Music), or with
+                    --browser brave-origin from the Brave Origin profile (default:
+                    ~/.config/BraveSoftware/Brave-Origin/Default), opening its cookies
+                    with the keyring's \"Brave Safe Storage\" key; it checks the
+                    session with YouTube Music and prints the account's name first
   play <videoId> [--null-sink] [--seconds N]
                     play one song to the default output and exit (debug helper);
                     --null-sink plays in real time into nothing (benchmarks),
@@ -52,13 +58,25 @@ enum Command {
     Daemon {
         null_sink: bool,
     },
-    /// The profile folder, when `--profile` gave one.
-    ImportSession(Option<PathBuf>),
+    /// Where the session comes from, and the profile folder when `--profile` gave one.
+    ImportSession {
+        source: Source,
+        profile: Option<PathBuf>,
+    },
     Play(PlayArgs),
     Version,
     Help,
     /// Anything we don't understand: print usage and exit 2.
     Usage,
+}
+
+/// The profile `import-session` reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Source {
+    /// The `pear-desktop` app's (the default, as before `--browser` existed).
+    PearDesktop,
+    /// The Brave Origin browser's (`--browser brave-origin`).
+    BraveOrigin,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,13 +94,35 @@ fn parse(args: impl IntoIterator<Item = String>) -> Command {
     match args.as_slice() {
         ["daemon"] => Command::Daemon { null_sink: false },
         ["daemon", "--null-sink"] => Command::Daemon { null_sink: true },
-        ["import-session"] => Command::ImportSession(None),
-        ["import-session", "--profile", path] => Command::ImportSession(Some(path.into())),
+        ["import-session", rest @ ..] => parse_import(rest).unwrap_or(Command::Usage),
         ["play", rest @ ..] => parse_play(rest).map_or(Command::Usage, Command::Play),
         ["-V" | "--version"] => Command::Version,
         ["-h" | "--help"] => Command::Help,
         _ => Command::Usage,
     }
+}
+
+/// `import-session`'s options, in any order, each at most once.
+fn parse_import(args: &[&str]) -> Option<Command> {
+    let mut source = None;
+    let mut profile = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match *arg {
+            "--browser" if source.is_none() => match *it.next()? {
+                // The one browser read so far; a name it doesn't know is a usage error, not
+                // a silent fall back to pear-desktop.
+                "brave-origin" => source = Some(Source::BraveOrigin),
+                _ => return None,
+            },
+            "--profile" if profile.is_none() => profile = Some(PathBuf::from(*it.next()?)),
+            _ => return None,
+        }
+    }
+    Some(Command::ImportSession {
+        source: source.unwrap_or(Source::PearDesktop),
+        profile,
+    })
 }
 
 /// `play`'s arguments, in any order: the id once, each option at most once.
@@ -116,25 +156,53 @@ fn parse_play(args: &[&str]) -> Option<PlayArgs> {
 /// `$XDG_CONFIG_HOME/<app name>`, else `~/.config/<app name>`, and the app is named
 /// "YouTube Music".
 fn default_profile_in(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let config = env("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(config.join("YouTube Music"))
+    Some(config_dir_in(env)?.join("YouTube Music"))
 }
 
-/// Imports the session from the profile and saves it in the login keyring, then stops a
-/// running engine so it can't write its old session back over the new one. Prints only the
-/// cookie count: never a value.
-fn import_session(profile: Option<PathBuf>) -> ExitCode {
-    let Some(profile) = profile.or_else(|| default_profile_in(&|k| std::env::var_os(k))) else {
+/// Brave Origin's first profile: Chromium keeps its data in `$XDG_CONFIG_HOME/<vendor>/<app>`
+/// (else `~/.config/…`), and Brave Origin's is `BraveSoftware/Brave-Origin`, its first
+/// profile `Default`.
+fn default_brave_origin_profile_in(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(config_dir_in(env)?.join("BraveSoftware/Brave-Origin/Default"))
+}
+
+/// `$XDG_CONFIG_HOME` when it is absolute (a relative one is invalid by the spec), else
+/// `~/.config`.
+fn config_dir_in(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+/// Imports the session from the profile, checks it with YouTube Music and prints the
+/// account's name, saves it in the login keyring, then stops a running engine so it can't
+/// write its old session back over the new one. Prints the name and the cookie count: never a
+/// value.
+fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
+    let env = |k: &str| std::env::var_os(k);
+    let default = match source {
+        Source::PearDesktop => default_profile_in(&env),
+        Source::BraveOrigin => default_brave_origin_profile_in(&env),
+    };
+    let Some(profile) = profile.or(default) else {
         eprintln!("ytmfast: no home folder; pass --profile PATH");
         return ExitCode::from(1);
     };
-    let session = match chromium::import(&profile) {
+    let not_signed_in = match source {
+        Source::PearDesktop => NOT_SIGNED_IN,
+        Source::BraveOrigin => BRAVE_NOT_SIGNED_IN,
+    };
+    // Runs before the async runtime below is built: the keyring lookup makes its own (a
+    // runtime can't be started inside another).
+    let imported = match source {
+        Source::PearDesktop => chromium::import(&profile),
+        Source::BraveOrigin => chromium::import_brave_origin(&profile, &SafeStorageKeys::brave()),
+    };
+    let session = match imported {
         Ok(s) => s,
         Err(Error::SignedOut) => {
-            eprintln!("ytmfast: {NOT_SIGNED_IN}");
+            eprintln!("ytmfast: {not_signed_in}");
             return ExitCode::from(1);
         }
         Err(e) => {
@@ -145,10 +213,10 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
     // Checked before saving: a profile with YouTube cookies but no sign-in (a visitor's
     // cookies only) would replace a working session with one that can't sign a request.
     if !has_sign_in(&session) {
-        eprintln!("ytmfast: {NOT_SIGNED_IN}");
+        eprintln!("ytmfast: {not_signed_in}");
         return ExitCode::from(1);
     }
-    // One small runtime for the keyring calls; the daemon builds its own.
+    // One small runtime for the account check and the keyring calls; the daemon builds its own.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -156,6 +224,25 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
         Ok(r) => r,
         Err(_) => {
             eprintln!("ytmfast: could not start the async runtime");
+            return ExitCode::from(1);
+        }
+    };
+    // Spec A2 (ruling P19): the session must sign someone in before it replaces the saved
+    // one, and the account's name shows which Google account it is (a browser signed in to
+    // another one would otherwise swap the library silently). Any failure saves nothing: a
+    // session that can't be checked is not known to work.
+    let session = match runtime.block_on(check_account(session)) {
+        Ok((session, name)) => {
+            // The bar widget reads this line as it is ("Signed in as <name>").
+            println!("Signed in as {name}");
+            session
+        }
+        Err(Error::SignedOut) => {
+            eprintln!("ytmfast: {not_signed_in}");
+            return ExitCode::from(1);
+        }
+        Err(_) => {
+            eprintln!("ytmfast: {CHECK_FAILED}");
             return ExitCode::from(1);
         }
     };
@@ -191,6 +278,40 @@ fn import_session(profile: Option<PathBuf>) -> ExitCode {
 }
 
 const NOT_SIGNED_IN: &str = "no YouTube sign-in in that profile; sign in to the app first";
+/// The account check could not be made (no network, an error answer). The bar widget shows it
+/// as it is.
+const CHECK_FAILED: &str = "could not check the sign-in with YouTube Music; try again";
+
+/// Asks YouTube Music for the session's account name (`Innertube::account_name`). Returns the
+/// session as it is after the answer (a cookie the answer rotated is kept, so the copy saved
+/// is the newest) and the name.
+///
+/// The check's own client saves rotations to a throwaway store: the keyring is written once,
+/// by the caller, and only after the check passed.
+async fn check_account(session: Session) -> Result<(Session, String), Error> {
+    let shared = Arc::new(Mutex::new(session));
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let name = account_api(shared.clone(), store).account_name().await?;
+    let session = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok((session, name))
+}
+
+/// The client the account check goes through: production's (https, the allowlist). A debug
+/// build alone also reads `YTMFAST_TEST_API_BASE`, the import tests' local fake server, so no
+/// test reaches YouTube; a release build never looks at it, so nothing can send a real
+/// session's check anywhere else.
+fn account_api(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>) -> Innertube {
+    #[cfg(debug_assertions)]
+    if let Some(base) = std::env::var("YTMFAST_TEST_API_BASE")
+        .ok()
+        .and_then(|b| url::Url::parse(&b).ok())
+    {
+        return Innertube::new(session, store, base);
+    }
+    Innertube::production(session, store)
+}
+/// The bar widget shows it as it is.
+const BRAVE_NOT_SIGNED_IN: &str = "Brave Origin isn't signed in to YouTube Music";
 
 /// True when the session can sign API requests: it holds a SAPISID cookie for the origin the
 /// `player` request is signed for. Without one every request would be `signed_out`.
@@ -396,9 +517,12 @@ async fn serve(
     // MPRIS on the session bus, started inside `control::run` next to the socket. Without a
     // session bus it logs one line and the socket carries on alone.
     // The socket's browsing commands go through the same lazily loaded session.
+    // The lyrics services get their own client (`lyrics::web`): three hosts, nothing of the
+    // session.
     let options = control::Options {
         mpris: Some(ytmfast::mpris::Bus::Session),
         browser: Some(backend),
+        lyrics_web: Some(Arc::new(ytmfast::lyrics::HttpWeb::new())),
         ..control::Options::default()
     };
     Ok(control::run(listener, engine, cmds, events, options, shutdown).await)
@@ -494,7 +618,7 @@ fn main() -> ExitCode {
     ytmfast::trace::init_from_env();
     match parse(std::env::args().skip(1)) {
         Command::Daemon { null_sink } => daemon(null_sink),
-        Command::ImportSession(profile) => import_session(profile),
+        Command::ImportSession { source, profile } => import_session(source, profile),
         Command::Play(args) => play(args),
         Command::Version => {
             println!("ytmfast {}", env!("CARGO_PKG_VERSION"));
@@ -526,11 +650,38 @@ mod tests {
             p(&["daemon", "--null-sink"]),
             Command::Daemon { null_sink: true }
         );
-        assert_eq!(p(&["import-session"]), Command::ImportSession(None));
+        assert_eq!(p(&["import-session"]), import(Source::PearDesktop, None));
         assert_eq!(
             p(&["import-session", "--profile", "/x/YouTube Music"]),
-            Command::ImportSession(Some("/x/YouTube Music".into()))
+            import(Source::PearDesktop, Some("/x/YouTube Music"))
         );
+        assert_eq!(
+            p(&["import-session", "--browser", "brave-origin"]),
+            import(Source::BraveOrigin, None)
+        );
+        // Options in either order.
+        for args in [
+            &[
+                "import-session",
+                "--browser",
+                "brave-origin",
+                "--profile",
+                "/b/Default",
+            ][..],
+            &[
+                "import-session",
+                "--profile",
+                "/b/Default",
+                "--browser",
+                "brave-origin",
+            ],
+        ] {
+            assert_eq!(
+                p(args),
+                import(Source::BraveOrigin, Some("/b/Default")),
+                "{args:?}"
+            );
+        }
         assert_eq!(
             p(&["play", "dQw4w9WgXcQ"]),
             Command::Play(play("dQw4w9WgXcQ"))
@@ -539,6 +690,13 @@ mod tests {
         assert_eq!(p(&["-V"]), Command::Version);
         assert_eq!(p(&["--help"]), Command::Help);
         assert_eq!(p(&["-h"]), Command::Help);
+    }
+
+    fn import(source: Source, profile: Option<&str>) -> Command {
+        Command::ImportSession {
+            source,
+            profile: profile.map(PathBuf::from),
+        }
     }
 
     fn play(id: &str) -> PlayArgs {
@@ -625,6 +783,26 @@ mod tests {
         assert_eq!(p(&["daemon", "--null-sink", "--null-sink"]), Command::Usage);
         assert_eq!(p(&["import-session", "--profile"]), Command::Usage);
         assert_eq!(p(&["import-session", "/x"]), Command::Usage);
+        assert_eq!(p(&["import-session", "--browser"]), Command::Usage);
+        assert_eq!(p(&["import-session", "--browser", "brave"]), Command::Usage);
+        assert_eq!(
+            p(&["import-session", "--browser", "firefox"]),
+            Command::Usage
+        );
+        assert_eq!(
+            p(&[
+                "import-session",
+                "--browser",
+                "brave-origin",
+                "--browser",
+                "brave-origin"
+            ]),
+            Command::Usage
+        );
+        assert_eq!(
+            p(&["import-session", "--profile", "/a", "--profile", "/b"]),
+            Command::Usage
+        );
     }
 
     #[test]
@@ -680,5 +858,27 @@ mod tests {
             Some(PathBuf::from("/h/.config/YouTube Music"))
         );
         assert_eq!(default_profile_in(&env(&[])), None);
+    }
+
+    #[test]
+    fn default_brave_origin_profile_follows_chromium() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        assert_eq!(
+            default_brave_origin_profile_in(&env(&[("HOME", "/h")])),
+            Some(PathBuf::from(
+                "/h/.config/BraveSoftware/Brave-Origin/Default"
+            ))
+        );
+        assert_eq!(
+            default_brave_origin_profile_in(&env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/c")])),
+            Some(PathBuf::from("/c/BraveSoftware/Brave-Origin/Default"))
+        );
+        assert_eq!(default_brave_origin_profile_in(&env(&[])), None);
     }
 }

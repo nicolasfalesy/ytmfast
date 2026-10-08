@@ -27,7 +27,11 @@ The power figure is step 1's (when the engine used 31.5 MB and 0.51% CPU); it wa
 Step 3 did not change how songs play, so these are step 2's figures; its own (page load times, and memory while
 browsing) are in the benchmarks file.
 
-Coming next: **step 4, the widget.** The Omarchy bar widget switches to the engine.
+Coming next: **step 4, the widget.** The Omarchy bar widget switches to the engine. Its engine side is under way:
+lyrics are now timed, word by word from KuGou and line by line from LRCLIB (both free, keyless services), with
+YouTube Music's own plain lyrics after them. Those requests go only to `lrclib.net`, `krcs.kugou.com` and
+`lyrics.kugou.com`, over https, and carry only the song's title, artists, album and length; everything else the
+engine sends goes to YouTube and Google alone. See [docs/protocol.md](docs/protocol.md) (`lyrics`).
 
 ## Resume and history
 
@@ -39,15 +43,30 @@ Delete it, with the engine stopped, to start fresh.
 
 ## Sign in
 
-ytmfast reuses the sign-in of the YouTube Music desktop app. Close that app, then run:
+ytmfast reuses a sign-in the user already has: the Brave Origin browser's, or the YouTube Music desktop app's.
+
+From Brave Origin (sign in to music.youtube.com there first; Brave Origin can stay open):
+
+```sh
+ytmfast import-session --browser brave-origin
+```
+
+It reads the first profile (`~/.config/BraveSoftware/Brave-Origin/Default`; `--profile <folder>` picks another) and
+opens its cookies with the key Brave keeps in the login keyring, the item labelled "Brave Safe Storage" (an unlock
+prompt may show). Brave writes new cookies to disk about every 30 seconds, so right after signing in, wait half a minute
+if the import says Brave Origin isn't signed in.
+
+From the desktop app (close it first):
 
 ```sh
 ytmfast import-session
 ```
 
-It copies the session into the login keyring (never into a plain file) and prints how many cookies it took. It
-refuses a profile that isn't signed in. If the engine is running, it is stopped, so the next play starts it with the
-new session.
+Either way, it first asks YouTube Music whose session it is and prints `Signed in as <name>`, so a browser signed
+in to another Google account is seen at once. It refuses a profile that isn't signed in, or whose sign-in YouTube
+Music no longer takes, and saves nothing when that check can't be made. Then it copies only the YouTube and Google
+sign-in cookies into the login keyring (never into a plain file) and prints how many it took, never a value. If the
+engine is running, it is stopped, so the next play starts it with the new session.
 
 ## Build
 
