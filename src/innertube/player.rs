@@ -205,7 +205,7 @@ fn parse_tracking(answer: &[u8], allowed: impl Fn(&Url) -> bool) -> Result<Track
 
 /// The request body, as yt-dlp 2026.08.19 sends it for this client.
 fn request_body(client: &clients::ClientInfo, video_id: &str, sts: u32) -> serde_json::Value {
-    json!({
+    let mut body = json!({
         "context": {
             "client": {
                 "clientName": client.name,
@@ -226,7 +226,15 @@ fn request_body(client: &clients::ClientInfo, video_id: &str, sts: u32) -> serde
         // Skip the "this may be inappropriate" interstitials; the user picked the song.
         "contentCheckOk": true,
         "racyCheckOk": true,
-    })
+    });
+    if let Some(d) = client.device {
+        let c = &mut body["context"]["client"];
+        c["deviceMake"] = d.make.into();
+        c["deviceModel"] = d.model.into();
+        c["osName"] = d.os_name.into();
+        c["osVersion"] = d.os_version.into();
+    }
+    body
 }
 
 // The answer, only the parts we read. Everything is optional so one odd field doesn't sink
@@ -892,6 +900,19 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_tv_body_names_its_device_and_the_music_body_none() {
+        let b = request_body(&clients::TV, "abc", 20731);
+        let c = &b["context"]["client"];
+        assert_eq!(c["deviceMake"], "Samsung");
+        assert_eq!(c["deviceModel"], "UKS9800");
+        assert_eq!(c["osName"], "Tizen");
+        assert_eq!(c["osVersion"], "2.4.0");
+        assert_eq!(c["userAgent"], clients::TV.user_agent);
+        let b = request_body(&clients::WEB_REMIX, "abc", 20731);
+        assert!(b["context"]["client"].get("deviceMake").is_none());
     }
 
     #[test]

@@ -21,19 +21,41 @@ pub struct ClientInfo {
     /// signed-in session; the TV client never has, and step 1's working TV requests are kept
     /// exactly as they were.
     pub sends_auth_user: bool,
+    /// `context.client.deviceMake`, `deviceModel`, `osName` and `osVersion`, for a client
+    /// that names its device (the TV client, below); `None` sends none of them.
+    pub device: Option<Device>,
+}
+
+/// The device a client says it runs on (see `ClientInfo::device`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Device {
+    pub make: &'static str,
+    pub model: &'static str,
+    pub os_name: &'static str,
+    pub os_version: &'static str,
 }
 
 /// The TV client, used for `player`: with the session it gave the Premium formats (itag 774)
-/// in the feasibility check. This is yt-dlp's `tv_downgraded` entry: its `Cobalt/Version`
-/// user agent and the `5.x` version make YouTube serve the classic TV player answer.
+/// in the feasibility check. The `5.x` version makes YouTube serve the classic TV player
+/// answer. It names a Samsung TV (yt-dlp PR #17723's `tv_samsung` entry, not merged yet):
+/// from 2026-10-07 this account got "The page needs to be reloaded." (UNPLAYABLE) for
+/// yt-dlp's `tv_downgraded` entry, which sends the bare `Cobalt/Version` user agent and no
+/// device (yt-dlp issue #17389, open since 2026-08), while the same request naming the TV
+/// gets the Premium formats again (checked live on two songs).
 pub const TV: ClientInfo = ClientInfo {
     name: "TVHTML5",
     version: "5.20260707",
     name_id: 7,
-    user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+    user_agent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1",
     origin: "https://www.youtube.com",
     api_host: "www.youtube.com",
     sends_auth_user: false,
+    device: Some(Device {
+        make: "Samsung",
+        model: "UKS9800",
+        os_name: "Tizen",
+        os_version: "2.4.0",
+    }),
 };
 
 /// The YouTube Music web client, for `next` (the queue) and the browse/search requests of later
@@ -46,6 +68,7 @@ pub const WEB_REMIX: ClientInfo = ClientInfo {
     origin: "https://music.youtube.com",
     api_host: "music.youtube.com",
     sends_auth_user: true,
+    device: None,
 };
 
 /// Every client, so tests can check each one against the host allowlist.
