@@ -14,6 +14,14 @@
 //! The preprocessed player (the player cut down to the two solver functions) is cached in
 //! `players/{id}.js`, so a warm call skips parsing the whole 3 MB player.
 //!
+//! The kept player: `core`'s `preprocessed` mode runs the whole 4 MB preprocessed player
+//! again on every call (`Function("_result", player)(...)` inside `jsc`), which cost 172 ms
+//! per song (measured 2026-10-13, player 5203c085, one performance core). So warm calls skip
+//! `jsc`: `GLUE_JS` runs the preprocessed player once, keeps the two functions it leaves in
+//! `_result`, and answers later calls by calling them (well under a millisecond). Only one
+//! version is kept; a new one replaces it. `prime` loads it ahead of the solve, while the
+//! `player` request is still in flight, so even the first song doesn't wait for it.
+//!
 //! Sandbox: the context has the base objects plus a short list of intrinsics the scripts need
 //! (see `Js::new`) and no module loader, and quickjs-libc's `std`/`os` modules are never added,
 //! so the scripts have no file, network or OS access. Each call gets a 5 s deadline (an
@@ -47,6 +55,40 @@ use crate::error::Error;
 /// list. Bundled so the solver needs nothing at run time and can't be swapped on disk.
 const LIB_JS: &str = include_str!("../../assets/ejs/lib.min.js");
 const CORE_JS: &str = include_str!("../../assets/ejs/core.min.js");
+
+/// Keeps one preprocessed player run, for the warm calls (see the module docs). `load` and the
+/// answer shape mirror `core.min.js` 0.8.0's own `preprocessed` branch: run the player with a
+/// `_result` object, then answer each request with `_result[type]`, errors as `{type:
+/// "error"}`. Recheck both when the `ejs` scripts are updated; `quickjs_matches_deno`
+/// compares these answers with yt-dlp's.
+const GLUE_JS: &str = r#"
+var __ytmfast = (() => {
+    let id = null, fns = null;
+    return {
+        loaded: () => id,
+        load(playerId, player) {
+            id = null; fns = null;
+            const r = { n: null, sig: null };
+            Function("_result", player)(r);
+            id = playerId; fns = r;
+        },
+        answer(requests) {
+            return {
+                type: "result",
+                responses: requests.map(q => {
+                    const f = fns[q.type];
+                    if (!f) return { type: "error", error: `Failed to extract ${q.type} function` };
+                    try {
+                        return { type: "result", data: Object.fromEntries(q.challenges.map(c => [c, f(c)])) };
+                    } catch (e) {
+                        return { type: "error", error: e instanceof Error ? `${e.message}\n${e.stack}` : `${e}` };
+                    }
+                }),
+            };
+        },
+    };
+})();
+"#;
 
 /// The spec's limits for one call: a script that loops or hogs memory is cut, not waited on.
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
@@ -95,6 +137,10 @@ pub trait ChallengeSolver: Send + Sync {
     /// without the player code (which saves reading the 3 MB script).
     fn has_player(&self, player_id: &str) -> bool;
 
+    /// Gets `player_id`'s cached preprocessed player ready ahead of a `solve_batch`, without
+    /// waiting. Does nothing when it isn't cached (a cold solve needs the player code anyway).
+    fn prime(&self, _player_id: &str) {}
+
     /// Solves every request in one `jsc` call. The answers come back in the order of
     /// `requests`. `player_code` is only needed when `has_player` is false; without either the
     /// call fails. Any challenge left unanswered fails the whole call.
@@ -125,6 +171,8 @@ enum Job {
         requests: Vec<(ChallengeKind, Vec<String>)>,
         reply: oneshot::Sender<Result<Vec<Answers>, Error>>,
     },
+    /// Loads a cached preprocessed player (see `ChallengeSolver::prime`).
+    Prime { player_id: String },
     /// Runs any code in the sandbox, for the sandbox tests.
     #[cfg(test)]
     Eval {
@@ -215,6 +263,15 @@ impl ChallengeSolver for Solver {
             .is_some_and(|p| p.is_file())
     }
 
+    fn prime(&self, player_id: &str) {
+        if player_js::valid_player_id(player_id) {
+            // A gone thread is reported by the solve that follows.
+            let _ = self.send(Job::Prime {
+                player_id: player_id.to_owned(),
+            });
+        }
+    }
+
     async fn solve_batch(
         &self,
         player_id: &str,
@@ -260,6 +317,13 @@ impl Worker {
                 }
                 // The caller may have given up (dropped its future); nothing to do then.
                 let _ = reply.send(result);
+            }
+            Job::Prime { player_id } => {
+                // Best effort: if this fails, the solve that follows loads it again and
+                // reports the error.
+                if self.load(&player_id).is_err() {
+                    self.reset();
+                }
             }
             #[cfg(test)]
             Job::Eval { code, reply } => {
@@ -311,45 +375,60 @@ impl Worker {
         player_code: Option<String>,
         requests: &[(ChallengeKind, Vec<String>)],
     ) -> Result<Vec<Answers>, Error> {
-        let dir = self.players_dir.clone();
-        let cached = player_js::load_cached(&dir, player_id, player_js::PREPROCESSED_SUFFIX);
-        if cached.is_some() {
-            crate::trace::mark("preprocessed player from the cache");
+        // Warm: the kept player (primed, or left by an earlier song), or the cached one.
+        if self.load(player_id)? {
+            let answers = self.js()?.answer(requests)?;
+            crate::trace::mark("solver answered from the kept player");
+            return Ok(answers);
         }
-        let input = match (&cached, &player_code) {
-            (Some(pre), _) => Input::Preprocessed(pre),
-            (None, Some(code)) => Input::Player(code),
-            // Internal, not StreamFailed: the caller's slip (or the cache pruned since it
-            // asked `has_player`), which says nothing about this player (see the trait).
-            (None, None) => {
-                return Err(Error::Internal(
-                    "the player script is needed but was not given".into(),
-                ));
-            }
+        // Cold: the whole player through `jsc`, which hands back the preprocessed player.
+        // Internal, not StreamFailed, without the code: the caller's slip (or the cache
+        // pruned since it asked `has_player`), which says nothing about this player (see the
+        // trait).
+        let Some(code) = player_code else {
+            return Err(Error::Internal(
+                "the player script is needed but was not given".into(),
+            ));
         };
-        let cold = matches!(input, Input::Player(_));
+        let js = self.js()?;
+        js.rt.set_memory_limit(COLD_MEMORY_LIMIT);
+        let output = js.call_jsc(Input::Player(&code), requests, COLD_DEADLINE);
+        js.rt.set_memory_limit(MEMORY_LIMIT);
+        let output = output?;
+        if let Some(pre) = &output.preprocessed_player {
+            // A failed write only costs the next call a cold solve; the answer is good.
+            if let Err(e) = player_js::store_cached(
+                &self.players_dir,
+                player_id,
+                player_js::PREPROCESSED_SUFFIX,
+                pre,
+            ) {
+                eprintln!("ytmfast: could not cache the preprocessed player: {e}");
+            }
+        }
+        Ok(output.answers)
+    }
+
+    /// Makes `player_id` the kept player. True when it is kept (already, or loaded now from
+    /// the disk cache); false when it isn't cached, which leaves a cold solve.
+    fn load(&mut self, player_id: &str) -> Result<bool, Error> {
         let built = self.js.is_none();
         let js = self.js()?;
         if built {
             crate::trace::mark("solver runtime built");
         }
-        let output = if cold {
-            js.rt.set_memory_limit(COLD_MEMORY_LIMIT);
-            let output = js.call_jsc(input, requests, COLD_DEADLINE);
-            js.rt.set_memory_limit(MEMORY_LIMIT);
-            output
-        } else {
-            js.call_jsc(input, requests, CALL_DEADLINE)
-        }?;
-        if let (None, Some(pre)) = (&cached, &output.preprocessed_player) {
-            // A failed write only costs the next call a cold solve; the answer is good.
-            if let Err(e) =
-                player_js::store_cached(&dir, player_id, player_js::PREPROCESSED_SUFFIX, pre)
-            {
-                eprintln!("ytmfast: could not cache the preprocessed player: {e}");
-            }
+        if js.loaded()?.as_deref() == Some(player_id) {
+            return Ok(true);
         }
-        Ok(output.answers)
+        let dir = self.players_dir.clone();
+        let Some(pre) = player_js::load_cached(&dir, player_id, player_js::PREPROCESSED_SUFFIX)
+        else {
+            return Ok(false);
+        };
+        crate::trace::mark("preprocessed player from the cache");
+        self.js()?.load(player_id, &pre)?;
+        crate::trace::mark("preprocessed player kept");
+        Ok(true)
     }
 }
 
@@ -361,7 +440,6 @@ impl Drop for Worker {
 
 enum Input<'a> {
     Player(&'a str),
-    Preprocessed(&'a str),
 }
 
 struct JscOutput {
@@ -427,7 +505,12 @@ impl Js {
             ctx.eval::<(), _>("Object.assign(globalThis, lib);")
                 .catch(&ctx)
                 .map_err(|e| caught(&e))?;
-            ctx.eval::<(), _>(core).catch(&ctx).map_err(|e| caught(&e))
+            ctx.eval::<(), _>(core)
+                .catch(&ctx)
+                .map_err(|e| caught(&e))?;
+            ctx.eval::<(), _>(GLUE_JS)
+                .catch(&ctx)
+                .map_err(|e| caught(&e))
         })?;
         Ok(js)
     }
@@ -497,22 +580,46 @@ impl Js {
                         data.set("player", code)?;
                         data.set("output_preprocessed", true)?;
                     }
-                    Input::Preprocessed(pre) => {
-                        data.set("type", "preprocessed")?;
-                        data.set("preprocessed_player", pre)?;
-                    }
                 }
-                let reqs = rquickjs::Array::new(ctx.clone())?;
-                for (i, (kind, challenges)) in requests.iter().enumerate() {
-                    let r = Object::new(ctx.clone())?;
-                    r.set("type", kind.as_str())?;
-                    r.set("challenges", challenges.clone())?;
-                    reqs.set(i, r)?;
-                }
-                data.set("requests", reqs)?;
+                data.set("requests", requests_value(&ctx, requests)?)?;
                 let jsc: Function = ctx.globals().get("jsc")?;
                 let out: Object = jsc.call((data,))?;
                 read_output(&out, requests)
+            };
+            run().catch(&ctx).map_err(|e| caught(&e))?
+        })
+    }
+
+    /// The id of the kept player, if any.
+    fn loaded(&self) -> Result<Option<String>, Error> {
+        self.guarded(CALL_DEADLINE, |ctx| {
+            ctx.eval::<Option<String>, _>("__ytmfast.loaded()")
+                .catch(&ctx)
+                .map_err(|e| caught(&e))
+        })
+    }
+
+    /// Runs the preprocessed player once and keeps its two functions (`GLUE_JS`).
+    fn load(&self, player_id: &str, preprocessed: &str) -> Result<(), Error> {
+        self.guarded(CALL_DEADLINE, |ctx| {
+            let run = || -> rquickjs::Result<()> {
+                let glue: Object = ctx.globals().get("__ytmfast")?;
+                let load: Function = glue.get("load")?;
+                load.call((rquickjs::function::This(glue), player_id, preprocessed))
+            };
+            run().catch(&ctx).map_err(|e| caught(&e))
+        })
+    }
+
+    /// Answers `requests` with the kept player's functions, in `jsc`'s answer shape.
+    fn answer(&self, requests: &[(ChallengeKind, Vec<String>)]) -> Result<Vec<Answers>, Error> {
+        self.guarded(CALL_DEADLINE, |ctx| {
+            let run = || -> rquickjs::Result<Result<Vec<Answers>, Error>> {
+                let reqs = requests_value(&ctx, requests)?;
+                let glue: Object = ctx.globals().get("__ytmfast")?;
+                let answer: Function = glue.get("answer")?;
+                let out: Object = answer.call((rquickjs::function::This(glue), reqs))?;
+                Ok(read_output(&out, requests)?.map(|o| o.answers))
             };
             run().catch(&ctx).map_err(|e| caught(&e))?
         })
@@ -526,6 +633,21 @@ impl Js {
                 .map_err(|e| caught(&e))
         })
     }
+}
+
+/// `requests` as the `jsc` protocol's `[{type, challenges}]`.
+fn requests_value<'js>(
+    ctx: &Ctx<'js>,
+    requests: &[(ChallengeKind, Vec<String>)],
+) -> rquickjs::Result<rquickjs::Array<'js>> {
+    let reqs = rquickjs::Array::new(ctx.clone())?;
+    for (i, (kind, challenges)) in requests.iter().enumerate() {
+        let r = Object::new(ctx.clone())?;
+        r.set("type", kind.as_str())?;
+        r.set("challenges", challenges.clone())?;
+        reqs.set(i, r)?;
+    }
+    Ok(reqs)
 }
 
 /// Reads `jsc`'s answer: `{type: "result", preprocessed_player?, responses: [{type:
@@ -666,7 +788,12 @@ mod tests {
                         [d.type, String(d.output_preprocessed), r.type, c, code, marker].join("|")]))
                 })),
             };
-            if (d.type === "player" && d.output_preprocessed) out.preprocessed_player = "PRE(" + d.player + ")";
+            // A real (tiny) preprocessed player: `GLUE_JS` runs it, so it must set `_result`.
+            // It counts its runs, so a test can tell a kept player from a reloaded one.
+            if (d.type === "player" && d.output_preprocessed) out.preprocessed_player =
+                `globalThis.runs = (globalThis.runs || 0) + 1;
+                 _result.n = c => ["kept", "n", c, "${d.player}", runs].join("|");
+                 _result.sig = c => ["kept", "sig", c, "${d.player}", runs].join("|");`;
             return out;
         };
     "#;
@@ -696,17 +823,25 @@ mod tests {
         assert_eq!(got[1]["s1"], "player|true|sig|s1|CODE|lib-loaded");
         assert!(s.has_player(id));
         let cached = tmp.path().join("players").join(format!("{id}.js"));
-        assert_eq!(std::fs::read_to_string(&cached).unwrap(), "PRE(CODE)");
+        assert!(
+            std::fs::read_to_string(&cached)
+                .unwrap()
+                .contains("_result.n")
+        );
 
-        // Warm: no code needed; the cached preprocessed player is sent instead.
+        // Warm: no code needed; the cached preprocessed player is run once and kept.
         let got = s
             .solve(id, None, ChallengeKind::Sig, &["s2".to_string()])
             .await
             .unwrap();
-        assert_eq!(
-            got["s2"],
-            "preprocessed|undefined|sig|s2|PRE(CODE)|lib-loaded"
-        );
+        assert_eq!(got["s2"], "kept|sig|s2|CODE|1");
+        // Kept: the next call doesn't run it again (still run 1), even with the file gone.
+        std::fs::remove_file(&cached).unwrap();
+        let got = s
+            .solve(id, None, ChallengeKind::N, &["n3".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(got["n3"], "kept|n|n3|CODE|1");
 
         // Cold with no code is an error, not a guess. `internal`: the caller's slip (or the
         // cache pruned between `has_player` and the call), not a sign the scripts fail on
@@ -722,6 +857,75 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn prime_loads_the_cached_player_and_a_new_version_replaces_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Solver::with_scripts(tmp.path().to_path_buf(), ECHO_LIB, ECHO_CORE);
+        for (id, code) in [("0000000a", "A"), ("0000000b", "B")] {
+            s.solve(id, Some(code), ChallengeKind::N, &["c".into()])
+                .await
+                .unwrap();
+        }
+        // Not cached: does nothing, and the solve after it still needs the code.
+        s.prime("0000000c");
+        let e = s
+            .solve("0000000c", None, ChallengeKind::N, &["c".into()])
+            .await;
+        assert_eq!(e.unwrap_err().code(), "internal");
+        // Primed, then answered from the kept player: one run (the counter is global).
+        s.prime("0000000a");
+        let got = s
+            .solve("0000000a", None, ChallengeKind::N, &["x".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["x"], "kept|n|x|A|1");
+        // A different version replaces the kept one, and switching back runs it again.
+        let got = s
+            .solve("0000000b", None, ChallengeKind::N, &["x".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["x"], "kept|n|x|B|2");
+        let got = s
+            .solve("0000000a", None, ChallengeKind::N, &["x".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["x"], "kept|n|x|A|3");
+    }
+
+    #[tokio::test]
+    async fn kept_player_errors_become_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let players = tmp.path().join("players");
+        std::fs::create_dir_all(&players).unwrap();
+        // No sig function, and an n function that throws.
+        std::fs::write(
+            players.join("0000000a.js"),
+            "_result.n = c => { throw new Error('boom ' + c); };",
+        )
+        .unwrap();
+        // A player that doesn't even run.
+        std::fs::write(players.join("0000000b.js"), "this is not javascript").unwrap();
+        let s = Solver::with_scripts(tmp.path().to_path_buf(), ECHO_LIB, ECHO_CORE);
+        let e = s
+            .solve("0000000a", None, ChallengeKind::N, &["one".into()])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("boom one"), "{e}");
+        let e = s
+            .solve("0000000a", None, ChallengeKind::Sig, &["s".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("Failed to extract sig function"),
+            "{e}"
+        );
+        let e = s
+            .solve("0000000b", None, ChallengeKind::N, &["c".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "stream_failed");
     }
 
     #[tokio::test]

@@ -220,6 +220,9 @@ impl Streams {
 
     async fn own(&self, video_id: &str, fresh: bool) -> Result<Stream, Error> {
         let (player_id, sts, mut code) = self.current_player(fresh).await?;
+        // Loads the kept player on the solver thread while the `player` request is in flight,
+        // so the solve below doesn't wait for it (about 170 ms, see `solver`).
+        self.solver.prime(&player_id);
         let answer = self.api.player(video_id, sts).await?;
         trace::mark("player request answered");
         // `StreamFailed`, not `Unavailable`: the TV answer can lack formats that yt-dlp's
@@ -236,9 +239,12 @@ impl Streams {
         if let Some(cipher) = &link.cipher {
             requests.push((ChallengeKind::Sig, vec![cipher.s.clone()]));
         }
-        let mut solved_n = None;
-        let mut solved_sig = None;
-        if !requests.is_empty() {
+        let solve = async {
+            let mut solved_n = None;
+            let mut solved_sig = None;
+            if requests.is_empty() {
+                return Ok((solved_n, solved_sig));
+            }
             if code.is_none() && !self.solver.has_player(&player_id) {
                 code = Some(self.player_code(&player_id).await?);
             }
@@ -271,19 +277,27 @@ impl Streams {
                     ChallengeKind::Sig => solved_sig = value,
                 }
             }
-        }
-        let url = link.assemble(solved_sig.as_deref(), solved_n.as_deref())?;
-        let mut stream = stream_from_answer(format, url, &answer);
-        if stream.meta.title.is_empty() {
-            // The TV answer can come back without the song's details (seen live): ask oEmbed.
-            // Best effort: a song without a title still plays.
+            Ok((solved_n, solved_sig))
+        };
+        // The TV answer can come back without the song's details (seen live): ask oEmbed, at
+        // the same time as the solve rather than after it (about 50 ms saved). Best effort: a
+        // song without a title still plays.
+        let details = async {
+            if !answer.title.is_empty() {
+                return None;
+            }
             let details = self.oembed(video_id).await;
             trace::mark("oEmbed answered");
-            if let Some((title, artist)) = details {
-                stream.meta.title = title;
-                if stream.meta.artist.is_empty() {
-                    stream.meta.artist = artist;
-                }
+            details
+        };
+        let (solved, details) = tokio::join!(solve, details);
+        let (solved_n, solved_sig) = solved?;
+        let url = link.assemble(solved_sig.as_deref(), solved_n.as_deref())?;
+        let mut stream = stream_from_answer(format, url, &answer);
+        if let Some((title, artist)) = details {
+            stream.meta.title = title;
+            if stream.meta.artist.is_empty() {
+                stream.meta.artist = artist;
             }
         }
         Ok(stream)
