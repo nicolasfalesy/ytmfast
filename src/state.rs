@@ -257,7 +257,8 @@ fn fit(saved: &Saved, cap: u64) -> Saved {
 fn order_within(order: &[usize], range: &Range<usize>) -> Vec<usize> {
     order
         .iter()
-        .filter(|p| range.contains(p))
+        // `&&p`: with oxc in the build, `contains(p)` on a `&&usize` no longer infers.
+        .filter(|&&p| range.contains(&p))
         .map(|p| p - range.start)
         .collect()
 }

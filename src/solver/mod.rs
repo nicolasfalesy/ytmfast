@@ -36,6 +36,7 @@
 //! the single JS context needs anyway. The thread ends when the `Solver` is dropped.
 
 pub mod player_js;
+mod prep;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -390,23 +391,50 @@ impl Worker {
                 "the player script is needed but was not given".into(),
             ));
         };
+        // The Rust prep first (`prep`: about 3 s and 190 MB less than `jsc`'s), then the kept
+        // player answers. If either step fails, `jsc` below is the reference and gets a go.
+        match prep::preprocess(&code) {
+            Some(pre) => {
+                crate::trace::mark("player preprocessed");
+                let js = self.js()?;
+                match js.load(player_id, &pre).and_then(|()| js.answer(requests)) {
+                    Ok(answers) => {
+                        crate::trace::mark("solver answered from the kept player");
+                        self.store_preprocessed(player_id, &pre);
+                        return Ok(answers);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ytmfast: the player prep's answer failed ({}); trying yt-dlp's",
+                            e.code()
+                        );
+                        self.reset();
+                    }
+                }
+            }
+            None => eprintln!("ytmfast: the player prep did not know this player; trying yt-dlp's"),
+        }
         let js = self.js()?;
         js.rt.set_memory_limit(COLD_MEMORY_LIMIT);
         let output = js.call_jsc(Input::Player(&code), requests, COLD_DEADLINE);
         js.rt.set_memory_limit(MEMORY_LIMIT);
         let output = output?;
         if let Some(pre) = &output.preprocessed_player {
-            // A failed write only costs the next call a cold solve; the answer is good.
-            if let Err(e) = player_js::store_cached(
-                &self.players_dir,
-                player_id,
-                player_js::PREPROCESSED_SUFFIX,
-                pre,
-            ) {
-                eprintln!("ytmfast: could not cache the preprocessed player: {e}");
-            }
+            self.store_preprocessed(player_id, pre);
         }
         Ok(output.answers)
+    }
+
+    fn store_preprocessed(&self, player_id: &str, pre: &str) {
+        // A failed write only costs the next call a cold solve; the answer is good.
+        if let Err(e) = player_js::store_cached(
+            &self.players_dir,
+            player_id,
+            player_js::PREPROCESSED_SUFFIX,
+            pre,
+        ) {
+            eprintln!("ytmfast: could not cache the preprocessed player: {e}");
+        }
     }
 
     /// Makes `player_id` the kept player. True when it is kept (already, or loaded now from
@@ -981,7 +1009,10 @@ mod tests {
     }
 
     /// The real scripts on a real player give the same answers in QuickJS as in deno (the
-    /// runtime yt-dlp prefers). Needs `deno` and either `YTMFAST_TEST_PLAYER_JS` (a saved
+    /// runtime yt-dlp prefers). The cold solve here goes through the Rust `prep`, so this is
+    /// also the check that `prep` matches `jsc` (on 2026-10-13 it did on six players:
+    /// 21090930, 22cb88bc, 5203c085, 7daa59ad, f2999a12 and the web app's ES6 22cb88bc;
+    /// a "trying yt-dlp's" line in the output means it fell back and proved nothing). Needs `deno` and either `YTMFAST_TEST_PLAYER_JS` (a saved
     /// `base.js`, named `<player id>.base.js`) or the network for an unauthenticated download
     /// of the current player. Prints the cold and warm solve times.
     /// Run: `cargo test --release --lib quickjs_matches_deno -- --ignored --nocapture`

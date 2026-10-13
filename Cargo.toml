@@ -69,6 +69,10 @@ zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 # control socket. signal: a clean stop on SIGTERM/SIGINT.
 tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "process", "time", "net", "io-util", "signal"] }
 url = "2.5"
+oxc_parser = { version = "0.154.0", default-features = false }
+oxc_ast = { version = "0.154.0", default-features = false }
+oxc_allocator = { version = "0.154.0", default-features = false }
+oxc_span = { version = "0.154.0", default-features = false }
 
 [build-dependencies]
 # Finds the system libopus (build.rs); already in the tree through aws-lc-sys.
