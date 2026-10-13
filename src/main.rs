@@ -27,7 +27,7 @@ use ytmfast::solver::Solver;
 use ytmfast::state;
 use ytmfast::streams::lazy::{self, LazySession};
 use ytmfast::streams::ytdlp::{self, YtDlpCommand};
-use ytmfast::streams::{Resolver, Streams, TrackMeta};
+use ytmfast::streams::{PLAYER_REFRESH_EVERY, Resolver, Streams, TrackMeta};
 
 const USAGE: &str = "\
 usage: ytmfast <command>
@@ -480,6 +480,16 @@ fn backend() -> Result<Arc<LazySession>, String> {
             Arc::new(YtDlpCommand::new(runtime_dir.clone())),
             cache.clone(),
         ));
+        // Between songs, keep the player version and the solver ready, so no song waits for
+        // them. Sleeps first: the load that builds this is usually a song's, which looks the
+        // version up itself.
+        let refresh = resolver.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PLAYER_REFRESH_EVERY).await;
+                refresh.refresh_player().await;
+            }
+        });
         // One `Innertube` (so one session) for links, queues, play reports and browsing.
         lazy::Loaded {
             resolver: resolver.clone(),

@@ -109,6 +109,9 @@ const COLD_MEMORY_LIMIT: usize = 256 << 20;
 const JS_STACK: usize = 4 << 20;
 const THREAD_STACK: usize = 16 << 20;
 
+/// A made-up `n` challenge, for checking that a prepared player answers at all.
+const PROBE_N: &str = "ytmfastProbeN0123";
+
 /// The two challenges a stream link can carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChallengeKind {
@@ -142,6 +145,10 @@ pub trait ChallengeSolver: Send + Sync {
     /// waiting. Does nothing when it isn't cached (a cold solve needs the player code anyway).
     fn prime(&self, _player_id: &str) {}
 
+    /// Preprocesses and loads a new player version ahead of its first solve, without waiting
+    /// (the Rust `prep` only: `jsc`'s seconds of CPU are left to a real solve).
+    fn prepare(&self, _player_id: &str, _player_code: String) {}
+
     /// Solves every request in one `jsc` call. The answers come back in the order of
     /// `requests`. `player_code` is only needed when `has_player` is false; without either the
     /// call fails. Any challenge left unanswered fails the whole call.
@@ -174,6 +181,11 @@ enum Job {
     },
     /// Loads a cached preprocessed player (see `ChallengeSolver::prime`).
     Prime { player_id: String },
+    /// Preprocesses a new one (see `ChallengeSolver::prepare`).
+    Prepare {
+        player_id: String,
+        player_code: String,
+    },
     /// Runs any code in the sandbox, for the sandbox tests.
     #[cfg(test)]
     Eval {
@@ -264,6 +276,16 @@ impl ChallengeSolver for Solver {
             .is_some_and(|p| p.is_file())
     }
 
+    fn prepare(&self, player_id: &str, player_code: String) {
+        if player_js::valid_player_id(player_id) {
+            // A gone thread is reported by the solve that follows.
+            let _ = self.send(Job::Prepare {
+                player_id: player_id.to_owned(),
+                player_code,
+            });
+        }
+    }
+
     fn prime(&self, player_id: &str) {
         if player_js::valid_player_id(player_id) {
             // A gone thread is reported by the solve that follows.
@@ -318,6 +340,14 @@ impl Worker {
                 }
                 // The caller may have given up (dropped its future); nothing to do then.
                 let _ = reply.send(result);
+            }
+            Job::Prepare {
+                player_id,
+                player_code,
+            } => {
+                if self.prepare(&player_id, &player_code).is_err() {
+                    self.reset();
+                }
             }
             Job::Prime { player_id } => {
                 // Best effort: if this fails, the solve that follows loads it again and
@@ -423,6 +453,23 @@ impl Worker {
             self.store_preprocessed(player_id, pre);
         }
         Ok(output.answers)
+    }
+
+    /// `Job::Prepare`: the Rust prep, kept and cached only once it answers a probe challenge,
+    /// so a prep that runs but can't solve never reaches the cache (where a song would meet
+    /// it as a failing player instead of falling back to `jsc`).
+    fn prepare(&mut self, player_id: &str, code: &str) -> Result<(), Error> {
+        if self.load(player_id)? {
+            return Ok(());
+        }
+        let Some(pre) = prep::preprocess(code) else {
+            return Ok(());
+        };
+        let js = self.js()?;
+        js.load(player_id, &pre)?;
+        js.answer(&[(ChallengeKind::N, vec![PROBE_N.into()])])?;
+        self.store_preprocessed(player_id, &pre);
+        Ok(())
     }
 
     fn store_preprocessed(&self, player_id: &str, pre: &str) {
@@ -920,6 +967,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["x"], "kept|n|x|A|3");
+    }
+
+    #[tokio::test]
+    async fn prepare_caches_only_a_player_that_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Solver::with_scripts(tmp.path().to_path_buf(), ECHO_LIB, ECHO_CORE);
+        // A tiny player in the two-statement shape whose URL builder reverses `n`.
+        let good = r#"var p = {};
+(function (g) {
+    var window = this;
+    g.U = function (b, sp, sig) { this.q = { s: sig }; };
+    g.U.prototype.set = function (k, v) { this.q[k] = v; };
+    g.U.prototype.get = function (k) { return this.q[k]; };
+    g.U.prototype.go = function () { if (this.q.n) this.q.n = this.q.n.split("").reverse().join(""); };
+    g.mk = function (a, b, c) { var u = new g.U(a, b, c); u.set("alr", "yes"); return u; };
+})(p);"#;
+        s.prepare("0000000a", good.into());
+        let got = s
+            .solve("0000000a", None, ChallengeKind::N, &["abc".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["abc"], "cba");
+        assert!(s.has_player("0000000a"), "cached");
+        // Its builder throws: it runs, but can't answer, so it is not cached.
+        s.prepare(
+            "0000000b",
+            good.replace("u.set(\"alr\"", "throw 1; u.set(\"alr\""),
+        );
+        // Not a shape the prep knows: nothing happens.
+        s.prepare("0000000c", "var x = 1;".into());
+        // A solve waits behind the jobs above, so they are done by now.
+        assert!(
+            s.solve("0000000c", None, ChallengeKind::N, &[])
+                .await
+                .is_err()
+        );
+        assert!(!s.has_player("0000000b"));
+        assert!(!s.has_player("0000000c"));
     }
 
     #[tokio::test]

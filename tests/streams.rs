@@ -91,6 +91,8 @@ struct FakeSolver {
     /// The error a failing call returns (a JS failure, `stream_failed`, if `None`).
     error: Option<Error>,
     calls: Mutex<Vec<SolveCall>>,
+    /// `prime` and `prepare` calls: the player id, and whether the code came with it.
+    readied: Mutex<Vec<(String, bool)>>,
 }
 
 impl FakeSolver {
@@ -124,6 +126,13 @@ impl FakeSolver {
 impl ChallengeSolver for FakeSolver {
     fn has_player(&self, _player_id: &str) -> bool {
         self.cached
+    }
+    fn prime(&self, player_id: &str) {
+        self.readied.lock().unwrap().push((player_id.into(), false));
+    }
+    fn prepare(&self, player_id: &str, player_code: String) {
+        assert_eq!(player_code, PLAYER_JS);
+        self.readied.lock().unwrap().push((player_id.into(), true));
     }
     async fn solve_batch(
         &self,
@@ -470,6 +479,42 @@ async fn sts_reaches_the_player_request() {
         body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"],
         20725
     );
+}
+
+#[tokio::test]
+async fn refresh_readies_the_solver_and_spares_the_next_song_the_lookup() {
+    let expire = now() + 6 * 3600;
+    for cached in [true, false] {
+        let mut solver = FakeSolver::mapping(&[("abc", "def")]);
+        solver.cached = cached;
+        let r = rig(
+            Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+            solver,
+            FakeYtDlp::failing(),
+        )
+        .await;
+        r.streams.refresh_player().await;
+        // A version the solver has is loaded; a new one is prepared with its code.
+        assert_eq!(
+            *r.solver.readied.lock().unwrap(),
+            [(PLAYER.to_string(), !cached)]
+        );
+        r.streams.resolve(VIDEO).await.unwrap();
+        let requests = r.server.received_requests().await.unwrap();
+        let lookups = requests
+            .iter()
+            .filter(|q| q.url.path() == "/iframe_api")
+            .count();
+        assert_eq!(lookups, 1, "the song reused the refreshed version");
+    }
+}
+
+#[tokio::test]
+async fn refresh_failure_is_quiet() {
+    let r = rig(None, FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    r.server.reset().await;
+    r.streams.refresh_player().await;
+    assert!(r.solver.readied.lock().unwrap().is_empty());
 }
 
 /// The music web client's `player` answer (the play reports' links), on the test server.

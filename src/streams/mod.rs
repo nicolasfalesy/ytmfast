@@ -44,6 +44,11 @@ const EXPIRY_MARGIN_SECS: u64 = 30 * 60;
 /// link stops working) always asks again.
 const PLAYER_ID_TTL: Duration = Duration::from_secs(3600);
 
+/// How often the daemon looks the player version up between songs (`refresh_player`). Under
+/// `PLAYER_ID_TTL`, so the remembered version never runs out and no song waits for
+/// `iframe_api` (125-150 ms, measured 2026-10-13). One small request an hour.
+pub const PLAYER_REFRESH_EVERY: Duration = Duration::from_secs(50 * 60);
+
 /// How long a player version the solver failed on is skipped (straight to yt-dlp) before the
 /// own-code path tries it again. The frozen solver scripts may simply not handle a newer
 /// player, and each try costs a cold solve (seconds of CPU and a ~190 MiB spike); but the
@@ -215,6 +220,20 @@ impl Streams {
                 eprintln!("ytmfast: yt-dlp failed too ({})", e.code());
                 Err(own)
             }
+        }
+    }
+
+    /// Looks the current player version up ahead of the next song, and gets the solver ready
+    /// for it: a version it has seen is loaded (`prime`), a new one is preprocessed now
+    /// (`prepare`) instead of on the next song. Best effort: a failure here is left for the
+    /// next song to meet and report.
+    pub async fn refresh_player(&self) {
+        let Ok((id, _, code)) = self.current_player(true).await else {
+            return;
+        };
+        match code {
+            Some(code) if !self.solver.has_player(&id) => self.solver.prepare(&id, code),
+            _ => self.solver.prime(&id),
         }
     }
 
