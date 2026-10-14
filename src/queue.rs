@@ -261,6 +261,13 @@ impl Queue {
         self.current.and_then(|c| self.items.get(c))
     }
 
+    /// The current item's song, to fill in details learned after it was queued.
+    pub fn current_song_mut(&mut self) -> Option<&mut SongItem> {
+        self.current
+            .and_then(|c| self.items.get_mut(c))
+            .map(|i| &mut i.song)
+    }
+
     /// The current item's index in `items()`.
     pub fn current_index(&self) -> Option<usize> {
         self.current

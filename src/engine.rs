@@ -1873,6 +1873,35 @@ impl Engine {
         {
             self.status.meta = song_meta(&item.song, self.resolved_meta.as_ref());
         }
+        self.fill_bare_current();
+    }
+
+    /// Gives a bare current item (`bare_song`: a song played by id whose list didn't hold it)
+    /// its link's details, so the Queue tab shows the song playing, not an empty row
+    /// (2026-10-13: "Stick Season" played with shuffle on, its queue row had no title, artist
+    /// or cover while the now-playing line had all three).
+    fn fill_bare_current(&mut self) {
+        let Some(meta) = self.resolved_meta.clone().filter(|m| !m.title.is_empty()) else {
+            return;
+        };
+        let playing = self.status.video_id.clone();
+        let Some(song) = self.queue.current_song_mut() else {
+            return;
+        };
+        if !song.title.is_empty() || playing.as_deref() != Some(song.video_id.as_str()) {
+            return;
+        }
+        song.title = meta.title;
+        if song.artists.is_empty() && !meta.artist.is_empty() {
+            song.artists = vec![meta.artist];
+        }
+        if song.thumbnail.is_none() {
+            song.thumbnail = meta.thumbnail;
+        }
+        if song.length_seconds == 0 {
+            song.length_seconds = meta.length_seconds;
+        }
+        self.emit_queue();
     }
 
     fn pause(&mut self) {
@@ -5726,6 +5755,51 @@ mod tests {
             order(engine),
             [vid('A'), vid('X'), vid('B'), vid('C'), vid('Z')]
         );
+    }
+
+    #[tokio::test]
+    async fn a_seed_missing_from_its_list_gets_its_links_details_in_the_queue() {
+        // Both orders: the link before the list lands, and after.
+        for link_first in [true, false] {
+            let server = server().await;
+            let fake = Arc::new(Fake {
+                base: server.base.clone(),
+                delays: HashMap::new(),
+                failures: HashMap::new(),
+                calls: Mutex::new(Vec::new()),
+            });
+            let mut built = engine_for(&server, fake.clone(), Arc::default(), true, false);
+            let engine = &mut built.engine;
+            engine.handle(EngineCmd::Play {
+                video_id: Some(vid('A')),
+                playlist_id: Some("PLlist".into()),
+                index: None,
+                params: None,
+                start_seconds: 0.0,
+            });
+            let resolve = |engine: &mut Engine| {
+                let stream = fake.stream(&vid('A'));
+                engine.on_resolved(Resolved {
+                    generation: engine.generation,
+                    result: Ok(stream),
+                });
+            };
+            if link_first {
+                resolve(engine);
+            }
+            // The list doesn't hold the song playing, so it goes first as a bare id.
+            engine.on_load(Ok(page("BCD", None)));
+            if !link_first {
+                resolve(engine);
+            }
+            let want = meta(&vid('A'));
+            let song = &engine.queue.current().unwrap().song;
+            assert_eq!(song.video_id, vid('A'));
+            assert_eq!(song.title, want.title, "link first: {link_first}");
+            assert_eq!(song.artists, vec![want.artist.clone()]);
+            assert_eq!(song.thumbnail, want.thumbnail);
+            assert_eq!(song.length_seconds, want.length_seconds);
+        }
     }
 
     #[tokio::test]
