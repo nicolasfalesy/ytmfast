@@ -67,6 +67,7 @@ mod tests {
         let session = Session {
             cookies: vec![yt("SAPISID", "abc")],
             account: None,
+            browser_stamp: None,
         };
         let expected = format!(
             "SAPISIDHASH 1700000000_{}",
@@ -87,6 +88,7 @@ mod tests {
                 yt("__Secure-1PAPISID", "one"),
             ],
             account: None,
+            browser_stamp: None,
         };
         let ts = 1_700_000_000;
         let part = |sid: &str| format!("{ts}_{}", sha1_hex(&format!("{ts} {sid} {ORIGIN}")));
@@ -106,6 +108,7 @@ mod tests {
         let session = Session {
             cookies: vec![yt("__Secure-3PAPISID", "three")],
             account: None,
+            browser_stamp: None,
         };
         let ts = 1_700_000_000;
         let part = format!("{ts}_{}", sha1_hex(&format!("{ts} three {ORIGIN}")));
@@ -123,6 +126,7 @@ mod tests {
         let session = Session {
             cookies: vec![g],
             account: None,
+            browser_stamp: None,
         };
         assert_eq!(authorization(&session, ORIGIN, 1), None);
         assert_eq!(authorization(&Session::default(), ORIGIN, 1), None);
@@ -136,6 +140,7 @@ mod tests {
         let session = Session {
             cookies: vec![c],
             account: None,
+            browser_stamp: None,
         };
         assert_eq!(authorization(&session, ORIGIN, 1_000), None);
     }

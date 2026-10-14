@@ -131,6 +131,12 @@ pub struct Session {
     /// kept, or when the check found no channel: such a session is never renewed on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// The browser's sign-in stamp (`chromium::brave_sign_in_stamp`) when these cookies were
+    /// copied from it. The engine takes a new copy once the browser's stamp moves past this, so
+    /// it never waits for YouTube to sign the old copy out. `None` for a session saved before it
+    /// was kept: the first check then takes a copy once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_stamp: Option<i64>,
 }
 
 impl Session {
@@ -634,6 +640,7 @@ mod tests {
         let session = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "s3cr3t-value", "/", true)],
             account: None,
+            browser_stamp: None,
         };
         let shown = format!("{session:?}");
         assert!(!shown.contains("s3cr3t-value"), "{shown}");
@@ -659,6 +666,7 @@ mod tests {
                 later,
             ],
             account: None,
+            browser_stamp: None,
         };
         let h = session.cookie_header_at(&url("https://music.youtube.com/youtubei/v1/player"), NOW);
         // Longer paths first (RFC 6265 5.4), then stored order.
@@ -676,6 +684,7 @@ mod tests {
         let mut session = Session {
             cookies: vec![cookie(".youtube.com", "__Secure-3PSIDTS", "old", "/", true)],
             account: None,
+            browser_stamp: None,
         };
         let u = url("https://music.youtube.com/youtubei/v1/player");
         let h = "__Secure-3PSIDTS=new; Domain=.youtube.com; Path=/; \
@@ -751,6 +760,7 @@ mod tests {
                 cookie(".youtube.com", "KEPT", "y", "/", true),
             ],
             account: None,
+            browser_stamp: None,
         };
         let u = url("https://www.youtube.com/");
         assert!(session.apply_set_cookie_at(
@@ -803,6 +813,7 @@ mod tests {
         let s = Session {
             cookies: vec![c],
             account: None,
+            browser_stamp: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), s);
@@ -814,6 +825,7 @@ mod tests {
         let s = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "v", "/", true)],
             account: None,
+            browser_stamp: None,
         };
         store.save(&s).await.unwrap();
         assert_eq!(store.load().await.unwrap(), s);
@@ -829,6 +841,7 @@ mod tests {
         let s = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID", "v", "/", true)],
             account: None,
+            browser_stamp: None,
         };
         store.save_without_prompt(&s).await.unwrap();
         assert_eq!(store.load().await.unwrap(), s);

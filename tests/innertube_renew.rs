@@ -35,6 +35,7 @@ fn session(sapisid: &str) -> Session {
     Session {
         cookies: vec![cookie(".youtube.com", true), cookie("127.0.0.1", false)],
         account: Some(ACCOUNT.into()),
+        browser_stamp: None,
     }
 }
 
@@ -45,6 +46,8 @@ struct Hook {
     delay: Duration,
     /// The session each call was given.
     seen: Mutex<Vec<Session>>,
+    /// What `stamp` answers: the browser's sign-in stamp.
+    stamp: Mutex<Option<i64>>,
 }
 
 impl Hook {
@@ -54,6 +57,7 @@ impl Hook {
             works,
             delay,
             seen: Mutex::new(Vec::new()),
+            stamp: Mutex::new(None),
         })
     }
 
@@ -73,6 +77,10 @@ impl Renew for Hook {
         } else {
             Err("the browser is signed out".into())
         }
+    }
+
+    fn stamp(&self) -> Option<i64> {
+        *self.stamp.lock().unwrap()
     }
 }
 
@@ -177,4 +185,54 @@ async fn requests_signed_out_together_renew_once() {
     let (a, b) = tokio::join!(home(&rig), home(&rig));
     assert_eq!((a, b), (Ok(()), Ok(())));
     assert_eq!(hook.calls(), 1);
+}
+
+#[tokio::test]
+async fn following_takes_the_browsers_new_sign_in_once_per_change() {
+    let hook = Hook::new(true, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    // No stamp (no browser to follow): nothing is read or taken.
+    assert!(!rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 0);
+    *hook.stamp.lock().unwrap() = Some(100);
+    assert!(rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 1);
+    let now = rig.session.lock().unwrap().clone();
+    assert_eq!(now.cookies, session("new").cookies);
+    assert_eq!(now.browser_stamp, Some(100));
+    // The same stamp again: the copy is already the newest.
+    assert!(!rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 1);
+    // Brave rotated again: one more copy.
+    *hook.stamp.lock().unwrap() = Some(200);
+    assert!(rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 2);
+    // The request after it goes out with the new session, never signed out first.
+    assert_eq!(home(&rig).await, Ok(()));
+    assert_eq!(hook.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_follow_is_tried_again_only_after_the_next_change() {
+    let hook = Hook::new(false, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    *hook.stamp.lock().unwrap() = Some(100);
+    assert!(!rig.api.follow_browser().await);
+    assert!(!rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(*rig.session.lock().unwrap(), session("old"));
+    *hook.stamp.lock().unwrap() = Some(200);
+    assert!(!rig.api.follow_browser().await);
+    assert_eq!(hook.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_follow_does_not_hold_back_a_sign_out_renewal() {
+    let hook = Hook::new(false, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    *hook.stamp.lock().unwrap() = Some(100);
+    assert!(!rig.api.follow_browser().await);
+    // A sign-out right after still gets its own try (it fails here too, as the hook does).
+    assert_eq!(home(&rig).await, Err(Error::SignedOut));
+    assert_eq!(hook.calls(), 2);
 }

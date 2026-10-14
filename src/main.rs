@@ -322,6 +322,19 @@ async fn check_account(session: Session) -> Result<(Session, Account), Error> {
 /// person decides.
 struct BraveRenew {
     profile: PathBuf,
+    /// The cookie file's size and change time at the last `stamp`, with the stamp read then:
+    /// Brave rewrites the file every half minute or so while browsing, but the size and time
+    /// alone show when it didn't, and that check costs one `stat`.
+    last_look: Mutex<Option<(u64, std::time::SystemTime, Option<i64>)>>,
+}
+
+impl BraveRenew {
+    fn new(profile: PathBuf) -> Self {
+        BraveRenew {
+            profile,
+            last_look: Mutex::new(None),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -330,6 +343,8 @@ impl Renew for BraveRenew {
         let Some(want) = current.account.clone() else {
             return Err("the session has no account kept; import it once by hand".into());
         };
+        // Read before the cookies, so a rotation between the two is seen as newer next time.
+        let stamp = chromium::brave_sign_in_stamp(&self.profile).ok().flatten();
         // On a thread of its own, not `spawn_blocking`: the cookie key lookup starts a
         // runtime of its own, which can't be done on a thread inside this one.
         let profile = self.profile.clone();
@@ -354,7 +369,24 @@ impl Renew for BraveRenew {
             Error::SignedOut => BRAVE_NOT_SIGNED_IN.to_string(),
             _ => CHECK_FAILED.to_string(),
         })?;
-        same_account(session, &account, &want)
+        let mut session = same_account(session, &account, &want)?;
+        session.browser_stamp = stamp;
+        Ok(session)
+    }
+
+    fn stamp(&self) -> Option<i64> {
+        let db = chromium::find_database(&self.profile)?;
+        let meta = std::fs::metadata(&db).ok()?;
+        let key = (meta.len(), meta.modified().ok()?);
+        let mut last = self.last_look.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((len, time, stamp)) = *last
+            && (len, time) == key
+        {
+            return stamp;
+        }
+        let stamp = chromium::brave_sign_in_stamp(&self.profile).ok().flatten();
+        *last = Some((key.0, key.1, stamp));
+        stamp
     }
 }
 
@@ -470,7 +502,7 @@ fn backend() -> Result<Arc<LazySession>, String> {
         let session = Arc::new(Mutex::new(session));
         let mut api = Innertube::production(session.clone(), api_store.clone());
         if let Some(profile) = brave_profile.clone() {
-            api = api.with_renew(Arc::new(BraveRenew { profile }), innertube::RENEW_EVERY);
+            api = api.with_renew(Arc::new(BraveRenew::new(profile)), innertube::RENEW_EVERY);
         }
         let api = Arc::new(api);
         let resolver = Arc::new(Streams::new(
@@ -488,6 +520,14 @@ fn backend() -> Result<Arc<LazySession>, String> {
             loop {
                 tokio::time::sleep(PLAYER_REFRESH_EVERY).await;
                 refresh.refresh_player().await;
+            }
+        });
+        // Follows Brave's sign-in cookie rotations, so YouTube never signs out an old copy.
+        let follow = api.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(innertube::FOLLOW_EVERY).await;
+                follow.follow_browser().await;
             }
         });
         // One `Innertube` (so one session) for links, queues, play reports and browsing.
@@ -916,17 +956,20 @@ mod tests {
                 cookie(".youtube.com", "YSC"),
             ],
             account: None,
+            browser_stamp: None,
         };
         assert!(!has_sign_in(&visitor));
         // A SAPISID for another domain doesn't sign youtube.com requests.
         let google_only = Session {
             cookies: vec![cookie(".google.com", "SAPISID")],
             account: None,
+            browser_stamp: None,
         };
         assert!(!has_sign_in(&google_only));
         let signed_in = Session {
             cookies: vec![cookie(".youtube.com", "SAPISID")],
             account: None,
+            browser_stamp: None,
         };
         assert!(has_sign_in(&signed_in));
     }

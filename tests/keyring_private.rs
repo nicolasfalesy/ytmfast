@@ -45,6 +45,7 @@ fn session(value: &str) -> Session {
             expires_utc: Some(1_900_000_000),
         }],
         account: None,
+        browser_stamp: None,
     }
 }
 

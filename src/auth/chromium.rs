@@ -88,6 +88,53 @@ pub fn import_brave_origin(profile: &Path, keys: &dyn KeySource) -> Result<Sessi
     read_session(&db_path, Keys::new(Some(keys)))
 }
 
+/// The Brave Origin cookies whose change means the browser holds a newer sign-in than the
+/// engine: the session cookies themselves, and the `PSIDTS` timestamps Google rotates on them.
+/// Not the `SIDCC` family, which Google rewrites on almost every answer.
+const SIGN_IN_NAMES: &[&str] = &[
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+];
+
+/// When Brave Origin last wrote one of its YouTube or Google sign-in cookies (`SIGN_IN_NAMES`):
+/// the newest `last_update_utc`, Chromium's microseconds since 1601. `None` when the profile
+/// holds none, or its schema has no `last_update_utc` (Chromium before 2022).
+///
+/// Reads no value and needs no key, so it never touches the keyring: the engine calls it once a
+/// minute to see whether Brave refreshed the sign-in (2026-10-13: Brave rewrote `PSIDTS` at
+/// 17:51 and 18:20 while the engine's copy aged, and YouTube then signed the engine out at the
+/// next boot).
+pub fn brave_sign_in_stamp(profile: &Path) -> Result<Option<i64>, Error> {
+    let db_path = find_database(profile).ok_or_else(|| Error::Internal(NO_BRAVE_PROFILE.into()))?;
+    sign_in_stamp(&open_copy(&db_path)?)
+}
+
+fn sign_in_stamp(db: &Connection) -> Result<Option<i64>, Error> {
+    let hosts = KEPT_HOSTS
+        .iter()
+        .map(|h| format!("'{h}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let names = SIGN_IN_NAMES
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT max(last_update_utc) FROM cookies WHERE host_key IN ({hosts}) AND name IN ({names})"
+    );
+    match db.query_row(&sql, [], |r| r.get::<_, Option<i64>>(0)) {
+        Ok(stamp) => Ok(stamp),
+        // Matched on the text: rusqlite reports it as a different variant depending on its
+        // build features (`SqliteFailure`, or `SqlInputError` with modern_sqlite).
+        Err(e) if e.to_string().contains("no such column") => Ok(None),
+        Err(e) => Err(unreadable(e)),
+    }
+}
+
 /// `import` with the `/proc` root injectable, so tests don't depend on what runs on the box.
 fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
     if pear_desktop_running(proc_root, profile) {
@@ -102,7 +149,7 @@ fn import_with(profile: &Path, proc_root: &Path) -> Result<Session, Error> {
 }
 
 /// The profile's cookie database, wherever this Chromium keeps it.
-fn find_database(profile: &Path) -> Option<std::path::PathBuf> {
+pub fn find_database(profile: &Path) -> Option<std::path::PathBuf> {
     DB_CANDIDATES
         .iter()
         .map(|c| profile.join(c))
@@ -153,6 +200,7 @@ fn read_session(db_path: &Path, mut keys: Keys) -> Result<Session, Error> {
     Ok(Session {
         cookies,
         account: None,
+        browser_stamp: None,
     })
 }
 
@@ -847,5 +895,32 @@ mod tests {
         // Non-process entries in /proc are skipped.
         std::fs::write(procs.join("uptime"), "1 2").unwrap();
         assert!(import_with(&p, &procs).is_ok());
+    }
+
+    #[test]
+    fn sign_in_stamp_is_the_newest_sign_in_cookie_write() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL,
+               last_update_utc INTEGER NOT NULL);
+             INSERT INTO cookies VALUES ('.youtube.com', '__Secure-1PSIDTS', 300);
+             INSERT INTO cookies VALUES ('.google.com', 'SAPISID', 200);
+             -- Rewritten on almost every answer, or another site's: never a sign-in change.
+             INSERT INTO cookies VALUES ('.youtube.com', '__Secure-1PSIDCC', 900);
+             INSERT INTO cookies VALUES ('.example.com', '__Secure-1PSIDTS', 999);",
+        )
+        .unwrap();
+        assert_eq!(sign_in_stamp(&db).unwrap(), Some(300));
+        db.execute_batch("DELETE FROM cookies WHERE last_update_utc < 900")
+            .unwrap();
+        assert_eq!(sign_in_stamp(&db).unwrap(), None);
+    }
+
+    #[test]
+    fn sign_in_stamp_without_the_column_is_none() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL);")
+            .unwrap();
+        assert_eq!(sign_in_stamp(&db).unwrap(), None);
     }
 }

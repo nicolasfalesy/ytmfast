@@ -51,6 +51,11 @@ enum Target {
 /// shows its Sign in again screen, whose button imports by hand at any time.
 pub const RENEW_EVERY: Duration = Duration::from_secs(10 * 60);
 
+/// How often the engine checks whether the browser refreshed its sign-in (`follow_browser`).
+/// A check is one file read with no value and no key in it (`Renew::stamp`); a new copy is taken
+/// only when the browser's sign-in cookies moved, a few times a day.
+pub const FOLLOW_EVERY: Duration = Duration::from_secs(60);
+
 /// How long one renewal may take: the browser's cookie key comes from the keyring, which can
 /// hold a lookup behind an unlock prompt with no timeout of its own.
 const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,6 +71,13 @@ pub trait Renew: Send + Sync {
     /// A session for the same account as `current` (`Session::account`), checked to sign it
     /// in; or why there is none, as fixed text for the log (never a cookie or a name).
     async fn renew(&self, current: &Session) -> Result<Session, String>;
+
+    /// The browser's sign-in stamp now (`Session::browser_stamp`), or `None` when it can't tell.
+    /// It blocks (it reads a file), so `follow_browser` calls it off the runtime. A hook with no
+    /// browser to follow leaves the default.
+    fn stamp(&self) -> Option<i64> {
+        None
+    }
 }
 
 struct Renewal {
@@ -78,6 +90,9 @@ struct Renewal {
     /// time the request came back signed out, another request already renewed the session,
     /// and this one is sent again with it instead of trying too.
     renewed: AtomicU64,
+    /// The browser stamp `follow_browser` last tried and failed to take, so a browser signed in
+    /// to another account is asked once per change, not once a minute.
+    failed_stamp: Mutex<Option<i64>>,
 }
 
 pub struct Innertube {
@@ -131,6 +146,7 @@ impl Innertube {
             every,
             last_try: tokio::sync::Mutex::new(None),
             renewed: AtomicU64::new(0),
+            failed_stamp: Mutex::new(None),
         });
         self
     }
@@ -297,11 +313,7 @@ impl Innertube {
             .clone();
         match tokio::time::timeout(RENEW_TIMEOUT, r.hook.renew(&current)).await {
             Ok(Ok(session)) => {
-                *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
-                r.renewed.fetch_add(1, Ordering::Release);
-                // In the background, as a cookie rotation is: the keyring keeps the new
-                // session for the next start, and this request doesn't wait on the save.
-                self.save_in_background();
+                self.adopt(r, session);
                 eprintln!(
                     "ytmfast: YouTube signed the session out; signed in again from the browser"
                 );
@@ -320,6 +332,56 @@ impl Innertube {
                 false
             }
         }
+    }
+
+    /// Takes a new session from the browser once its sign-in stamp (`Renew::stamp`) moved past
+    /// the one this session was copied at, so the engine follows the browser's cookie rotations
+    /// instead of waiting for YouTube to sign the old copy out (which it did at most boots up
+    /// to 2026-10-13). Same account only, as a renewal. True when it took one.
+    pub async fn follow_browser(&self) -> bool {
+        let Some(r) = &self.renewal else {
+            return false;
+        };
+        let hook = r.hook.clone();
+        let Ok(Some(stamp)) = tokio::task::spawn_blocking(move || hook.stamp()).await else {
+            return false;
+        };
+        let current = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let failed = *r.failed_stamp.lock().unwrap_or_else(|e| e.into_inner());
+        if current.browser_stamp.is_some_and(|s| s >= stamp) || failed == Some(stamp) {
+            return false;
+        }
+        // Held, so a sign-out renewal at the same moment waits for this one and then sees it
+        // (`renewed` moved) instead of making a second. `last_try` itself is left alone: a
+        // follow is no failed renewal, and must not hold one back for `every`.
+        let _one_at_a_time = r.last_try.lock().await;
+        let why = match tokio::time::timeout(RENEW_TIMEOUT, r.hook.renew(&current)).await {
+            Ok(Ok(mut session)) => {
+                // Kept even when the hook didn't set it, so the same stamp is never taken twice.
+                session.browser_stamp = Some(session.browser_stamp.unwrap_or(stamp));
+                self.adopt(r, session);
+                eprintln!("ytmfast: the browser refreshed its sign-in; took the new copy");
+                return true;
+            }
+            Ok(Err(why)) => why,
+            Err(_) => "it took too long".to_owned(),
+        };
+        *r.failed_stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+        eprintln!("ytmfast: the browser refreshed its sign-in; could not take it: {why}");
+        false
+    }
+
+    /// Puts a renewed `session` in use for every request sharing it.
+    fn adopt(&self, r: &Renewal, session: Session) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+        r.renewed.fetch_add(1, Ordering::Release);
+        // In the background, as a cookie rotation is: the keyring keeps the new session for the
+        // next start, and the request that renewed doesn't wait on the save.
+        self.save_in_background();
     }
 
     /// One `post_with` request, without renewing.

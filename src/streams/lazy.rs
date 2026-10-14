@@ -233,6 +233,7 @@ mod tests {
                 expires_utc: None,
             }],
             account: None,
+            browser_stamp: None,
         }
     }
 

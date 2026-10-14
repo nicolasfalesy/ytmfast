@@ -55,6 +55,7 @@ fn session() -> Session {
             cookie("127.0.0.1", "SAPISID", "fake-sapisid", false),
         ],
         account: None,
+        browser_stamp: None,
     }
 }
 

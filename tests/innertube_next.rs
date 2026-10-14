@@ -46,6 +46,7 @@ fn session() -> Session {
             cookie("127.0.0.1", "ROTATE", "old", false),
         ],
         account: None,
+        browser_stamp: None,
     }
 }
 
