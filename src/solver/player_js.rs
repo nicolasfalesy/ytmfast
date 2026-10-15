@@ -159,6 +159,18 @@ pub fn load_cached(dir: &Path, id: &str, suffix: &str) -> Option<String> {
     if text.len() > MAX_PLAYER_SCRIPT {
         return None;
     }
+    // Not a player we could have stored whole: the prepared player is never empty, and a
+    // downloaded script always has its signature timestamp (`fetch_player`'s caller needs it
+    // too). Read as absent, the file is made again instead of failing every song until
+    // YouTube moves on to another version.
+    let whole = match suffix {
+        PREPROCESSED_SUFFIX => !text.is_empty(),
+        BASE_SUFFIX => sts(&text).is_some(),
+        _ => true,
+    };
+    if !whole {
+        return None;
+    }
     // Best effort: a failed touch only makes the pruning order a little less exact.
     if let Ok(f) = fs::File::options().write(true).open(&path) {
         let _ = f.set_modified(SystemTime::now());
@@ -181,17 +193,36 @@ pub fn remove_cached(dir: &Path, id: &str, suffix: &str) {
 
 /// Writes a cache file (whole or not at all: written to a temp name, then renamed, so a
 /// crash can't leave a cut-off script that would later fail to solve), then prunes the folder
-/// to the newest `KEEP_PLAYERS` versions.
+/// to the newest `KEEP_PLAYERS` versions. The folder is private (0700) and the files 0600,
+/// like the rest of the engine's files, whatever the umask. The data is on disk before the
+/// rename and the folder entry is on disk after it, so a power cut leaves the old file or the
+/// whole new one, never a renamed empty or half-written one (which `load_cached` would also
+/// refuse, but only after every song had failed on it).
 pub fn store_cached(dir: &Path, id: &str, suffix: &str, text: &str) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
     let path = cache_path(dir, id, suffix)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a player id"))?;
-    fs::create_dir_all(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // A folder an older version made with the umask's 0755 is tightened here.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     // The pid keeps two ytmfast processes (the daemon and a `play`) from sharing a temp file.
     let tmp = dir.join(format!("{id}.{suffix}.tmp{}", std::process::id()));
     let result = (|| {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(text.as_bytes())?;
-        fs::rename(&tmp, &path)
+        f.sync_data()?;
+        fs::rename(&tmp, &path)?;
+        // The rename itself lives in the folder.
+        fs::File::open(dir)?.sync_all()
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -300,10 +331,10 @@ mod tests {
     fn store_then_load() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("players");
-        store_cached(&dir, "0000000a", BASE_SUFFIX, "code").unwrap();
+        store_cached(&dir, "0000000a", BASE_SUFFIX, "{signatureTimestamp:20725}").unwrap();
         assert_eq!(
             load_cached(&dir, "0000000a", BASE_SUFFIX).as_deref(),
-            Some("code")
+            Some("{signatureTimestamp:20725}")
         );
         assert_eq!(load_cached(&dir, "0000000b", BASE_SUFFIX), None);
         // No temp file is left behind.
@@ -342,20 +373,58 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_folder_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ytmfast").join("players");
+        store_cached(&dir, "0000000a", BASE_SUFFIX, "signatureTimestamp:20725").unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("0000000a.base.js")), 0o600);
+        // A folder an older version made (0755) is tightened by the next write.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        store_cached(&dir, "0000000b", PREPROCESSED_SUFFIX, "x").unwrap();
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn damaged_cache_files_are_not_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A cut-off write (nothing in the file) and a download cut before the signature
+        // timestamp: neither is a player, and both would fail every song until YouTube moved on.
+        fs::write(dir.join("0000000a.js"), "").unwrap();
+        fs::write(dir.join("0000000b.base.js"), "var cfg={};").unwrap();
+        fs::write(
+            dir.join("0000000c.base.js"),
+            "var cfg={signatureTimestamp:20725};",
+        )
+        .unwrap();
+        fs::write(dir.join("0000000d.js"), "function(){}").unwrap();
+        assert_eq!(load_cached(dir, "0000000a", PREPROCESSED_SUFFIX), None);
+        assert_eq!(load_cached(dir, "0000000b", BASE_SUFFIX), None);
+        assert!(load_cached(dir, "0000000c", BASE_SUFFIX).is_some());
+        assert!(load_cached(dir, "0000000d", PREPROCESSED_SUFFIX).is_some());
+    }
+
+    #[test]
     fn a_cached_script_over_the_cap_is_not_read() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
-            tmp.path().join("0000000a.base.js"),
-            vec![b' '; MAX_PLAYER_SCRIPT + 1],
+            tmp.path().join("0000000a.js"),
+            vec![b'x'; MAX_PLAYER_SCRIPT + 1],
         )
         .unwrap();
         fs::write(
-            tmp.path().join("0000000b.base.js"),
-            vec![b' '; MAX_PLAYER_SCRIPT],
+            tmp.path().join("0000000b.js"),
+            vec![b'x'; MAX_PLAYER_SCRIPT],
         )
         .unwrap();
-        assert_eq!(load_cached(tmp.path(), "0000000a", BASE_SUFFIX), None);
-        assert!(load_cached(tmp.path(), "0000000b", BASE_SUFFIX).is_some());
+        assert_eq!(
+            load_cached(tmp.path(), "0000000a", PREPROCESSED_SUFFIX),
+            None
+        );
+        assert!(load_cached(tmp.path(), "0000000b", PREPROCESSED_SUFFIX).is_some());
     }
 
     #[tokio::test]
@@ -365,7 +434,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(any())
             .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_PLAYER_SCRIPT + 1]),
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_PLAYER_SCRIPT + 1]),
             )
             .mount(&server)
             .await;

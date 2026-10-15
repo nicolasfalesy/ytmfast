@@ -936,6 +936,36 @@ async fn failed_player_goes_straight_to_ytdlp() {
 }
 
 #[tokio::test]
+async fn a_solver_failure_drops_the_players_cached_files() {
+    // A cached player that fails to solve may simply be damaged (a cut-off write). Left in
+    // place it would fail the same way, and be read again, on every retry until YouTube moved
+    // on; deleted, the retry after the failure window downloads and prepares it afresh.
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "&n=abc")))),
+        solver_failing_on(&[PLAYER]),
+        FakeYtDlp::answering(fallback_answer(expire)),
+    )
+    .await;
+    let players = r.cache.path().join("players");
+    std::fs::create_dir_all(&players).unwrap();
+    let prepared = players.join(format!("{PLAYER}.js"));
+    let script = players.join(format!("{PLAYER}.base.js"));
+    std::fs::write(&prepared, "half a player").unwrap();
+    std::fs::write(&script, PLAYER_JS).unwrap();
+    assert_eq!(r.streams.resolve_fresh(VIDEO).await.unwrap().itag, 251);
+    assert!(
+        !prepared.exists(),
+        "the prepared player stays after a failure"
+    );
+    assert!(
+        !script.exists(),
+        "the downloaded script stays after a failure"
+    );
+    assert!(players.join(format!("{PLAYER}.failed")).exists());
+}
+
+#[tokio::test]
 async fn our_own_faults_do_not_mark_the_player() {
     // A stopped solver thread, or a player script pruned between `has_player` and the call,
     // says nothing about whether the scripts can solve this player: the next song tries the

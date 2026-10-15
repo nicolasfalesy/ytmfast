@@ -284,6 +284,19 @@ impl Streams {
                     // script pruned mid-call) say nothing about the player, and marking it
                     // would send every song to yt-dlp for no reason.
                     if matches!(e, Error::StreamFailed(_)) {
+                        // The cached files may be the damage (a cut-off write): left in
+                        // place they would fail the same way when the mark expires. Gone,
+                        // the retry downloads and prepares this version again.
+                        player_js::remove_cached(
+                            &self.players_dir,
+                            &player_id,
+                            player_js::PREPROCESSED_SUFFIX,
+                        );
+                        player_js::remove_cached(
+                            &self.players_dir,
+                            &player_id,
+                            player_js::BASE_SUFFIX,
+                        );
                         self.mark_player_failed(&player_id);
                     }
                     return Err(e);
