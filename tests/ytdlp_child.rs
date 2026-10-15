@@ -1,0 +1,125 @@
+//! How the yt-dlp fallback process is started. The "program" is always `/bin/sh` running a
+//! stand-in script: nothing here starts yt-dlp or deno, or touches the network.
+//!
+//! yt-dlp is handed the user's signed-in cookie file, so what steers it matters: its
+//! environment, the plugins it loads, and how much of its output the engine will hold.
+
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
+
+use ytmfast::auth::{Cookie, Session};
+use ytmfast::error::Error;
+use ytmfast::streams::ytdlp::{YtDlp, YtDlpCommand};
+
+fn session() -> Session {
+    Session {
+        cookies: vec![Cookie {
+            domain: ".youtube.com".into(),
+            name: "SID".into(),
+            value: "fake".into(),
+            path: "/".into(),
+            secure: true,
+            expires_utc: None,
+        }],
+        account: None,
+        browser_stamp: None,
+    }
+}
+
+/// Runs a stand-in yt-dlp whose script is `body` after it has logged its arguments and its
+/// environment's variable names to `log`; returns the answer and that log.
+async fn run(body: &str) -> (Result<Vec<u8>, Error>, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_dir = tmp.path().join("run");
+    std::fs::create_dir(&run_dir).unwrap();
+    let log = tmp.path().join("log.txt");
+    let script = tmp.path().join("fake-yt-dlp.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'ARG %s\\n' \"$@\" >> '{log}'\nenv | cut -d= -f1 | sed 's/^/ENV /' >> '{log}'\n{body}\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cmd = YtDlpCommand::new(run_dir).with_program(
+        "/bin/sh".into(),
+        vec![script.into_os_string()],
+        Duration::from_secs(30),
+    );
+    let out = cmd.info_json("abcDEF_12-x", &session()).await;
+    (out, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+fn has_line(log: &str, line: &str) -> bool {
+    log.lines().any(|l| l == line)
+}
+
+#[tokio::test]
+async fn the_child_gets_an_allowlisted_environment_only() {
+    // SAFETY: names no other test reads.
+    unsafe {
+        std::env::set_var("YTMFAST_TEST_CANARY", "from-the-daemon");
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/test");
+        std::env::set_var("NODE_OPTIONS", "--no-warnings");
+    }
+    let (out, log) = run("echo '{}'").await;
+    assert!(out.is_ok(), "{out:?}");
+    for leaked in [
+        "YTMFAST_TEST_CANARY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "NODE_OPTIONS",
+    ] {
+        assert!(
+            !has_line(&log, &format!("ENV {leaked}")),
+            "{leaked} reached yt-dlp: the whole environment was inherited"
+        );
+    }
+    // What yt-dlp and its JS runtime need still arrives.
+    assert!(
+        has_line(&log, "ENV PATH") && has_line(&log, "ENV HOME"),
+        "PATH and HOME are kept:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn yt_dlp_is_told_not_to_load_plugins() {
+    let (_, log) = run("echo '{}'").await;
+    // `--ignore-config` alone does not stop it loading Python plugins from user-writable
+    // plugin folders, and it holds the user's sign-in.
+    assert!(
+        has_line(&log, "ARG --no-plugin-dirs"),
+        "arguments were:\n{log}"
+    );
+    assert!(has_line(&log, "ARG --ignore-config"));
+}
+
+fn peak_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn output_over_the_cap_is_cut_off_while_it_is_read() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    let before = peak_kib();
+    // 160 MiB from the stand-in: five times the 32 MiB answer cap.
+    let (out, _) = run("head -c 167772160 /dev/zero | tr '\\0' 'a'").await;
+    let grew_mib = peak_kib().saturating_sub(before) / 1024;
+    assert!(out.is_err(), "an answer over the cap must be refused");
+    assert!(
+        grew_mib < 64,
+        "the engine held about {grew_mib} MiB of the child's output before refusing it"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_under_the_cap_still_comes_back_whole() {
+    let (out, _) = run("printf '{\"id\":\"x\"}'").await;
+    assert_eq!(out.unwrap(), b"{\"id\":\"x\"}");
+}

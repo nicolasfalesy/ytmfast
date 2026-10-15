@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 
 use crate::auth::Session;
 use crate::error::Error;
@@ -42,13 +43,46 @@ pub struct YtDlpCommand {
     timeout: Duration,
 }
 
+/// Where the system package puts yt-dlp.
+const SYSTEM_YT_DLP: &str = "/usr/bin/yt-dlp";
+
+/// The only environment variables yt-dlp (and the JS runtime it starts) are given. The rest of
+/// the engine's environment stays out: yt-dlp is handed the user's sign-in, and variables such
+/// as `NODE_OPTIONS`, `LD_PRELOAD` or `PYTHONPATH` in the user manager's environment would
+/// steer it.
+const KEPT_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "XDG_RUNTIME_DIR",
+    "XDG_CACHE_HOME",
+];
+
+/// `system` when it exists, else `yt-dlp` from `PATH` (said once in the journal). The system
+/// copy first, because the service's `PATH` can begin with folders the user's own tools can
+/// write to, and a program found there would be handed the session.
+fn pick_program(system: &Path) -> PathBuf {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if system.exists() {
+        return system.to_path_buf();
+    }
+    SAID.call_once(|| {
+        eprintln!(
+            "ytmfast: {} is not there; running yt-dlp from PATH",
+            system.display()
+        );
+    });
+    "yt-dlp".into()
+}
+
 impl YtDlpCommand {
-    /// Runs `yt-dlp` from `PATH`, with its cookie folders made under `runtime_dir`
-    /// (`paths::runtime_dir()` in production).
+    /// Runs the system `yt-dlp` (`PATH`'s if there is no system one), with its cookie folders
+    /// made under `runtime_dir` (`paths::runtime_dir()` in production).
     pub fn new(runtime_dir: PathBuf) -> YtDlpCommand {
         YtDlpCommand {
             runtime_dir,
-            program: "yt-dlp".into(),
+            program: pick_program(Path::new(SYSTEM_YT_DLP)),
             prefix_args: Vec::new(),
             timeout: TIMEOUT,
         }
@@ -79,8 +113,21 @@ impl YtDlp for YtDlpCommand {
             .map_err(|_| Error::StreamFailed("could not write yt-dlp's cookie file".into()))?;
 
         let mut cmd = tokio::process::Command::new(&self.program);
+        // Only the variables yt-dlp needs (see `KEPT_ENV`).
+        cmd.env_clear();
+        for name in KEPT_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
         cmd.args(&self.prefix_args)
-            .args(["--ignore-config", "--no-cookies-from-browser"])
+            // `--no-plugin-dirs`: `--ignore-config` leaves yt-dlp's plugin folders (Python
+            // code in user-writable places) loaded, and it runs with the user's sign-in.
+            .args([
+                "--ignore-config",
+                "--no-cookies-from-browser",
+                "--no-plugin-dirs",
+            ])
             .args(["--no-warnings", "-q", "--cookies"])
             .arg(&cookies)
             .args(["-f", "774/141/bestaudio", "-j"])
@@ -94,7 +141,7 @@ impl YtDlp for YtDlpCommand {
             // children too: it runs a JS runtime for the same challenges.
             .process_group(0)
             .kill_on_drop(true);
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|_| Error::StreamFailed("could not run yt-dlp".into()))?;
         // From here until yt-dlp is reaped, dropping this (timeout, error, or the caller
@@ -102,14 +149,31 @@ impl YtDlp for YtDlpCommand {
         // `kill_on_drop` alone would kill only yt-dlp and orphan the JS runtime it started.
         let mut group = GroupKill(child.id().and_then(|p| i32::try_from(p).ok()));
 
-        let result = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
-        let output = match result {
-            Ok(Ok(output)) => {
-                // Reaped: the group id may be reused from now on, so it must not be killed.
-                group.0 = None;
-                output
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::StreamFailed("yt-dlp failed".into()))?;
+        // The answer is read as it comes and cut off one byte past the cap, so a runaway
+        // yt-dlp never has more than the cap in memory (`wait_with_output` would hold all of
+        // it before any size check). Over the cap, returning drops `group`, which kills it.
+        let run = async {
+            let mut answer = Vec::new();
+            (&mut stdout)
+                .take(net::MAX_ANSWER as u64 + 1)
+                .read_to_end(&mut answer)
+                .await
+                .map_err(|_| Error::StreamFailed("yt-dlp failed".into()))?;
+            if answer.len() > net::MAX_ANSWER {
+                return Err(Error::StreamFailed("yt-dlp's answer is too large".into()));
             }
-            Ok(Err(_)) => return Err(Error::StreamFailed("yt-dlp failed".into())),
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| Error::StreamFailed("yt-dlp failed".into()))?;
+            Ok((status, answer))
+        };
+        let (status, answer) = match tokio::time::timeout(self.timeout, run).await {
+            Ok(done) => done?,
             Err(_) => {
                 return Err(Error::StreamFailed(format!(
                     "yt-dlp took over {} s",
@@ -117,17 +181,16 @@ impl YtDlp for YtDlpCommand {
                 )));
             }
         };
+        // Reaped: the group id may be reused from now on, so it must not be killed.
+        group.0 = None;
         drop(folder);
-        if !output.status.success() {
-            return Err(Error::StreamFailed(match output.status.code() {
+        if !status.success() {
+            return Err(Error::StreamFailed(match status.code() {
                 Some(code) => format!("yt-dlp exited with status {code}"),
                 None => "yt-dlp was killed".into(),
             }));
         }
-        if output.stdout.len() > net::MAX_ANSWER {
-            return Err(Error::StreamFailed("yt-dlp's answer is too large".into()));
-        }
-        Ok(output.stdout)
+        Ok(answer)
     }
 }
 
@@ -315,6 +378,28 @@ mod tests {
         );
         // A missing runtime folder is no error.
         sweep_stale(&r.join("missing"));
+    }
+
+    #[test]
+    fn yt_dlp_is_the_system_one_when_there_is_one() {
+        // Not whatever `PATH` finds first: the unit's PATH can start with folders the user's
+        // own tools (mise shims) can write to.
+        let run = tempfile::tempdir().unwrap();
+        let cmd = YtDlpCommand::new(run.path().to_path_buf());
+        let expected = if Path::new("/usr/bin/yt-dlp").exists() {
+            "/usr/bin/yt-dlp"
+        } else {
+            "yt-dlp"
+        };
+        assert_eq!(cmd.program, Path::new(expected));
+        // And the choice itself, for a machine with and without it.
+        let there = run.path().join("yt-dlp");
+        fs::write(&there, "").unwrap();
+        assert_eq!(pick_program(&there), there);
+        assert_eq!(
+            pick_program(&run.path().join("missing")),
+            Path::new("yt-dlp")
+        );
     }
 
     #[test]
