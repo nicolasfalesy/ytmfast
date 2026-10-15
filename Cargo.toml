@@ -48,7 +48,8 @@ rquickjs = "0.14"
 rtrb = "0.4"
 # Reads the Chromium Cookies database. bundled: no system libsqlite needed at build time. serialize: the
 # database is opened from an in-memory copy, so the cookie values are never written to a temp file.
-rusqlite = { version = "0.40.2", features = ["bundled", "serialize"] }
+# limits: a 1 MiB cap on any one string or blob SQLite builds while reading another program's file.
+rusqlite = { version = "0.40.2", features = ["bundled", "serialize", "limits"] }
 # The session is stored in the keyring as JSON.
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order: the browse module lists rows in the order YouTube's JSON holds them (its walk is

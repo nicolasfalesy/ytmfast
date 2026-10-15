@@ -14,12 +14,13 @@
 //! gives valid padding 1 time in 256).
 
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use rusqlite::Connection;
+use rusqlite::limits::Limit;
 use sha2::{Digest, Sha256};
 
 use super::{Cookie, Session};
@@ -63,6 +64,10 @@ const DB_CANDIDATES: &[&str] = &[
 /// A real cookie database is well under 1 MiB; this only stops a wrong path from reading a
 /// huge file into memory.
 const MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The longest string or blob SQLite may build while reading the database (SQLITE_LIMIT_LENGTH).
+/// A real cookie row is a few KB; a hostile file could otherwise make one row cost hundreds of MB.
+const MAX_VALUE_BYTES: i32 = 1 << 20;
 
 /// Seconds from 1601-01-01 (Chromium's epoch) to 1970-01-01 (Unix's).
 const CHROMIUM_EPOCH_OFFSET_SECS: i64 = 11_644_473_600;
@@ -214,11 +219,31 @@ fn unreadable<E>(_: E) -> Error {
 /// A copy, because Chromium may hold a lock on the file; in memory, not a temp file, so the
 /// cookie values are never written anywhere else on disk.
 fn open_copy(path: &Path) -> Result<Connection, Error> {
-    let size = fs::metadata(path).map_err(unreadable)?.len();
-    if size > MAX_DB_BYTES {
-        return Err(Error::Internal("the Cookies database is too large".into()));
+    open_copy_capped(path, MAX_DB_BYTES)
+}
+
+/// `open_copy` with the size cap as an argument, so a test can use a small one.
+fn open_copy_capped(path: &Path, max_bytes: u64) -> Result<Connection, Error> {
+    let too_large = || Error::Internal("the Cookies database is too large".into());
+    // Opened once, and everything below asks the open file, not the path: the file can't be
+    // swapped between the checks and the read, and the size it states isn't trusted (a procfs
+    // file states 0, a file another process is still writing keeps growing), so the read is
+    // cut off one byte past the cap and that byte is the refusal.
+    let file = fs::File::open(path).map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(unreadable(()));
     }
-    let mut bytes = fs::read(path).map_err(unreadable)?;
+    if meta.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
     // Header bytes 18 and 19 are the file-format write and read versions: 2 means WAL. The
     // in-memory database can't do WAL and refuses to read such a file, so mark it as a
     // rollback-journal database (1). The content is the same either way: a cleanly closed
@@ -233,6 +258,28 @@ fn open_copy(path: &Path) -> Result<Connection, Error> {
     let mut db = Connection::open_in_memory().map_err(unreadable)?;
     db.deserialize_read_exact("main", Cursor::new(&bytes), bytes.len(), true)
         .map_err(unreadable)?;
+    // The file is another program's, so what SQLite does with it is bounded. No single string
+    // or blob over 1 MiB (a real cookie row is far below that; a generated column or view
+    // could otherwise build hundreds of MB per row from a file of a few KB)...
+    db.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+        .map_err(unreadable)?;
+    // ...and `cookies` and `meta` (the two tables read) must be plain tables, if present. A
+    // view runs its own definition on every query (an endless recursive one pinned a core),
+    // and a virtual table runs module code.
+    let (cookies_tables, others): (i64, i64) = db
+        .query_row(
+            "SELECT \
+               coalesce(sum(name = 'cookies' AND type = 'table' \
+                            AND upper(sql) NOT LIKE 'CREATE VIRTUAL%'), 0), \
+               coalesce(sum(NOT (type = 'table' AND upper(sql) NOT LIKE 'CREATE VIRTUAL%')), 0) \
+             FROM sqlite_master WHERE name IN ('cookies', 'meta')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(unreadable)?;
+    if cookies_tables != 1 || others != 0 {
+        return Err(unreadable(()));
+    }
     Ok(db)
 }
 
@@ -922,5 +969,60 @@ mod tests {
         db.execute_batch("CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL);")
             .unwrap();
         assert_eq!(sign_in_stamp(&db).unwrap(), None);
+    }
+
+    #[test]
+    fn the_size_cap_holds_for_a_file_that_states_no_size() {
+        // A procfs file is a regular file whose stat size is 0, and it reads as far as it
+        // goes (a file another process is still appending to is the same): the cap must
+        // count the bytes read, not trust the size the file states.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("Cookies");
+        std::os::unix::fs::symlink("/proc/self/maps", &link).unwrap();
+        assert_eq!(std::fs::metadata(&link).unwrap().len(), 0, "stats as empty");
+        let e = open_copy_capped(&link, 1024).unwrap_err();
+        assert_eq!(
+            e,
+            Error::Internal("the Cookies database is too large".into())
+        );
+    }
+
+    #[test]
+    fn meta_that_is_a_view_is_refused() {
+        // `meta` is queried too, so it gets the same check as `cookies`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cookies");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE cookies(host_key TEXT, name TEXT);
+                 CREATE VIEW meta AS SELECT 'version' AS key, '24' AS value;",
+            )
+            .unwrap();
+        assert!(open_copy(&path).is_err());
+    }
+
+    #[test]
+    fn cookies_that_is_not_a_plain_table_is_refused() {
+        // A view (its definition can do unbounded work on every query) and a virtual table.
+        for object in [
+            "CREATE VIEW cookies AS SELECT 0 AS creation_utc, '.youtube.com' AS host_key, \
+             'SAPISID' AS name, 1 AS last_update_utc;",
+            "CREATE VIRTUAL TABLE cookies USING fts5(host_key, name);",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Cookies");
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(object)
+                .unwrap();
+            assert_eq!(
+                open_copy(&path).err(),
+                Some(Error::Internal(
+                    "could not read the Cookies database".into()
+                )),
+                "{object}"
+            );
+        }
     }
 }
