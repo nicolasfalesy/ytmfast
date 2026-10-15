@@ -41,6 +41,9 @@ pub struct YtDlpCommand {
     program: PathBuf,
     prefix_args: Vec<OsString>,
     timeout: Duration,
+    /// Whether the child gets the fixed `SYSTEM_PATH` (the system yt-dlp is used) or the
+    /// engine's own `PATH` (yt-dlp itself came from `PATH`).
+    fixed_path: bool,
 }
 
 /// Where the system package puts yt-dlp.
@@ -58,6 +61,9 @@ const KEPT_ENV: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "XDG_CACHE_HOME",
 ];
+
+/// The `PATH` the system yt-dlp's child gets (the system package also puts `deno` in `/usr/bin`).
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 /// `system` when it exists, else `yt-dlp` from `PATH` (said once in the journal). The system
 /// copy first, because the service's `PATH` can begin with folders the user's own tools can
@@ -80,9 +86,16 @@ impl YtDlpCommand {
     /// Runs the system `yt-dlp` (`PATH`'s if there is no system one), with its cookie folders
     /// made under `runtime_dir` (`paths::runtime_dir()` in production).
     pub fn new(runtime_dir: PathBuf) -> YtDlpCommand {
+        YtDlpCommand::for_system_program(runtime_dir, Path::new(SYSTEM_YT_DLP))
+    }
+
+    /// `new` with the system copy's place named (tests aim it at a stand-in).
+    pub fn for_system_program(runtime_dir: PathBuf, system: &Path) -> YtDlpCommand {
+        let program = pick_program(system);
         YtDlpCommand {
             runtime_dir,
-            program: pick_program(Path::new(SYSTEM_YT_DLP)),
+            fixed_path: program == system,
+            program,
             prefix_args: Vec::new(),
             timeout: TIMEOUT,
         }
@@ -119,6 +132,12 @@ impl YtDlp for YtDlpCommand {
             if let Some(value) = std::env::var_os(name) {
                 cmd.env(name, value);
             }
+        }
+        // yt-dlp finds its JS runtime (deno) through PATH, and the service's PATH can begin
+        // with folders the user's own tools can write to. With the system yt-dlp, the child
+        // gets only the system folders, so a deno planted there is never run with the sign-in.
+        if self.fixed_path {
+            cmd.env("PATH", SYSTEM_PATH);
         }
         cmd.args(&self.prefix_args)
             // `--no-plugin-dirs`: `--ignore-config` leaves yt-dlp's plugin folders (Python

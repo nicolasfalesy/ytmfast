@@ -83,6 +83,59 @@ async fn the_child_gets_an_allowlisted_environment_only() {
     );
 }
 
+/// Runs a stand-in that records its `PATH`, started as the "system" yt-dlp when `system` is
+/// true (the stand-in is at the place named as the system copy) or as the fallback when it is
+/// not (the system place is empty, the stand-in is run through `with_program`).
+async fn path_the_child_sees(system: bool) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_dir = tmp.path().join("run");
+    std::fs::create_dir(&run_dir).unwrap();
+    let log = tmp.path().join("log.txt");
+    let script = tmp.path().join("fake-yt-dlp.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$PATH\" > '{}'\necho '{{}}'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cmd = if system {
+        YtDlpCommand::for_system_program(run_dir, &script)
+    } else {
+        YtDlpCommand::for_system_program(run_dir, &tmp.path().join("missing")).with_program(
+            "/bin/sh".into(),
+            vec![script.into_os_string()],
+            Duration::from_secs(30),
+        )
+    };
+    let out = cmd.info_json("abcDEF_12-x", &session()).await;
+    assert!(out.is_ok(), "{out:?}");
+    std::fs::read_to_string(&log).unwrap()
+}
+
+#[tokio::test]
+async fn the_system_yt_dlp_gets_a_fixed_path() {
+    // yt-dlp finds its JS runtime (deno) through PATH, and the service's PATH can begin with
+    // folders the user's own tools can write to: a deno found there would run with the
+    // user's sign-in. The system copy gets only the system folders.
+    // SAFETY: only this test file's tests read PATH, and none depends on its value.
+    unsafe { std::env::set_var("PATH", "/home/someone/shims:/usr/bin:/bin") };
+    assert_eq!(path_the_child_sees(true).await, "/usr/bin:/bin");
+}
+
+#[tokio::test]
+async fn a_yt_dlp_found_through_path_keeps_the_engines_path() {
+    // It came from PATH, so it (and what it starts) needs that PATH to be found at all.
+    // SAFETY: as above.
+    unsafe { std::env::set_var("PATH", "/home/someone/shims:/usr/bin:/bin") };
+    assert_eq!(
+        path_the_child_sees(false).await,
+        "/home/someone/shims:/usr/bin:/bin"
+    );
+}
+
 #[tokio::test]
 async fn yt_dlp_is_told_not_to_load_plugins() {
     let (_, log) = run("echo '{}'").await;
