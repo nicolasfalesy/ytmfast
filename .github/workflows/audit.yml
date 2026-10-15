@@ -1,0 +1,40 @@
+name: Audit
+
+# `cargo audit` checks Cargo.lock against the RustSec advisory database. New advisories are
+# published against crates that did not change, so it runs every week as well as when the
+# dependencies change (the rustls advisories of 2026-10-14 were found this way).
+on:
+  push:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/audit.yml
+  schedule:
+    # Mondays, 06:17 UTC (an off-the-hour minute: the top of the hour is busy).
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      # git first, so actions/checkout makes a real clone instead of a tarball download.
+      - name: Install cargo-audit
+        run: pacman -Syu --noconfirm cargo-audit git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Audit Cargo.lock
+        # Any advisory fails the job; a warning (an unmaintained or yanked crate) does not.
+        run: cargo audit

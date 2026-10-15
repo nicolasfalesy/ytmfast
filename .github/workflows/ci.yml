@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# Every action is pinned to a full commit SHA, with its tag beside it: a tag can be moved to
+# other code after it was reviewed, a SHA cannot. To move to a newer version, look up the
+# tag's commit (`gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq .object.sha`) and change
+# both the SHA and the comment.
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,7 +28,10 @@ jobs:
         # tree runs them since the bundled libopus went (a clean build with both blocked passes).
         run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git dbus
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The job never pushes: the token is not left in the clone's git config.
+          persist-credentials: false
 
       - name: Note the compiler version
         id: rustc
@@ -31,7 +39,7 @@ jobs:
         # compiler from restoring a target folder it can't reuse.
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -49,3 +57,41 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # The same tests in a release build. Some timing windows only fail when the code is
+  # optimized (the restarted-output test did, 5 runs in 5, while the debug run above was
+  # green), so the debug run alone is not enough.
+  release-tests:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      CARGO_TERM_COLOR: always
+      # The release profile builds with fat LTO and one codegen unit (about two minutes for the
+      # binary alone). The tests only need optimized code, not the smallest binary, and a
+      # release-only failure reproduces without either (checked on the restarted-output test).
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - name: Install toolchain and libraries
+        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git dbus
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Note the compiler version
+        id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ steps.rustc.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ steps.rustc.outputs.version }}-
+
+      - name: Test (release)
+        run: cargo test --release --locked
