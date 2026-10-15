@@ -3567,11 +3567,13 @@ mod tests {
         r.until(PlayState::Playing).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         // Where the song was just before the restart, and how long it could go on after it.
+        // The clock starts before the status call (its reply takes time too, and in a release
+        // build that time is the whole window), and ends when the replay is seen.
+        let clock = std::time::Instant::now();
         let before = r.status().await.position;
-        let lost_at = std::time::Instant::now();
         r.stats.lose_output();
         let seen = r.until(PlayState::Playing).await;
-        let window = lost_at.elapsed().as_secs_f64();
+        let window = clock.elapsed().as_secs_f64();
         // The restart is reported, then the same song plays again from where it was.
         let errors: Vec<_> = seen
             .iter()
@@ -3597,11 +3599,13 @@ mod tests {
         );
         // The replay starts where the song was when the output went: not before the last
         // position seen, and no further than the real time that passed since (no fixed window,
-        // so a slow test machine can't fail it).
+        // so a slow test machine can't fail it). The position only moves once per written
+        // packet (20 ms), so the one read may be that much behind the song: one packet of room.
         let at = states[1].position;
+        const PACKET_SECS: f64 = 0.02;
         assert!(before > 0.0, "the song played before the restart");
         assert!(
-            at >= before && at <= before + window,
+            at >= before && at <= before + window + PACKET_SECS,
             "restarted at {at}, was at {before}, {window} s later"
         );
         assert_eq!(r.started(), ["AAAAAAAAAAA", "AAAAAAAAAAA"]);
