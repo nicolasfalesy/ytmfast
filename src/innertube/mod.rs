@@ -45,10 +45,10 @@ enum Target {
     Fixed(Url),
 }
 
-/// The shortest time between two tries at renewing a signed-out session (his pick, 2026-10-07:
-/// once per 10 minutes). One try reads the browser's cookies and asks YouTube who they sign
-/// in; when that fails, every request until the next try is signed out at once, and the bar
-/// shows its Sign in again screen, whose button imports by hand at any time.
+/// The shortest time between two tries at renewing a signed-out session (the user's pick,
+/// 2026-10-07: once per 10 minutes). One try reads the browser's cookies and asks YouTube who
+/// they sign in; when that fails, every request until the next try is signed out at once, and
+/// the bar shows its Sign in again screen, whose button imports by hand at any time.
 pub const RENEW_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// How often the engine checks whether the browser refreshed its sign-in (`follow_browser`).

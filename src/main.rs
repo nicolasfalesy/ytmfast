@@ -283,7 +283,7 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
                 eprintln!("ytmfast: {e}");
                 return ExitCode::from(1);
             }
-            println!("Restarted the running engine: the next play starts it with the new session");
+            println!("{ENGINE_STOPPED}");
             ExitCode::SUCCESS
         }
         EngineStop::Unreachable => {
@@ -294,6 +294,12 @@ fn import_session(source: Source, profile: Option<PathBuf>) -> ExitCode {
         }
     }
 }
+
+/// What `import-session` says after it stopped a running engine. It stops it, it does not
+/// restart it: a socket-activated engine starts again on the next request, with the new
+/// session (an engine started by hand does not start again).
+const ENGINE_STOPPED: &str =
+    "Stopped the running engine: the next play starts it again with the new session";
 
 const NOT_SIGNED_IN: &str = "no YouTube sign-in in that profile; sign in to the app first";
 /// The account check could not be made (no network, an error answer). The bar widget shows it
@@ -316,8 +322,8 @@ async fn check_account(session: Session) -> Result<(Session, Account), Error> {
 }
 
 /// Renews a session YouTube dropped from the Brave Origin profile, as `import-session
-/// --browser brave-origin` would, but only for the same account (his picks, 2026-10-07: on
-/// its own, same account only, a log line and no notice). Another account in the browser,
+/// --browser brave-origin` would, but only for the same account (the user's picks,
+/// 2026-10-07: on its own, same account only, a log line and no notice). Another account in the browser,
 /// or a session with no account kept, is refused: the bar then shows Sign in again, and the
 /// person decides.
 struct BraveRenew {
@@ -782,6 +788,13 @@ mod tests {
 
     fn p(args: &[&str]) -> Command {
         parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn the_import_says_it_stopped_the_engine_not_restarted_it() {
+        // `import-session` asks the engine to quit; nothing restarts it by itself.
+        assert!(ENGINE_STOPPED.starts_with("Stopped the running engine"));
+        assert!(!ENGINE_STOPPED.contains("Restarted"));
     }
 
     #[test]

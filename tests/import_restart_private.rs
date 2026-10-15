@@ -200,7 +200,7 @@ async fn import_stops_the_running_engine() {
     assert!(out.status.success(), "{stdout}{stderr}");
     assert!(stdout.contains("Signed in as Fake Person"), "{stdout}");
     assert!(stdout.contains("Imported 2 cookies"), "{stdout}");
-    assert!(stdout.contains("Restarted the running engine"), "{stdout}");
+    assert!(stdout.contains("Stopped the running engine"), "{stdout}");
     assert!(!format!("{stdout}{stderr}").contains("fake-new"));
 
     // The engine quit cleanly.
