@@ -70,6 +70,24 @@ pub fn clean(s: &str) -> String {
     out
 }
 
+/// [`clean`] for text whose lines matter (plain lyrics): every line break (`\r\n`, `\r`, NEL,
+/// U+2028, U+2029) becomes `\n` and is kept; every other control and invisible character is
+/// dropped, as in [`clean`].
+pub fn clean_lines(s: &str) -> String {
+    let s = s.replace("\r\n", "\n");
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_break(c) && c != '\t' {
+            out.push('\n');
+        } else if c == '\t' {
+            out.push(' ');
+        } else if !(c.is_control() || invisible(c)) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

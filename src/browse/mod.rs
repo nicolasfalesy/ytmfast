@@ -410,7 +410,8 @@ pub fn parse_lyrics(b: &Value) -> Option<(String, String)> {
         .as_array()?
         .iter()
         .find_map(|c| get(c, "musicDescriptionShelfRenderer"))?;
-    let t = text(shelf.get("description"));
+    // Plain lyrics keep their lines; only the other control characters go.
+    let t = crate::text::clean_lines(&raw_text(shelf.get("description")));
     if t.is_empty() {
         return None;
     }
@@ -468,8 +469,16 @@ pub(crate) fn get<'a>(o: &'a Value, key: &str) -> Option<&'a Value> {
     o.get(key).filter(|v| truthy(v))
 }
 
-/// YouTube's text object: `simpleText`, or its `runs` joined.
+/// YouTube's text object: `simpleText`, or its `runs` joined, as one line of plain text
+/// ([`crate::text::clean`]). Rows leave over the socket to any client, so control characters and
+/// bidi overrides are dropped here, like song details; text with none comes back unchanged, so
+/// the golden test against `Page.js` still holds.
 pub(crate) fn text(t: Option<&Value>) -> String {
+    crate::text::clean(&raw_text(t))
+}
+
+/// [`text`] without the cleaning, for text whose line breaks matter (plain lyrics).
+fn raw_text(t: Option<&Value>) -> String {
     let Some(t) = t else {
         return String::new();
     };
@@ -532,4 +541,33 @@ pub(crate) fn clean_id(v: Option<&Value>) -> String {
 
 pub(crate) fn clean_token(v: Option<&Value>) -> String {
     clean(v, token_ok)
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Browse, search and library rows go out over the socket to any client, not only the
+    // widget, so their words are cleaned like song details (audit 2026-10-14, checker claim 7).
+    #[test]
+    fn row_text_drops_controls_and_bidi_overrides() {
+        let runs = json!({"runs": [{"text": "A\u{202E}b\u{0}c"}, {"text": "\u{1b}[31md\ne"}]});
+        assert_eq!(text(Some(&runs)), "Abc[31md e");
+        let simple = json!({"simpleText": "x\u{2066}y\u{7}"});
+        assert_eq!(text(Some(&simple)), "xy");
+    }
+
+    #[test]
+    fn plain_lyrics_keep_their_lines_but_lose_controls() {
+        let page = json!({"contents": {"sectionListRenderer": {"contents": [
+            {"musicDescriptionShelfRenderer": {
+                "description": {"runs": [{"text": "one\u{202E}\r\ntwo\u{0}\nthree"}]},
+                "footer": {"runs": [{"text": "Source: X\u{1b}"}]}
+            }}
+        ]}}});
+        let (t, src) = parse_lyrics(&page).unwrap();
+        assert_eq!(t, "one\ntwo\nthree");
+        assert_eq!(src, "Source: X");
+    }
 }
