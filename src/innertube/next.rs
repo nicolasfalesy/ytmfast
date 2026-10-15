@@ -95,8 +95,15 @@ pub struct SongItem {
 
 /// An artist name without the `" - Topic"` suffix of YouTube's auto-generated artist channels.
 /// Only one trailing suffix is removed.
+///
+/// Also one line of visible text (`text::clean`): this is applied to every artist name from every
+/// source (YouTube's answers, the socket, a state file), and an artist name reaches the MPRIS bus.
 pub fn clean_artist(name: &str) -> String {
-    name.strip_suffix(" - Topic").unwrap_or(name).to_string()
+    let name = crate::text::clean(name);
+    match name.strip_suffix(" - Topic") {
+        Some(artist) => artist.to_string(),
+        None => name,
+    }
 }
 
 impl Innertube {
@@ -501,7 +508,7 @@ struct Byline {
 /// browse id is that link's (a malformed id leaves the name, without the link).
 fn byline(b: RawByline) -> Byline {
     let album_run = b.runs.iter().find(|r| r.page_type() == Some(PAGE_ALBUM));
-    let album = album_run.and_then(|r| r.text.clone());
+    let album = album_run.and_then(|r| r.text.as_deref().map(crate::text::clean));
     let album_id = album_run
         .and_then(RawBylineRun::browse_id)
         .unwrap_or_default()
@@ -604,6 +611,28 @@ mod tests {
             song(v).unwrap().thumbnail.as_deref(),
             Some("https://lh3.googleusercontent.com/@evil.example/a=w120")
         );
+    }
+
+    #[test]
+    fn answer_text_loses_control_characters() {
+        let v: RawVideo = serde_json::from_value(json!({
+            "videoId": "abcdefghijk",
+            "title": {"runs": [{"text": "T\u{0}i\u{1b}[31mtle\n"}, {"text": "\u{202E}2"}]},
+            "longBylineText": {"runs": [
+                {"text": "Ar\u{0}tist", "navigationEndpoint": {"browseEndpoint": {
+                    "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"}}, "browseId": "UCxxxxxxxxxxxxxxxxxxxxxx"}}},
+                {"text": " • "},
+                {"text": "Al\nbum", "navigationEndpoint": {"browseEndpoint": {
+                    "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                        "pageType": "MUSIC_PAGE_TYPE_ALBUM"}}, "browseId": "MPREb_xxxxxxxxxxx"}}}
+            ]}
+        }))
+        .unwrap();
+        let s = song(v).unwrap();
+        assert_eq!(s.title, "Ti[31mtle 2");
+        assert_eq!(s.artists, ["Artist"]);
+        assert_eq!(s.album.as_deref(), Some("Al bum"));
     }
 
     #[test]

@@ -16,4 +16,5 @@ pub mod report;
 pub mod solver;
 pub mod state;
 pub mod streams;
+pub mod text;
 pub mod trace;

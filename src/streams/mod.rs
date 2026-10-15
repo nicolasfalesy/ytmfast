@@ -356,7 +356,7 @@ impl Streams {
         let body = tokio::time::timeout(OEMBED_TIMEOUT, ask).await.ok()??;
         let o: OEmbed = serde_json::from_slice(&body).ok()?;
         Some((
-            o.title.unwrap_or_default(),
+            o.title.map(|t| crate::text::clean(&t)).unwrap_or_default(),
             // The channel's name: "<artist> - Topic" for most songs (seen live on the first
             // second of a list play); the bar shows the artist alone.
             o.author_name.map(|a| clean_artist(&a)).unwrap_or_default(),
@@ -801,7 +801,10 @@ fn from_ytdlp(json: &[u8], video_id: &str) -> Result<Stream, Error> {
             .map(|n| n as u64),
         loudness_db: None,
         meta: TrackMeta {
-            title: info.title.unwrap_or_default(),
+            title: info
+                .title
+                .map(|t| crate::text::clean(&t))
+                .unwrap_or_default(),
             // `uploader` is the channel's name ("<artist> - Topic" for an auto-made artist
             // channel); cleaned like every other channel name.
             artist: info

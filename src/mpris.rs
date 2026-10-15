@@ -138,20 +138,57 @@ pub async fn run(
     hub: Hub,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let mpris = tokio::select! {
-        served = serve(&bus, cmds, events, hub) => match served {
-            Ok(m) => m,
-            Err(e) => {
+    // The wait before the next try after the connection was lost, doubling up to `RECONNECT_MAX`.
+    let mut delay = RECONNECT_MIN;
+    // Whether the connection was up and then lost: the first connect that fails ends MPRIS (no
+    // bus, or the name taken: nothing will change), a later one is tried again.
+    let mut was_up = false;
+    loop {
+        let served = tokio::select! {
+            served = serve(&bus, cmds.clone(), events.resubscribe(), hub.clone()) => served,
+            // Stopped while still connecting: dropping the half-made connection is enough.
+            _ = &mut stop => return,
+        };
+        match served {
+            Ok(mpris) => {
+                if was_up {
+                    eprintln!("ytmfast: MPRIS is back on the bus");
+                }
+                was_up = true;
+                delay = RECONNECT_MIN;
+                let connection = mpris.connection.clone();
+                tokio::select! {
+                    _ = &mut stop => {
+                        mpris.stop().await;
+                        return;
+                    }
+                    // The bus dropped the connection (or restarted): the name is gone with it,
+                    // and media keys and widgets would find no player. Said once, tried again.
+                    _ = connection.closed() => {
+                        eprintln!("ytmfast: MPRIS lost its bus connection; reconnecting");
+                    }
+                }
+                drop(mpris);
+            }
+            Err(e) if !was_up => {
                 eprintln!("ytmfast: MPRIS is off ({e})");
                 return;
             }
-        },
-        // Stopped while still connecting: dropping the half-made connection is enough.
-        _ = &mut stop => return,
-    };
-    let _ = stop.await;
-    mpris.stop().await;
+            // Still down: not said again until it has been up (one line per outage).
+            Err(_) => {}
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = &mut stop => return,
+        }
+        delay = (delay * 2).min(RECONNECT_MAX);
+    }
 }
+
+/// The wait before the first try to take the bus name again after losing it.
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// The longest wait between tries (a bus that stays away is tried about twice a minute).
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// zbus errors carry D-Bus names and reasons, never session values or links.
 fn bus_error(e: zbus::Error) -> Error {
@@ -369,11 +406,16 @@ fn metadata(status: &Status) -> HashMap<String, Value<'static>> {
         .expect("track_id makes valid object paths");
     m.insert("mpris:trackid".to_string(), Value::from(id));
     if let Some(meta) = status.meta.as_ref().filter(|_| status.video_id.is_some()) {
-        m.insert("xesam:title".into(), Value::from(meta.title.clone()));
+        // Cleaned again here although every source cleans its text: a NUL in any of these
+        // strings gets the whole connection dropped by the bus, and the name with it.
+        m.insert(
+            "xesam:title".into(),
+            Value::from(crate::text::clean(&meta.title)),
+        );
         // A list in the spec: a song can have several artists.
         m.insert(
             "xesam:artist".into(),
-            Value::from(vec![meta.artist.clone()]),
+            Value::from(vec![crate::text::clean(&meta.artist)]),
         );
         if meta.length_seconds > 0 {
             m.insert(
@@ -387,7 +429,7 @@ fn metadata(status: &Status) -> HashMap<String, Value<'static>> {
         }
     }
     if let Some(album) = status.album.as_ref().filter(|_| status.video_id.is_some()) {
-        m.insert("xesam:album".into(), Value::from(album.clone()));
+        m.insert("xesam:album".into(), Value::from(crate::text::clean(album)));
     }
     m
 }

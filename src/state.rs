@@ -360,12 +360,13 @@ fn sanitize(mut s: Saved) -> Saved {
         }
         // A file written before every source cleaned channel names (a `queue.add` from a
         // widget, say) can hold "<artist> - Topic"; cleaned here so a restart never brings
-        // the suffix back.
+        // the suffix back. The same for control characters (a NUL in a title got the MPRIS
+        // connection dropped, and the saved queue brought it back at every start).
         for artist in &mut song.artists {
-            if artist.ends_with(" - Topic") {
-                *artist = crate::innertube::clean_artist(artist);
-            }
+            *artist = crate::innertube::clean_artist(artist);
         }
+        song.title = crate::text::clean(&song.title);
+        song.album = song.album.take().map(|a| crate::text::clean(&a));
     }
     let keep: Vec<bool> = s.queue.iter().map(song_ok).collect();
     // Old index -> new index, for the songs kept.
@@ -746,6 +747,22 @@ mod tests {
         assert_eq!(got, None);
         // Kept for the user like any other file that is not a state file.
         assert!(dir.path().join(BAD_NAME).exists());
+    }
+
+    #[test]
+    fn loaded_text_loses_control_characters() {
+        // A file from before songs were cleaned (the NUL that took the MPRIS name off the bus
+        // was saved in it, and came back at every start).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = saved_of("AB", 0);
+        s.queue[0].title = "x\0y\u{1b}[0m\nz".into();
+        s.queue[0].album = Some("a\0b".into());
+        s.queue[0].artists = vec!["c\0d".into(), "e\u{202E}f".into()];
+        save(dir.path(), &s).unwrap();
+        let got = load(dir.path()).unwrap();
+        assert_eq!(got.queue[0].title, "xy[0m z");
+        assert_eq!(got.queue[0].album.as_deref(), Some("ab"));
+        assert_eq!(got.queue[0].artists, ["cd", "ef"]);
     }
 
     #[test]

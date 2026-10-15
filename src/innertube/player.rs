@@ -280,11 +280,14 @@ struct RawRun {
 }
 
 impl RawText {
+    /// The text as one line of visible text (`text::clean`): it is a title, which reaches the
+    /// MPRIS bus, a terminal and the bar.
     pub(super) fn text(self) -> String {
-        match self.simple_text {
+        let text: String = match self.simple_text {
             Some(t) => t,
             None => self.runs.into_iter().filter_map(|r| r.text).collect(),
-        }
+        };
+        crate::text::clean(&text)
     }
 }
 
@@ -418,7 +421,7 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     }
     let (title, author, length_seconds, thumbnail) = match details {
         Some(d) => (
-            d.title,
+            d.title.map(|t| crate::text::clean(&t)),
             d.author,
             d.length_seconds.and_then(|s| s.parse().ok()),
             d.thumbnail.and_then(widest_thumbnail),
@@ -711,6 +714,27 @@ mod tests {
             (p.title.as_str(), p.author.as_str(), p.length_seconds),
             ("Details Song", "Micro Artist", 10)
         );
+    }
+
+    #[test]
+    fn answer_text_loses_control_characters() {
+        let a = answer(json!({
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"videoId": "x", "title": "So\u{0}ng\n\u{1b}[0m", "author": "Ar\u{0}tist - Topic"},
+        }));
+        let p = parse(&a, "x").unwrap();
+        assert_eq!(
+            (p.title.as_str(), p.author.as_str()),
+            ("Song [0m", "Artist")
+        );
+        let a = answer(json!({
+            "playabilityStatus": {"status": "OK"},
+            "microformat": {"playerMicroformatRenderer": {
+                "title": {"simpleText": "Mi\u{0}cro\u{202E}"}, "ownerChannelName": "O\nwner"
+            }}
+        }));
+        let p = parse(&a, "x").unwrap();
+        assert_eq!((p.title.as_str(), p.author.as_str()), ("Micro", "O wner"));
     }
 
     #[test]

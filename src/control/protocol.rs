@@ -598,7 +598,9 @@ fn parse_song(v: &Value) -> Result<SongItem, &'static str> {
     let text = |name: &str| -> Result<Option<String>, &'static str> {
         match field(song, name) {
             None => Ok(None),
-            Some(Value::String(s)) if s.len() <= MAX_TEXT => Ok(Some(s.clone())),
+            // One line of visible text (`text::clean`): a control character in a title would
+            // reach the MPRIS bus, a terminal and the bar. The cap is on what was sent.
+            Some(Value::String(s)) if s.len() <= MAX_TEXT => Ok(Some(crate::text::clean(s))),
             Some(_) => Err(TEXT),
         }
     };
@@ -1285,6 +1287,27 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn queue_add_text_loses_control_characters() {
+        // A NUL, an escape sequence, a bidi override or a newline in a title would reach the
+        // MPRIS bus (a NUL gets the connection dropped), a terminal and the bar.
+        let line = json!({"id": 1, "cmd": "queue.add", "args": {"songs": [{
+            "videoId": "dQw4w9WgXcQ",
+            "title": "x\u{0}y\u{1b}[31mz\nw\u{202E}v",
+            "album": "a\u{0}b",
+            "artists": ["c\u{0}d", "e\nf - Topic"],
+        }]}})
+        .to_string();
+        match parse(&line) {
+            Ok((1, Request::QueueAdd { songs, .. })) => {
+                assert_eq!(songs[0].title, "xy[31mz wv");
+                assert_eq!(songs[0].album.as_deref(), Some("ab"));
+                assert_eq!(songs[0].artists, ["cd", "e f"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
