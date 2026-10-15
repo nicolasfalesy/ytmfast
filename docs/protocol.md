@@ -483,6 +483,17 @@ neither is refused. When both come back on, the `queue` event comes first, then 
 
 ## Connections
 
+- At most 64 clients are connected at once. A 65th connection is sent one line, an error
+  reply with `"id": null`, the code `unavailable` and the message `too many connections;
+  close one and try again`, and is closed. Every connection holds a file descriptor and some
+  memory, so a script that opens connections and leaves them could otherwise use up what the
+  engine needs to accept the next one. A place is free again as soon as a client goes.
+- A connection that has sent nothing at all for 10 minutes is closed (the engine closes it
+  after flushing, with no message). "Nothing" means no request of any kind: one request, or
+  a `watch`, makes the connection a client for good, and a client may then listen for as
+  long as it likes without sending anything. A widget that connects, asks for `status` and
+  then only listens is therefore never cut off; one that connects and says nothing should
+  not expect to stay.
 - A client that falls behind on events gets a fresh `state` event and a fresh `queue`
   event (without the `queue` event while it has them off, see `watch`) in place of the ones
   it missed.
