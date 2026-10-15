@@ -38,7 +38,11 @@ regex-lite = "0.1"
 # native_crypto (no async-std, no OpenSSL).
 oo7 = "0.6"
 # rustls only (no OpenSSL); http2 because the YouTube hosts speak it and it saves connections.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# gzip + brotli: the 3 MB player script and the API answers shrink by about two thirds on the
+# wire. `net::read_capped` counts the DECODED chunks, so the 32 MiB cap holds against an
+# inflate bomb (tests/compression.rs); `net::stream_client` turns decoding off (audio is
+# already compressed, and its Range / length checks want the bytes as sent).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "gzip", "brotli"] }
 # Audio output. v0_3_50: pw_stream_get_time_n, for the delay that the position subtracts.
 pipewire = { version = "0.10", features = ["v0_3_50"] }
 # The challenge solver: yt-dlp's ejs scripts run in an embedded QuickJS (quickjs-ng). Default
@@ -80,6 +84,8 @@ oxc_span = { version = "0.154.0", default-features = false }
 pkg-config = "0.3"
 
 [dev-dependencies]
+# Makes a brotli answer for the compression test (the same crate reqwest's brotli decoding uses).
+brotli = "9"
 # StreamExt for the MPRIS tests' signal streams (already in the tree through reqwest and zbus).
 futures-util = { version = "0.3", default-features = false }
 tempfile = "3"

@@ -103,6 +103,10 @@ impl HttpWeb {
     pub fn with(allow: fn(&Url) -> bool, timeout: Duration) -> HttpWeb {
         let client = reqwest::Client::builder()
             .user_agent(LRCLIB_CLIENT)
+            // The lyrics hosts are not YouTube's: their requests stay as they were (no
+            // `Accept-Encoding`); the answers are small.
+            .gzip(false)
+            .brotli(false)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()

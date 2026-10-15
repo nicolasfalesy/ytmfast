@@ -87,7 +87,8 @@ fn redirect_allowed(next: &Url, hops_so_far: usize) -> bool {
 }
 
 /// The one HTTP client: rustls, a 10 s timeout and a redirect policy that re-checks the
-/// allowlist on every hop.
+/// allowlist on every hop. It asks for gzip and brotli and hands back decoded bodies, so
+/// `read_capped` counts DECODED bytes: its cap holds against an inflate bomb.
 ///
 /// Panics only if the TLS backend can't start, which is a broken build, not a runtime
 /// condition worth an error path in every caller.
@@ -103,6 +104,10 @@ pub fn client(user_agent: &str) -> reqwest::Client {
 /// what must fail fast is a stall, so the 10 s applies to connecting and to each read.
 pub fn stream_client(user_agent: &str) -> reqwest::Client {
     builder(user_agent)
+        // Audio is already compressed, and the downloads' Range and length checks want the
+        // file's bytes exactly as sent: no `Accept-Encoding`, nothing decoded.
+        .gzip(false)
+        .brotli(false)
         .connect_timeout(TIMEOUT)
         .read_timeout(TIMEOUT)
         .build()
