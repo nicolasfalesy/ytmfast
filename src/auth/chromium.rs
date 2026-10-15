@@ -47,10 +47,13 @@ pub const NO_BRAVE_KEY: &str =
 pub const BRAVE_KEY_WRONG: &str =
     "the keyring's \"Brave Safe Storage\" key does not open Brave Origin's cookies";
 
-/// The only cookie hosts kept: the YouTube and Google sign-in cookies the API needs.
-/// Everything else in the profile (other Google country domains, any other site) stays out
-/// of the keyring.
-const KEPT_HOSTS: &[&str] = &[".youtube.com", ".google.com", "accounts.google.com"];
+/// The only cookie host kept: the `.youtube.com` sign-in cookies, which are all the engine
+/// ever sends (its clients talk to www.youtube.com and music.youtube.com alone, and it signs
+/// with the `.youtube.com` SAPISID). The `.google.com` and `accounts.google.com` ones are the
+/// whole Google account's sign-in: keeping them would only put them in the keyring item, in
+/// memory, and in yt-dlp's cookie file for nothing. Everything else in the profile (other
+/// Google country domains, any other site) stays out too.
+const KEPT_HOSTS: &[&str] = &[".youtube.com"];
 
 /// Where the database sits inside a profile: `Network/Cookies` since Chromium 96, the
 /// profile root before that; `Default/` when the app uses Chromium's profile folders.
@@ -72,7 +75,7 @@ const MAX_VALUE_BYTES: i32 = 1 << 20;
 /// Seconds from 1601-01-01 (Chromium's epoch) to 1970-01-01 (Unix's).
 const CHROMIUM_EPOCH_OFFSET_SECS: i64 = 11_644_473_600;
 
-/// Reads the YouTube and Google cookies out of the Chromium profile folder `profile`.
+/// Reads the YouTube cookies out of the Chromium profile folder `profile`.
 ///
 /// Refuses while the `pear-desktop` app is running: it rewrites the database (and rotates
 /// cookies) while it runs, so a copy taken then can be half-written or soon stale.
@@ -80,7 +83,7 @@ pub fn import(profile: &Path) -> Result<Session, Error> {
     import_with(profile, Path::new("/proc"))
 }
 
-/// Reads the YouTube and Google cookies out of the Brave Origin profile folder `profile`
+/// Reads the YouTube cookies out of the Brave Origin profile folder `profile`
 /// (`Default`), with `keys` for the `v11` ones.
 ///
 /// Brave Origin may be running: it holds the database open, so it is copied first (see
@@ -104,7 +107,7 @@ const SIGN_IN_NAMES: &[&str] = &[
     "__Secure-3PSIDTS",
 ];
 
-/// When Brave Origin last wrote one of its YouTube or Google sign-in cookies (`SIGN_IN_NAMES`):
+/// When Brave Origin last wrote one of its YouTube sign-in cookies (`SIGN_IN_NAMES`):
 /// the newest `last_update_utc`, Chromium's microseconds since 1601. `None` when the profile
 /// holds none, or its schema has no `last_update_utc` (Chromium before 2022).
 ///
@@ -199,7 +202,7 @@ fn read_session(db_path: &Path, mut keys: Keys) -> Result<Session, Error> {
         });
     }
     if cookies.is_empty() {
-        // No YouTube or Google cookies at all: that profile was never signed in.
+        // No YouTube cookies at all: that profile was never signed in.
         return Err(Error::SignedOut);
     }
     Ok(Session {
@@ -608,15 +611,9 @@ mod tests {
                 .iter()
                 .map(|c| (c.name.as_str(), c.value.as_str()))
                 .collect();
-            assert_eq!(
-                got,
-                [
-                    ("SAPISID", "v11-value"),
-                    ("NID", "v10-value"),
-                    ("LSID", "plain-value")
-                ],
-                "meta version {version}"
-            );
+            // Only the youtube.com cookie: the .google.com and accounts.google.com ones (the
+            // account-wide Google sign-in) are not kept, and the engine never sends them.
+            assert_eq!(got, [("SAPISID", "v11-value")], "meta version {version}");
             assert_eq!(keys.asked.get(), 1, "the keyring is asked once");
         }
     }
@@ -740,7 +737,7 @@ mod tests {
     #[test]
     fn import_plain_values() {
         let dir = tempfile::tempdir().unwrap();
-        let mut session_cookie = plain(".google.com", "NID", "n");
+        let mut session_cookie = plain(".youtube.com", "NID", "n");
         session_cookie.expires = 0;
         session_cookie.secure = false;
         let p = profile(
@@ -761,7 +758,7 @@ mod tests {
                     expires_utc: Some(1_900_000_000),
                 },
                 Cookie {
-                    domain: ".google.com".into(),
+                    domain: ".youtube.com".into(),
                     name: "NID".into(),
                     value: "n".into(),
                     path: "/".into(),
@@ -844,7 +841,9 @@ mod tests {
         );
         let s = import_with(&p, &no_procs(dir.path())).unwrap();
         let names: Vec<&str> = s.cookies.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["A", "B", "C"]);
+        // Only `.youtube.com`: the .google.com and accounts.google.com cookies are the whole
+        // Google account's sign-in, and the engine sends none of them to anything.
+        assert_eq!(names, ["A"]);
     }
 
     #[test]
@@ -951,7 +950,9 @@ mod tests {
             "CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL,
                last_update_utc INTEGER NOT NULL);
              INSERT INTO cookies VALUES ('.youtube.com', '__Secure-1PSIDTS', 300);
-             INSERT INTO cookies VALUES ('.google.com', 'SAPISID', 200);
+             -- The account-wide Google copy is not kept, so a write to it is not a change.
+             INSERT INTO cookies VALUES ('.google.com', 'SAPISID', 800);
+             INSERT INTO cookies VALUES ('accounts.google.com', '__Secure-1PSIDTS', 850);
              -- Rewritten on almost every answer, or another site's: never a sign-in change.
              INSERT INTO cookies VALUES ('.youtube.com', '__Secure-1PSIDCC', 900);
              INSERT INTO cookies VALUES ('.example.com', '__Secure-1PSIDTS', 999);",

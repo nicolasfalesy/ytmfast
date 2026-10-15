@@ -64,7 +64,7 @@ media keys / desktop ──MPRIS (D-Bus)────┤
 
 - `ytmfast import-session` reads the Chromium cookie database of the `pear-desktop` profile
   (`~/.config/YouTube Music/Cookies`), decrypts it (v10 fixed key; v11 key from the Secret Service), and
-  keeps only the `youtube.com` and `google.com` cookies that are needed.
+  keeps only the `youtube.com` cookies (the Google account's own sign-in cookies stay out).
 - It only runs while `pear-desktop` is closed, because Chromium holds the database open.
 - The session is stored encrypted in the user's login keyring (Secret Service, item label "ytmfast session",
   attribute `application=ytmfast`), never in a plain file. A locked or missing keyring gives a clear error. It is never logged, never sent anywhere except Google hosts, and never part of a backup.
