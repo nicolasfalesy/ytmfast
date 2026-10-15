@@ -96,6 +96,22 @@ pub fn import_brave_origin(profile: &Path, keys: &dyn KeySource) -> Result<Sessi
     read_session(&db_path, Keys::new(Some(keys)))
 }
 
+/// `import_brave_origin` and the sign-in stamp (`brave_sign_in_stamp`) from ONE read of the
+/// Cookies file. The stamp is the one of the same copy the cookies came from, so a rotation
+/// can't fall between the two.
+pub fn import_brave_origin_with_stamp(
+    profile: &Path,
+    keys: &dyn KeySource,
+) -> Result<(Session, Option<i64>), Error> {
+    let db_path = find_database(profile).ok_or_else(|| Error::Internal(NO_BRAVE_PROFILE.into()))?;
+    let db = open_copy(&db_path)?;
+    // The stamp first, as a take always read it: a failed stamp read is no reason to refuse
+    // the cookies (the caller records None).
+    let stamp = sign_in_stamp(&db).ok().flatten();
+    let session = read_session_from(&db, Keys::new(Some(keys)))?;
+    Ok((session, stamp))
+}
+
 /// The Brave Origin cookies whose change means the browser holds a newer sign-in than the
 /// engine: the session cookies themselves, and the `PSIDTS` timestamps Google rotates on them.
 /// Not the `SIDCC` family, which Google rewrites on almost every answer.
@@ -165,9 +181,13 @@ pub fn find_database(profile: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// The kept cookies of the database at `db_path`.
-fn read_session(db_path: &Path, mut keys: Keys) -> Result<Session, Error> {
-    let db = open_copy(db_path)?;
-    let version = meta_version(&db)?;
+fn read_session(db_path: &Path, keys: Keys) -> Result<Session, Error> {
+    read_session_from(&open_copy(db_path)?, keys)
+}
+
+/// The kept cookies of the opened copy `db`.
+fn read_session_from(db: &Connection, mut keys: Keys) -> Result<Session, Error> {
+    let version = meta_version(db)?;
 
     let mut stmt = db
         .prepare(

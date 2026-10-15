@@ -343,20 +343,20 @@ impl Renew for BraveRenew {
         let Some(want) = current.account.clone() else {
             return Err("the session has no account kept; import it once by hand".into());
         };
-        // Read before the cookies, so a rotation between the two is seen as newer next time.
-        let stamp = chromium::brave_sign_in_stamp(&self.profile).ok().flatten();
+        // The stamp and the cookies come from ONE read of the cookie file (it was read three
+        // times per take before), so a rotation between the two can't be missed either.
         // On a thread of its own, not `spawn_blocking`: the cookie key lookup starts a
         // runtime of its own, which can't be done on a thread inside this one.
         let profile = self.profile.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(chromium::import_brave_origin(
+            let _ = tx.send(chromium::import_brave_origin_with_stamp(
                 &profile,
                 &SafeStorageKeys::brave(),
             ));
         });
-        let imported = match rx.await {
-            Ok(Ok(s)) => s,
+        let (imported, stamp) = match rx.await {
+            Ok(Ok(read)) => read,
             Ok(Err(Error::SignedOut)) => return Err(BRAVE_NOT_SIGNED_IN.into()),
             // The import's errors are fixed texts (no cookie, no path).
             Ok(Err(e)) => return Err(e.to_string()),
