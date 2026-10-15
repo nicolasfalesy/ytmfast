@@ -43,6 +43,7 @@ use tokio::time::{Instant, Sleep};
 use crate::browse::{self, Browser};
 use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
 use crate::error::Error;
+use crate::loggate::{LogGate, more_since};
 use crate::mpris;
 use idle::IdlePolicy;
 use lyrics::{EngineTabs, LyricsCache};
@@ -285,50 +286,6 @@ struct Shared {
     queue_text: queue_text::QueueText,
 }
 
-/// Lets a log line through the first time, and then once per `every` at most, counting what
-/// it held back. For lines a client or the system can make the daemon write over and over
-/// (a refused connection, a failing accept): one a minute is enough to see it, and a
-/// journal flooded at ten lines a second helps nobody.
-struct LogGate {
-    last: Option<Instant>,
-    held_back: u64,
-}
-
-impl LogGate {
-    const EVERY: Duration = Duration::from_secs(60);
-
-    fn new() -> LogGate {
-        LogGate {
-            last: None,
-            held_back: 0,
-        }
-    }
-
-    /// `Some(n)` when the line may be written now, `n` being how many were held back since the
-    /// last one; `None` when it is held back.
-    fn allow(&mut self, now: Instant) -> Option<u64> {
-        match self.last {
-            Some(last) if now.duration_since(last) < Self::EVERY => {
-                self.held_back += 1;
-                None
-            }
-            _ => {
-                self.last = Some(now);
-                Some(std::mem::take(&mut self.held_back))
-            }
-        }
-    }
-}
-
-/// " (and N more since the last)" for a log line that held some back, else nothing.
-fn more_since(held_back: u64) -> String {
-    if held_back == 0 {
-        String::new()
-    } else {
-        format!(" ({held_back} more since the last such line)")
-    }
-}
-
 /// Serves the socket until `quit`, idle, or the engine stopping. Leaves the engine running.
 pub async fn serve(
     listener: UnixListener,
@@ -401,7 +358,7 @@ async fn serve_with(
                                 .as_bytes(),
                             );
                         }
-                        if let Some(held_back) = refused_log.allow(Instant::now()) {
+                        if let Some(held_back) = refused_log.allow(std::time::Instant::now()) {
                             eprintln!(
                                 "ytmfast: refused a connection: {max_clients} clients are \
                                  already connected{}",
@@ -415,7 +372,7 @@ async fn serve_with(
                 Err(e) => {
                     // Out of descriptors, say: the same error every 100 ms until one frees,
                     // so the journal gets the first and then one a minute.
-                    if let Some(held_back) = accept_log.allow(Instant::now()) {
+                    if let Some(held_back) = accept_log.allow(std::time::Instant::now()) {
                         eprintln!("ytmfast: accept failed: {e}{}", more_since(held_back));
                     }
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
@@ -1228,25 +1185,6 @@ pub fn bind_socket(path: &Path) -> io::Result<(std::os::unix::net::UnixListener,
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn a_repeating_log_line_is_written_once_a_minute() {
-        // A failing accept comes every 100 ms (`ACCEPT_BACKOFF`): 120 lines in 12 s without the
-        // gate, one with it, and one a minute after.
-        let start = Instant::now();
-        let mut gate = LogGate::new();
-        let mut written = Vec::new();
-        for tick in 0..1300u64 {
-            let now = start + Duration::from_millis(100 * tick);
-            if let Some(held_back) = gate.allow(now) {
-                written.push((tick, held_back));
-            }
-        }
-        // At 0 s, then at 60 s and 120 s: each says how many it held back.
-        assert_eq!(written, [(0, 0), (600, 599), (1200, 599)]);
-        assert_eq!(more_since(0), "");
-        assert!(more_since(599).contains("599 more"));
-    }
 
     #[test]
     fn peer_uid_checked() {
