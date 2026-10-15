@@ -11,6 +11,11 @@
 //! build reads; every run sets it (a dead port where the test never gets that far), so no test
 //! can reach YouTube.
 
+// A release build never reads `YTMFAST_TEST_API_BASE` (see `account_api` in src/main.rs), so there
+// the account check would go to the real YouTube Music with these made-up cookies. These tests
+// exist only for the debug build (the one `cargo test` makes), and say nothing in a release build.
+#![cfg(debug_assertions)]
+
 use std::path::Path;
 use std::process::{Command, Output};
 
