@@ -122,6 +122,17 @@ pub struct TrackMeta {
 pub trait Resolver: Send + Sync {
     /// A link for `video_id`, from the cache while it is good.
     async fn resolve(&self, video_id: &str) -> Result<Stream, Error>;
+    /// `resolve` for a song whose title and artist the caller already knows (its queue item):
+    /// the lookup that would fetch them (oEmbed, a request of its own) is skipped, and the
+    /// link carries `known` instead. `None` is plain `resolve`.
+    async fn resolve_with(
+        &self,
+        video_id: &str,
+        known: Option<TrackMeta>,
+    ) -> Result<Stream, Error> {
+        let _ = known;
+        self.resolve(video_id).await
+    }
     /// A new link, skipping the cache: for when a link stopped working mid-song (ruling R2).
     async fn resolve_fresh(&self, video_id: &str) -> Result<Stream, Error>;
 }
@@ -184,8 +195,13 @@ impl Streams {
     }
 
     /// The own-code path, then yt-dlp.
-    async fn fetch(&self, video_id: &str, fresh: bool) -> Result<Stream, Error> {
-        let own = match self.own(video_id, fresh).await {
+    async fn fetch(
+        &self,
+        video_id: &str,
+        fresh: bool,
+        known: Option<&TrackMeta>,
+    ) -> Result<Stream, Error> {
+        let own = match self.own(video_id, fresh, known).await {
             Ok(stream) => return Ok(stream),
             Err(e) => e,
         };
@@ -237,7 +253,12 @@ impl Streams {
         }
     }
 
-    async fn own(&self, video_id: &str, fresh: bool) -> Result<Stream, Error> {
+    async fn own(
+        &self,
+        video_id: &str,
+        fresh: bool,
+        known: Option<&TrackMeta>,
+    ) -> Result<Stream, Error> {
         let (player_id, sts, mut code) = self.current_player(fresh).await?;
         // Loads the kept player on the solver thread while the `player` request is in flight,
         // so the solve below doesn't wait for it (about 170 ms, see `solver`).
@@ -313,9 +334,12 @@ impl Streams {
         };
         // The TV answer can come back without the song's details (seen live): ask oEmbed, at
         // the same time as the solve rather than after it (about 50 ms saved). Best effort: a
-        // song without a title still plays.
+        // song without a title still plays. When the caller already knows them (the queue
+        // item), there is nothing to ask: the solve is a few milliseconds now, so the oEmbed
+        // request was most of the wait for the first sound.
+        let known = known.filter(|k| !k.title.is_empty());
         let details = async {
-            if !answer.title.is_empty() {
+            if !answer.title.is_empty() || known.is_some() {
                 return None;
             }
             let details = self.oembed(video_id).await;
@@ -326,6 +350,15 @@ impl Streams {
         let (solved_n, solved_sig) = solved?;
         let url = link.assemble(solved_sig.as_deref(), solved_n.as_deref())?;
         let mut stream = stream_from_answer(format, url, &answer);
+        if let Some(known) = known
+            && stream.meta.title.is_empty()
+        {
+            // The link is cached under the song's id: it keeps the details it was resolved with.
+            stream.meta.title = known.title.clone();
+            if stream.meta.artist.is_empty() {
+                stream.meta.artist = known.artist.clone();
+            }
+        }
         if let Some((title, artist)) = details {
             stream.meta.title = title;
             if stream.meta.artist.is_empty() {
@@ -522,19 +555,27 @@ impl Streams {
 #[async_trait]
 impl Resolver for Streams {
     async fn resolve(&self, video_id: &str) -> Result<Stream, Error> {
+        self.resolve_with(video_id, None).await
+    }
+
+    async fn resolve_with(
+        &self,
+        video_id: &str,
+        known: Option<TrackMeta>,
+    ) -> Result<Stream, Error> {
         check_video_id(video_id)?;
         if let Some(stream) = self.cached(video_id) {
             trace::mark("link from the cache");
             return Ok(stream);
         }
-        let stream = self.fetch(video_id, false).await?;
+        let stream = self.fetch(video_id, false, known.as_ref()).await?;
         self.remember(&stream);
         Ok(stream)
     }
 
     async fn resolve_fresh(&self, video_id: &str) -> Result<Stream, Error> {
         check_video_id(video_id)?;
-        let stream = self.fetch(video_id, true).await?;
+        let stream = self.fetch(video_id, true, None).await?;
         self.remember(&stream);
         Ok(stream)
     }

@@ -23,7 +23,7 @@ use crate::engine::QueueSource;
 use crate::error::Error;
 use crate::innertube::{MoreKind, NextPage, NextRequest, SongNext, Tracking};
 use crate::report::ReportApi;
-use crate::streams::{Resolver, Stream};
+use crate::streams::{Resolver, Stream, TrackMeta};
 use url::Url;
 
 /// How long one session load may take: long enough to type a keyring password into the
@@ -128,6 +128,18 @@ impl LazySession {
 impl Resolver for LazySession {
     async fn resolve(&self, video_id: &str) -> Result<Stream, Error> {
         self.get().await?.resolver.resolve(video_id).await
+    }
+
+    async fn resolve_with(
+        &self,
+        video_id: &str,
+        known: Option<TrackMeta>,
+    ) -> Result<Stream, Error> {
+        self.get()
+            .await?
+            .resolver
+            .resolve_with(video_id, known)
+            .await
     }
 
     async fn resolve_fresh(&self, video_id: &str) -> Result<Stream, Error> {

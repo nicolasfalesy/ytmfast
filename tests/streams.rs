@@ -1305,6 +1305,58 @@ async fn oembed_channel_names_lose_the_topic_suffix() {
     assert_eq!(s.meta.artist, "Oembed Artist");
 }
 
+/// The engine knows a queue song's title and artist, so the oEmbed lookup (a request of its
+/// own, about 50 ms, made after the `player` answer) is not on the way to the first sound.
+/// With a 100 ms oEmbed and a 50 ms `player` answer that has no title, the resolve must be
+/// done within the `player` time plus 20 ms, send no oEmbed request, and carry the details
+/// the caller knew.
+#[tokio::test]
+async fn known_details_keep_oembed_off_the_critical_path() {
+    use ytmfast::streams::TrackMeta;
+    let expire = now() + 6 * 3600;
+    let mut a = answer(url_format(&stream_url(expire, "")));
+    a.as_object_mut().unwrap().remove("videoDetails");
+    let r = rig(None, FakeSolver::mapping(&[]), FakeYtDlp::failing()).await;
+    Mock::given(method("POST"))
+        .and(path("/youtubei/v1/player"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(a)
+                .set_delay(Duration::from_millis(50)),
+        )
+        .mount(&r.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oembed"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"title": "Oembed Song", "author_name": "Oembed Artist"}))
+                .set_delay(Duration::from_millis(100)),
+        )
+        .mount(&r.server)
+        .await;
+    // The player version is remembered already (as it is for every song after the first), so
+    // the time below is the `player` request and the rest of the resolve.
+    r.streams.refresh_player().await;
+    let known = TrackMeta {
+        title: "Queue Song".into(),
+        artist: "Queue Artist".into(),
+        length_seconds: 0,
+        thumbnail: None,
+    };
+    let start = std::time::Instant::now();
+    let s = r.streams.resolve_with(VIDEO, Some(known)).await.unwrap();
+    let took = start.elapsed();
+    assert!(
+        took < Duration::from_millis(70),
+        "the resolve took {took:?}: it waited for oEmbed"
+    );
+    assert_eq!(s.meta.title, "Queue Song");
+    assert_eq!(s.meta.artist, "Queue Artist");
+    let reqs = r.server.received_requests().await.unwrap();
+    assert!(reqs.iter().all(|q| q.url.path() != "/oembed"));
+}
+
 #[tokio::test]
 async fn details_missing_everywhere_still_plays() {
     let expire = now() + 6 * 3600;

@@ -1753,8 +1753,15 @@ impl Engine {
         let resolver = self.resolver.clone();
         let tx = self.resolved_tx.clone();
         let generation = self.generation;
+        // The queue item's title and artist, when it has them: the resolve then skips the
+        // oEmbed lookup (a request of its own) that would only fetch the same details.
+        let known = self
+            .queue
+            .current()
+            .filter(|i| i.song.video_id == video_id)
+            .and_then(|i| known_details(&i.song));
         let task = tokio::spawn(async move {
-            let result = resolver.resolve(&video_id).await;
+            let result = resolver.resolve_with(&video_id, known).await;
             let _ = tx.send(Resolved { generation, result });
         });
         self.resolving = Some(task.abort_handle());
@@ -2518,9 +2525,10 @@ impl Engine {
         let resolver = self.resolver.clone();
         let tx = self.preloads_tx.clone();
         let video_id = next.song.video_id.clone();
+        let known = known_details(&next.song);
         let task = tokio::spawn(async move {
             // Usually from the link cache: the prefetch at half the song resolved it.
-            let result = resolver.resolve(&video_id).await;
+            let result = resolver.resolve_with(&video_id, known).await;
             let _ = tx.send(Preresolved { generation, result });
         });
         self.preload = Some(Preload {
@@ -2632,9 +2640,10 @@ impl Engine {
             old.abort();
         }
         let resolver = self.resolver.clone();
+        let known = known_details(&next.song);
         let task = tokio::spawn(async move {
             // Only the cache matters here; a failure shows when the song's turn comes.
-            let _ = resolver.resolve(&video_id).await;
+            let _ = resolver.resolve_with(&video_id, known).await;
         });
         self.prefetch = Some((id, task.abort_handle()));
     }
@@ -2810,6 +2819,15 @@ fn bare_song(video_id: &str) -> SongItem {
     }
 }
 
+/// What the engine already knows of a queue song for a resolve: its title and artist, or
+/// nothing for a bare song (a played id with no details), which the resolve fills itself.
+fn known_details(song: &SongItem) -> Option<TrackMeta> {
+    if song.title.is_empty() {
+        return None;
+    }
+    song_meta(song, None)
+}
+
 /// What the bar shows for a queue song: its own details, with gaps filled from its link's
 /// (`resolved`). A song with no title (a bare id) shows its link's details alone.
 fn song_meta(song: &SongItem, resolved: Option<&TrackMeta>) -> Option<TrackMeta> {
@@ -2948,12 +2966,17 @@ mod tests {
         Server { base, paths }
     }
 
+    /// One resolve and what it was told the caller already knew (title, artist).
+    type KnownCall = (String, Option<(String, String)>);
+
     /// A resolver with a per-id delay and failure; links point at the test server.
     struct Fake {
         base: Url,
         delays: HashMap<String, Duration>,
         failures: HashMap<String, Error>,
         calls: Mutex<Vec<String>>,
+        /// What each resolve was told the caller already knew (id, title, artist).
+        known: Mutex<Vec<KnownCall>>,
     }
 
     impl Fake {
@@ -2993,6 +3016,14 @@ mod tests {
                 Some(e) => Err(e.clone()),
                 None => Ok(self.stream(id)),
             }
+        }
+
+        async fn resolve_with(&self, id: &str, known: Option<TrackMeta>) -> Result<Stream, Error> {
+            self.known
+                .lock()
+                .unwrap()
+                .push((id.to_string(), known.map(|k| (k.title, k.artist))));
+            self.resolve(id).await
         }
 
         async fn resolve_fresh(&self, id: &str) -> Result<Stream, Error> {
@@ -3316,6 +3347,7 @@ mod tests {
                 .map(|(id, e)| (id.to_string(), e))
                 .collect(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let source = Arc::new(FakeSource {
             pages: setup
@@ -3915,6 +3947,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let Built {
             mut engine, events, ..
@@ -4142,6 +4175,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let Built {
             mut engine,
@@ -4184,6 +4218,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let Built { mut engine, .. } =
             engine_for(&server, fake.clone(), Arc::default(), true, false);
@@ -4231,6 +4266,27 @@ mod tests {
         // B's own end counts.
         engine.on_audio(AudioEvent::Ended);
         assert_eq!(engine.status.state, PlayState::Stopped);
+    }
+
+    /// A queue song is resolved with the title and artist its queue item holds, so the resolve
+    /// does not ask oEmbed for them; a song played by a bare id has none to give.
+    #[tokio::test]
+    async fn a_queue_song_is_resolved_with_the_details_the_queue_holds() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", Some(1)).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        let known = r.resolver.known.lock().unwrap().clone();
+        let b = known.iter().find(|(id, _)| *id == vid('B')).unwrap();
+        assert_eq!(b.1, Some(("Title B".into(), "One, Two".into())));
+        r.play("ZZZZZZZZZZZ").await;
+        r.until_song("ZZZZZZZZZZZ", PlayState::Playing).await;
+        let known = r.resolver.known.lock().unwrap().clone();
+        let z = known.iter().find(|(id, _)| id == "ZZZZZZZZZZZ").unwrap();
+        assert_eq!(z.1, None);
     }
 
     #[tokio::test]
@@ -4996,6 +5052,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let mut built = engine_for(&server, fake.clone(), Arc::default(), true, false);
         let engine = &mut built.engine;
@@ -5174,6 +5231,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         // In real time, so B's position grows at a known pace.
         let built = engine_for(&server, fake.clone(), Arc::default(), false, false);
@@ -5457,6 +5515,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let built = engine_for(&server, fake, Arc::default(), true, false);
         (built, server)
@@ -5771,6 +5830,7 @@ mod tests {
                 delays: HashMap::new(),
                 failures: HashMap::new(),
                 calls: Mutex::new(Vec::new()),
+                known: Mutex::new(Vec::new()),
             });
             let mut built = engine_for(&server, fake.clone(), Arc::default(), true, false);
             let engine = &mut built.engine;
@@ -5814,6 +5874,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let mut built = engine_for(&server, fake, Arc::default(), true, false);
         let engine = &mut built.engine;
@@ -5957,6 +6018,7 @@ mod tests {
             delays: HashMap::new(),
             failures: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
         });
         let Built { mut engine, .. } =
             engine_for(&server, fake.clone(), Arc::default(), false, false);
