@@ -315,7 +315,10 @@ pub fn load(dir: &Path) -> Option<Saved> {
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // O_NONBLOCK: opening a named pipe for reading otherwise waits for a writer, and the
+        // load would hang (past SIGTERM) before the check below could refuse it. It does
+        // nothing to a regular file.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -719,6 +722,30 @@ mod tests {
         // A save after that works as usual.
         save(dir.path(), &saved_of("A", 0)).unwrap();
         assert!(load(dir.path()).is_some());
+    }
+
+    /// A named pipe in place of the state file: opening it for reading blocks until someone
+    /// writes, and the load runs before the engine takes its first command (and ignores
+    /// SIGTERM while it waits). It must be refused at once, not waited on.
+    #[test]
+    fn a_pipe_in_place_of_the_state_file_does_not_block_the_load() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(load(&d));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("load was still waiting on the pipe after 3 s");
+        assert_eq!(got, None);
+        // Kept for the user like any other file that is not a state file.
+        assert!(dir.path().join(BAD_NAME).exists());
     }
 
     #[test]
