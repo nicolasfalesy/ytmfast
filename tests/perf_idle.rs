@@ -131,7 +131,10 @@ fn a_fresh_always_on_engine_is_idle_and_small() {
         "idle {WINDOW:?}: {ticks} CPU ticks, {woke} wakeups, {wrote} bytes written; \
          {pss} KiB PSS, {rss} KiB RSS, {threads} threads"
     );
-    assert_eq!(ticks, 0, "an idle engine used CPU");
+    // At most one clock tick (10 ms) over the window: the kernel charges CPU in whole ticks, and
+    // on a shared CI machine one can land on any process that wakes even once (GitHub's runner
+    // charged 1 on 2026-10-15; this laptop measures 0). Two or more is real work.
+    assert!(ticks <= 1, "an idle engine used {ticks} CPU ticks");
     assert!(
         woke <= MAX_WAKEUPS,
         "{woke} wakeups in {WINDOW:?}, the limit is {MAX_WAKEUPS}"
