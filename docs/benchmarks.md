@@ -41,6 +41,8 @@ decoded sample, so the CPU figure is the full decode-and-output cost).
 | Time to first sound (from closed) | 0.68 s | 0.65 to 0.70 s |
 | Idle | 0 processes (quits after 5 idle minutes on AC, 2 on battery; the systemd socket costs nothing) | |
 | Idle engine, before it quits | 9.3 MB PSS | |
+| Always-on engine (`--stay`), just started, no session | 10.7 MB PSS, falling to 9.1 MB | 0 CPU ticks and 0 wakeups in 146 s |
+| Always-on engine, paused after playing (YouTube's player kept loaded) | 56 MB PSS (61 MB RSS) | 73 to 80 MB when part of it is swapped out; measured 2026-10-14 on the user's laptop, 10 minutes: 0 CPU ticks, 4 wakeups a minute |
 | Decode cost alone (into a null output, no PipeWire) | Opus 256k: about 0.14% of a performance core; AAC 256k: about 0.05 to 0.06% | |
 | Power | see the power section | |
 

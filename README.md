@@ -104,7 +104,9 @@ socket protocol is described in [docs/protocol.md](docs/protocol.md).
 ### Keep it running
 
 To start the engine at login and keep it up instead (`ytmfast daemon --stay`; paused, it uses
-no CPU and about 8 MB of memory), add the drop-in and have the login target pull it in:
+no CPU; it takes about 10 MB when it starts and about 55 to 60 MB once it has played a song,
+because it then keeps YouTube's player loaded so the next song starts fast), add the drop-in
+and have the login target pull it in:
 
 ```sh
 mkdir -p ~/.config/systemd/user/ytmfast.service.d
