@@ -661,6 +661,11 @@ pub struct Engine {
     ticker: Option<Interval>,
     /// Saves the state (`crate::state`); `None` when nothing is saved (most tests).
     writer: Option<Writer>,
+    /// The writer's word on whether saves are failing (`Writer::health`).
+    save_health: Option<Arc<state::SaveHealth>>,
+    /// The clients were told that saves fail; not told again until a save works and fails
+    /// again, so a full disk is one notice, not one per command.
+    save_error_told: bool,
     /// Something worth saving changed (a song, the queue, a pause, a seek, the volume). Saved
     /// once the command or event at hand is handled, so a burst of changes is one snapshot.
     dirty: bool,
@@ -796,6 +801,8 @@ impl Engine {
             loads_seen: 0,
             ticker: None,
             writer: None,
+            save_health: None,
+            save_error_told: false,
             dirty: false,
             save_at: None,
             ticks_since_save: 0,
@@ -869,6 +876,7 @@ impl Engine {
 
     /// Saves the state through `writer` from now on, and once more on the way out.
     pub fn save_with(&mut self, writer: Writer) {
+        self.save_health = Some(writer.health());
         self.writer = Some(writer);
     }
 
@@ -906,6 +914,7 @@ impl Engine {
                 () = next_tick(&mut self.ticker) => self.on_tick(),
                 // A burst of volume, seek, mute, shuffle or repeat changes has settled.
                 () = save_due(self.save_at) => self.dirty = true,
+                () = save_failed(&self.save_health) => self.on_save_failed(),
             }
             if self.dirty {
                 self.write_state();
@@ -1864,6 +1873,10 @@ impl Engine {
     /// row (a full pass, measured when the run began), which stops rather than skipping round
     /// for ever.
     fn skip_unplayable(&mut self, e: &Error) {
+        eprintln!(
+            "{}",
+            failure_log("a song could not be played, skipping it", e)
+        );
         self.emit(EngineEvent::Error {
             code: e.code(),
             message: e.to_string(),
@@ -2352,6 +2365,7 @@ impl Engine {
     /// The current song failed: report it, and stop, keeping the song and where it stopped
     /// in the status, so a play goes on from there.
     fn fail(&mut self, e: &Error) {
+        eprintln!("{}", failure_log("playback stopped", e));
         self.end_report(self.status.position);
         self.drop_preload();
         self.current = None;
@@ -2812,6 +2826,10 @@ impl Engine {
     fn write_state(&mut self) {
         self.dirty = false;
         self.save_at = None;
+        // The last save worked: a failure after this one is news again.
+        if self.save_health.as_ref().is_some_and(|h| !h.failing()) {
+            self.save_error_told = false;
+        }
         self.ticks_since_save = 0;
         if self.writer.is_some() {
             let saved = self.saved();
@@ -2820,6 +2838,20 @@ impl Engine {
             }
         }
         self.seeked_to = None;
+    }
+
+    /// A save failed (the writer thread logged it, once a minute at most): the clients hear of
+    /// it once, since the queue and position stop persisting and nothing else shows it.
+    fn on_save_failed(&mut self) {
+        if self.save_error_told {
+            return;
+        }
+        self.save_error_told = true;
+        let e = Error::Internal("could not save the play state".into());
+        self.emit(EngineEvent::Error {
+            code: e.code(),
+            message: e.to_string(),
+        });
     }
 
     /// What `state.json` gets: at most `state::MAX_ITEMS` songs around the current one, and
@@ -2914,6 +2946,20 @@ fn song_meta(song: &SongItem, resolved: Option<&TrackMeta>) -> Option<TrackMeta>
             .clone()
             .or_else(|| resolved.and_then(|m| m.thumbnail.clone())),
     })
+}
+
+/// The journal line for a failed song: the error's code only. Its message can hold a stream
+/// link (a signed token), a title or a path, and the journal is kept and read by others.
+fn failure_log(what: &str, e: &Error) -> String {
+    format!("ytmfast: {what} ({})", e.code())
+}
+
+/// Waits until the state writer reports a failed save; never, while nothing is saved.
+async fn save_failed(health: &Option<Arc<state::SaveHealth>>) {
+    match health {
+        Some(h) => h.failed.notified().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Waits until a change that waited to be saved is due; never, while none is.
@@ -4336,6 +4382,91 @@ mod tests {
         // B's own end counts.
         engine.on_audio(AudioEvent::Ended);
         assert_eq!(engine.status.state, PlayState::Stopped);
+    }
+
+    /// A failed song or a lost audio output leaves one journal line (it left none before: "0
+    /// losses" only meant "not logged"), with the error's code and nothing else.
+    #[test]
+    fn a_failed_song_is_logged_by_code_only() {
+        let link = "https://rr1---sn-test.googlevideo.com/videoplayback?sig=SECRET&title=Some+Song";
+        let line = failure_log("playback stopped", &Error::StreamFailed(link.into()));
+        assert_eq!(line, "ytmfast: playback stopped (stream_failed)");
+        let line = failure_log(
+            "a song could not be played, skipping it",
+            &Error::OutputRestarted,
+        );
+        assert_eq!(
+            line,
+            "ytmfast: a song could not be played, skipping it (internal)"
+        );
+        for secret in ["SECRET", "googlevideo", "Some"] {
+            assert!(!failure_log("x", &Error::Unavailable(link.into())).contains(secret));
+        }
+    }
+
+    /// A state file that can't be written (a full disk, a read-only folder) is told to the
+    /// clients ONCE per run of failures, not once per save (and not in silence, as before: the
+    /// queue just stopped persisting); a save that works again re-arms the notice.
+    #[tokio::test(start_paused = true)]
+    async fn failing_saves_are_told_to_the_clients_once() {
+        let works = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = works.clone();
+        let writer = Writer::with(Box::new(move |_| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            }
+        }));
+        let mut r = rig(Setup {
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        let (_dog, mut bark) = watchdog(Duration::from_secs(30));
+        r.play("AAAAAAAAAAA").await;
+        // The play's own save fails, and its notice can come before the song is playing.
+        let mut early = 0;
+        loop {
+            match next_real(&mut r, &mut bark).await {
+                EngineEvent::State(s) if s.state == PlayState::Playing => break,
+                EngineEvent::Error { .. } => early += 1,
+                _ => {}
+            }
+        }
+        // Takes `n` more saves (a volume change each, past the debounce), then counts the
+        // save notices the clients got since the last count.
+        async fn more_saves(r: &mut Rig, n: u32) -> usize {
+            for i in 0..n {
+                r.send(EngineCmd::Volume(0.2 + 0.1 * i as f32)).await;
+                tokio::time::sleep(SAVE_DEBOUNCE + Duration::from_millis(100)).await;
+                // The writer is a real thread: let it fail and the engine hear of it.
+                for _ in 0..4 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    r.status().await;
+                }
+            }
+            let mut notices = 0;
+            while let Ok(e) = r.events.try_recv() {
+                if let EngineEvent::Error { code, message } = e {
+                    assert_eq!(code, "internal");
+                    assert!(message.contains("play state"), "{message}");
+                    notices += 1;
+                }
+            }
+            notices
+        }
+        let told = early + more_saves(&mut r, 4).await;
+        assert_eq!(told, 1, "one notice for five failed saves");
+        // Saves work again: no notice, and the next run of failures gets its own.
+        works.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(more_saves(&mut r, 2).await, 0);
+        works.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            more_saves(&mut r, 3).await,
+            1,
+            "a new run of failures is told again"
+        );
     }
 
     /// Asking for the queue again with no change between hands back the same items (shared,

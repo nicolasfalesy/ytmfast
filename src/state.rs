@@ -23,12 +23,13 @@ use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::innertube::SongItem;
+use crate::loggate::{LogGate, more_since};
 use crate::net;
 use crate::queue::Repeat;
 use crate::streams::is_video_id;
@@ -515,6 +516,35 @@ struct Slot {
 
 type Shared = Arc<(Mutex<Slot>, Condvar)>;
 
+/// Whether the last save failed, and a way to be told when one does. The writer thread sets
+/// it; the engine reads it (to tell the clients once) and waits on `failed`.
+#[derive(Default)]
+pub struct SaveHealth {
+    failing: std::sync::atomic::AtomicBool,
+    /// Notified at every failed save (one permit is kept, so a failure is never missed).
+    pub failed: tokio::sync::Notify,
+}
+
+impl SaveHealth {
+    /// True from a failed save until the next one succeeds.
+    pub fn failing(&self) -> bool {
+        self.failing.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The journal line for a failed save, or `None` while it is held back: the first failure is
+/// logged, then at most one a minute (a full disk or a read-only folder fails every save, and
+/// each save is a command or 30 s of play away). The error's kind only: its text can name the
+/// path (the home folder).
+fn failure_line(gate: &mut LogGate, now: Instant, kind: io::ErrorKind) -> Option<String> {
+    gate.allow(now).map(|held_back| {
+        format!(
+            "ytmfast: could not save the play state ({kind:?}){}",
+            more_since(held_back)
+        )
+    })
+}
+
 /// Saves snapshots on a thread of its own. At most one write is in flight; a snapshot that
 /// arrives while one is being written waits, and a newer one replaces it (only the latest
 /// matters).
@@ -524,6 +554,7 @@ type Shared = Arc<(Mutex<Slot>, Condvar)>;
 /// past `finish`'s bound, and the process exit ends it).
 pub struct Writer {
     shared: Shared,
+    health: Arc<SaveHealth>,
     /// Fires when the thread has written its last snapshot and ended. `None` when the thread
     /// could not be started.
     done: Option<oneshot::Receiver<()>>,
@@ -539,14 +570,26 @@ impl Writer {
         let shared: Shared = Arc::default();
         let (done_tx, done) = oneshot::channel();
         let theirs = shared.clone();
+        let health = Arc::new(SaveHealth::default());
+        let mine = health.clone();
         let thread = std::thread::Builder::new()
             .name("ytmfast-state".into())
             .spawn(move || {
+                let mut gate = LogGate::new();
                 while let Some(saved) = take(&theirs) {
-                    if let Err(e) = save(&saved) {
-                        // The kind only: an io::Error's text can name the path (the home
-                        // folder), and the engine carries on either way.
-                        eprintln!("ytmfast: could not save the play state ({:?})", e.kind());
+                    match save(&saved) {
+                        Ok(()) => mine
+                            .failing
+                            .store(false, std::sync::atomic::Ordering::Release),
+                        // The engine carries on either way.
+                        Err(e) => {
+                            mine.failing
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            mine.failed.notify_one();
+                            if let Some(line) = failure_line(&mut gate, Instant::now(), e.kind()) {
+                                eprintln!("{line}");
+                            }
+                        }
                     }
                 }
                 let _ = done_tx.send(());
@@ -558,7 +601,16 @@ impl Writer {
                 None
             }
         };
-        Writer { shared, done }
+        Writer {
+            shared,
+            health,
+            done,
+        }
+    }
+
+    /// Whether saves are failing, for the engine.
+    pub fn health(&self) -> Arc<SaveHealth> {
+        self.health.clone()
     }
 
     /// Queues `saved` for writing, replacing any snapshot still waiting.
@@ -1033,6 +1085,53 @@ mod tests {
             position,
             ..Saved::default()
         }
+    }
+
+    #[test]
+    fn a_failing_save_is_logged_first_then_once_a_minute() {
+        let mut gate = LogGate::new();
+        let start = Instant::now();
+        let kind = io::ErrorKind::StorageFull;
+        let first = failure_line(&mut gate, start, kind).unwrap();
+        assert!(first.contains("StorageFull") && !first.contains("more since"));
+        // A save every 2 s for a minute: all held back.
+        for i in 1..30 {
+            assert_eq!(
+                failure_line(&mut gate, start + Duration::from_secs(2 * i), kind),
+                None
+            );
+        }
+        // The next one after the minute says what it held back; the kind only, never a path.
+        let again = failure_line(&mut gate, start + Duration::from_secs(61), kind).unwrap();
+        assert!(again.contains("29 more since"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn the_writer_says_when_saves_fail_and_when_they_work_again() {
+        let ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ok.clone();
+        let w = Writer::with(Box::new(move |_| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            }
+        }));
+        let health = w.health();
+        assert!(!health.failing());
+        w.submit(at(1.0));
+        // The notice comes by itself (one permit is kept), within a moment.
+        tokio::time::timeout(Duration::from_secs(5), health.failed.notified())
+            .await
+            .expect("a failed save is announced");
+        assert!(health.failing());
+        ok.store(true, std::sync::atomic::Ordering::SeqCst);
+        w.submit(at(2.0));
+        let t = std::time::Instant::now();
+        while health.failing() && t.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!health.failing(), "a save that worked clears it");
     }
 
     #[tokio::test]
