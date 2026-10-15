@@ -80,10 +80,13 @@ fn home(env: Env) -> io::Result<PathBuf> {
 fn private_dir(dir: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
+    // The error names the folder: a plain file in its place gave only "File exists (os error
+    // 17)", and the daemon prints this error as its whole reason for not starting.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)?;
+        .create(dir)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
     // symlink_metadata, not metadata: `create` succeeds on a symlink to a folder, and we
     // must see the link itself to refuse it.
     let meta = std::fs::symlink_metadata(dir)?;
@@ -230,5 +233,27 @@ mod tests {
         std::fs::write(tmp.path().join("ytmfast"), b"").unwrap();
         let env = env_of(&[("XDG_STATE_HOME", tmp.path())]);
         assert!(state_dir_in(&env).is_err());
+    }
+
+    /// The daemon prints this error and exits; with only "File exists (os error 17)" the user
+    /// can't tell which file is in the way.
+    #[test]
+    fn a_plain_file_in_place_of_a_folder_is_named_in_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let in_the_way = tmp.path().join("ytmfast");
+        std::fs::write(&in_the_way, b"").unwrap();
+        let env = env_of(&[("XDG_RUNTIME_DIR", tmp.path())]);
+        let e = runtime_dir_in(&env).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            e.to_string().contains(&*in_the_way.to_string_lossy()),
+            "the error was: {e}"
+        );
+        // The same for a folder that can't be made at all.
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let env = env_of(&[("XDG_STATE_HOME", &blocked)]);
+        let e = state_dir_in(&env).unwrap_err();
+        assert!(e.to_string().contains("blocked"), "the error was: {e}");
     }
 }
