@@ -492,8 +492,16 @@ impl Worker {
         if built {
             crate::trace::mark("solver runtime built");
         }
-        if js.loaded()?.as_deref() == Some(player_id) {
+        let kept = js.loaded()?;
+        if kept.as_deref() == Some(player_id) {
             return Ok(true);
+        }
+        if kept.is_some() {
+            // Another version is kept: a fresh runtime, so the old player's memory is freed as a
+            // whole and handed back, not left as holes the new one grows around (measured: the
+            // resident size crept up by 8 to 14 MB over the version switches of a day).
+            self.reset();
+            crate::trace::mark("solver runtime renewed for a new player version");
         }
         let dir = self.players_dir.clone();
         let Some(pre) = player_js::load_cached(&dir, player_id, player_js::PREPROCESSED_SUFFIX)
@@ -956,17 +964,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["x"], "kept|n|x|A|1");
-        // A different version replaces the kept one, and switching back runs it again.
+        // A different version replaces the kept one (in a fresh runtime, so the run counter
+        // starts again at 1), and switching back runs it again.
         let got = s
             .solve("0000000b", None, ChallengeKind::N, &["x".into()])
             .await
             .unwrap();
-        assert_eq!(got["x"], "kept|n|x|B|2");
+        assert_eq!(got["x"], "kept|n|x|B|1");
         let got = s
             .solve("0000000a", None, ChallengeKind::N, &["x".into()])
             .await
             .unwrap();
-        assert_eq!(got["x"], "kept|n|x|A|3");
+        assert_eq!(got["x"], "kept|n|x|A|1");
+        // The same version again is answered by the kept player (its run counter stays 1: the
+        // counter counts loads), not by a new runtime.
+        let got = s
+            .solve("0000000a", None, ChallengeKind::N, &["y".into()])
+            .await
+            .unwrap();
+        assert_eq!(got["y"], "kept|n|y|A|1");
     }
 
     #[tokio::test]
