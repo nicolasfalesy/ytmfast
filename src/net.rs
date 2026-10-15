@@ -51,6 +51,22 @@ pub fn allowed_host(url: &Url) -> bool {
     })
 }
 
+/// True when `url` is https on `youtube.com` or one of its subdomains: the only hosts that
+/// may be sent the user's session (cookies, SAPISIDHASH). `allowed_host` is wider, for
+/// links that carry nothing of the user's (thumbnails, media).
+pub fn youtube_host(url: &Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(Host::Domain(host)) = url.host() else {
+        return false;
+    };
+    host == "youtube.com"
+        || host
+            .strip_suffix("youtube.com")
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
 /// A link found in data (a thumbnail) that another program will load: its parsed form when that is
 /// https on an allowed host, else `None`.
 ///

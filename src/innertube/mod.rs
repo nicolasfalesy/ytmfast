@@ -179,6 +179,18 @@ impl Innertube {
         }
     }
 
+    /// Whether a link that came in an answer may be requested WITH THE SESSION (cookies, the
+    /// SAPISIDHASH, the visitor id). Narrower than `target_allows`: the session goes only to
+    /// YouTube's own hosts. The wider list also holds hosts that serve other people's content
+    /// (googleusercontent, googlevideo) and Google sites; a link in an answer naming one of
+    /// those must not get the user's sign-in with it.
+    pub(crate) fn session_link_allows(&self, url: &Url) -> bool {
+        match &self.target {
+            Target::ApiHost => net::youtube_host(url),
+            Target::Fixed(base) => url.origin() == base.origin(),
+        }
+    }
+
     /// One play-history ping: a GET of `url` (a `playbackTracking` link with the report's
     /// parameters added) as the music web client, with the session.
     ///
@@ -191,7 +203,7 @@ impl Innertube {
     /// Errors (fixed text, never the link, ruling R6): `Internal` for a link off the
     /// allowlist (nothing is sent), `SignedOut` for no session or a 401, `Network` otherwise.
     pub async fn ping(&self, url: &Url, visitor_data: Option<&str>) -> Result<(), Error> {
-        if !self.target_allows(url) {
+        if !self.session_link_allows(url) {
             return Err(Error::Internal(
                 "a play-history link is not on an allowed host".into(),
             ));
@@ -579,6 +591,36 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_session_goes_only_to_youtube_hosts() {
+        let store: Arc<dyn SessionStore> = Arc::new(crate::auth::MemoryStore::new());
+        let api = Innertube::production(Arc::default(), store);
+        for ok in [
+            "https://s.youtube.com/api/stats/playback?docid=x",
+            "https://www.youtube.com/ptracking?video_id=x",
+            "https://music.youtube.com/api/stats/watchtime",
+            "https://youtube.com/api/stats/playback",
+        ] {
+            assert!(api.session_link_allows(&url(ok)), "{ok}");
+        }
+        // On the wider allowlist (images, media, Google sites) or not on any: no session.
+        for bad in [
+            "https://rr1---sn-x.googlevideo.com/videoplayback?x=1",
+            "https://i.ytimg.com/vi/x/hq.jpg",
+            "https://yt3.ggpht.com/a",
+            "https://lh3.googleusercontent.com/a",
+            "https://sites.google.com/a",
+            "https://www.google.com/",
+            "https://accounts.google.com/",
+            "https://evilyoutube.com/",
+            "https://youtube.com.example/api/stats/playback",
+            "http://s.youtube.com/api/stats/playback",
+            "https://203.0.113.9/",
+        ] {
+            assert!(!api.session_link_allows(&url(bad)), "{bad}");
+        }
     }
 
     #[test]
