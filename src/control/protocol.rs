@@ -847,6 +847,40 @@ pub fn queue_data(view: &QueueView) -> Value {
     serde_json::to_value(wire).expect("a queue serializes")
 }
 
+/// `queue_data` as text, without the `Value` tree in between (the same text).
+pub fn queue_data_text(view: &QueueView) -> String {
+    let wire = WireQueue::new(
+        None,
+        &view.items,
+        view.current_id,
+        view.shuffle,
+        view.repeat,
+        view.rev,
+    );
+    serde_json::to_string(&wire).expect("a queue serializes")
+}
+
+/// The `queue` event line for `view`: what `event_line` makes of `EngineEvent::Queue`.
+pub fn queue_event_text(view: &QueueView) -> String {
+    let wire = WireQueue::new(
+        Some("queue"),
+        &view.items,
+        view.current_id,
+        view.shuffle,
+        view.repeat,
+        view.rev,
+    );
+    let mut s = serde_json::to_string(&wire).expect("a queue serializes");
+    s.push('\n');
+    s
+}
+
+/// `ok_reply` for a `data` that is already JSON text (a cached queue): the same keys in the
+/// same order, `text` put in as it is.
+pub fn text_reply(id: u64, data_text: &str) -> String {
+    format!("{{\"id\":{id},\"ok\":true,\"data\":{data_text}}}\n")
+}
+
 /// An engine event as a line.
 pub fn event_line(event: &EngineEvent) -> String {
     match event {

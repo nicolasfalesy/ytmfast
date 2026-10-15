@@ -601,6 +601,8 @@ pub struct Engine {
     /// The newest queue event's revision: bumped by every `emit_queue`, 0 before the first.
     /// `QueueGet` answers with it too, so a reply and the event for the same queue match.
     queue_rev: u64,
+    /// The last `queue_view`, for as long as `queue_rev` is the same.
+    view_cache: Option<QueueView>,
     /// The running resolve, aborted when a newer play replaces it.
     resolving: Option<AbortHandle>,
     /// The play's queue request, and what it is for.
@@ -765,6 +767,7 @@ impl Engine {
             generation: 0,
             queue_generation: 0,
             queue_rev: 0,
+            view_cache: None,
             resolving: None,
             loading: None,
             pending: None,
@@ -2676,14 +2679,31 @@ impl Engine {
         self.status.clone()
     }
 
-    fn queue_view(&self) -> QueueView {
-        QueueView {
-            items: self.queue.items().into(),
-            current_id: self.queue.current().map(|i| i.id),
-            shuffle: self.queue.shuffle(),
-            repeat: self.queue.repeat(),
-            rev: self.queue_rev,
+    /// The queue as the widgets see it. Built once per revision (`queue_rev`: every change
+    /// bumps it, with the event that tells the clients) and shared after that: a client asking
+    /// `queue.get` over and over used to copy every item each time. The cheap checks beside the
+    /// revision keep a view that missed a bump (none should) from being handed out stale.
+    fn queue_view(&mut self) -> QueueView {
+        let current_id = self.queue.current().map(|i| i.id);
+        let (shuffle, repeat) = (self.queue.shuffle(), self.queue.repeat());
+        if let Some(v) = &self.view_cache
+            && v.rev == self.queue_rev
+            && v.items.len() == self.queue.items().len()
+            && v.current_id == current_id
+            && v.shuffle == shuffle
+            && v.repeat == repeat
+        {
+            return v.clone();
         }
+        let view = QueueView {
+            items: self.queue.items().into(),
+            current_id,
+            shuffle,
+            repeat,
+            rev: self.queue_rev,
+        };
+        self.view_cache = Some(view.clone());
+        view
     }
 
     /// A change to save after `SAVE_DEBOUNCE` of quiet (restarting that wait), not at once.
@@ -4316,6 +4336,37 @@ mod tests {
         // B's own end counts.
         engine.on_audio(AudioEvent::Ended);
         assert_eq!(engine.status.state, PlayState::Stopped);
+    }
+
+    /// Asking for the queue again with no change between hands back the same items (shared,
+    /// not copied again: a `queue.get` loop used to copy a 1,000-song queue each time); a
+    /// change makes a new copy.
+    #[tokio::test]
+    async fn the_queue_view_is_built_once_per_revision() {
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", Some(0)).await;
+        r.until_song(&vid('A'), PlayState::Playing).await;
+        let a = r.queue().await;
+        let b = r.queue().await;
+        assert!(
+            Arc::ptr_eq(&a.items, &b.items),
+            "copied again with no change"
+        );
+        assert_eq!(a, b);
+        r.send(EngineCmd::QueueAdd {
+            added: oneshot::channel().0,
+            songs: vec![song('D')],
+            at: AddAt::End,
+        })
+        .await;
+        let c = r.queue().await;
+        assert!(!Arc::ptr_eq(&a.items, &c.items));
+        assert_eq!(c.items.len(), 4);
+        assert!(c.rev > a.rev);
     }
 
     /// A queue song is resolved with the title and artist its queue item holds, so the resolve

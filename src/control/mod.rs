@@ -19,6 +19,7 @@
 pub mod idle;
 pub mod lyrics;
 pub mod protocol;
+mod queue_text;
 pub mod stop;
 
 use std::collections::HashMap;
@@ -280,6 +281,8 @@ struct Shared {
     lyrics: LyricsCache,
     /// `Options::client_idle`.
     client_idle: Duration,
+    /// The queue's JSON, kept per revision (`queue.get`, `watch` turned on, `queue` events).
+    queue_text: queue_text::QueueText,
 }
 
 /// Lets a log line through the first time, and then once per `every` at most, counting what
@@ -353,6 +356,7 @@ async fn serve_with(
         hub,
         browser: options.browser,
         client_idle: options.client_idle,
+        queue_text: queue_text::QueueText::default(),
     });
     // Dropping the set when this returns aborts every client task.
     let mut clients = JoinSet::new();
@@ -488,25 +492,20 @@ async fn query_queue(cmds: &mpsc::Sender<EngineCmd>) -> Option<QueueView> {
 /// What a client that fell behind may have missed: the state, and the queue (a missed
 /// queue event would leave a widget's list wrong until the next change) when it watches the
 /// queue (`with_queue`). One line each.
-async fn catch_up(cmds: &mpsc::Sender<EngineCmd>, with_queue: bool) -> Option<Vec<String>> {
+async fn catch_up(shared: &Shared, with_queue: bool) -> Option<Vec<String>> {
+    let cmds = &shared.cmds;
     let status = query_status(cmds).await?;
     let mut lines = vec![protocol::event_line(&EngineEvent::State(status))];
     if with_queue {
-        lines.push(queue_line(cmds).await?);
+        lines.push(queue_line(shared).await?);
     }
     Some(lines)
 }
 
-/// The queue as it is now, as a `queue` event line.
-async fn queue_line(cmds: &mpsc::Sender<EngineCmd>) -> Option<String> {
-    let queue = query_queue(cmds).await?;
-    Some(protocol::event_line(&EngineEvent::Queue {
-        items: queue.items,
-        current_id: queue.current_id,
-        shuffle: queue.shuffle,
-        repeat: queue.repeat,
-        rev: queue.rev,
-    }))
+/// The queue as it is now, as a `queue` event line (the text kept for its revision).
+async fn queue_line(shared: &Shared) -> Option<String> {
+    let queue = query_queue(&shared.cmds).await?;
+    Some(shared.queue_text.event(&queue).to_string())
 }
 
 /// The position as it is now, as a plain `position` event line (not a seek's).
@@ -586,7 +585,7 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                             // paused song sends no tick, so its slider would stay wrong.
                             let mut fresh = Vec::new();
                             if watch_queue && !queue_was {
-                                fresh.push(queue_line(&shared.cmds).await);
+                                fresh.push(queue_line(&shared).await);
                             }
                             if watch_position && !position_was {
                                 fresh.push(position_line(&shared.cmds).await);
@@ -672,9 +671,14 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
                     // Nor the position (a seek's included: whoever turns it back on gets the
                     // position as it is then).
                     Ok(EngineEvent::Position { .. }) if !watch_position => true,
+                    // The queue's text is made once per revision for every client.
+                    Ok(EngineEvent::Queue { items, current_id, shuffle, repeat, rev }) => {
+                        let view = QueueView { items, current_id, shuffle, repeat, rev };
+                        push(&out, shared.queue_text.event(&view).to_string())
+                    }
                     Ok(e) => push(&out, protocol::event_line(&e)),
                     // It missed some events: a fresh state and queue cover them.
-                    Err(RecvError::Lagged(_)) => match catch_up(&shared.cmds, watch_queue).await {
+                    Err(RecvError::Lagged(_)) => match catch_up(&shared, watch_queue).await {
                         Some(lines) => lines.into_iter().all(|l| push(&out, l)),
                         None => break Close::Flush,
                     },
@@ -779,7 +783,7 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
         }
         Request::QueueGet => {
             return Handled::Reply(match query_queue(&shared.cmds).await {
-                Some(q) => protocol::ok_reply(id, protocol::queue_data(&q)),
+                Some(q) => protocol::text_reply(id, &shared.queue_text.data(&q)),
                 None => gone(),
             });
         }
