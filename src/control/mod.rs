@@ -113,6 +113,12 @@ pub struct Options {
     /// reaches them by accident: `lyrics` then gives YouTube Music's plain lyrics only. The
     /// daemon passes `lyrics::HttpWeb`.
     pub lyrics_web: Option<Arc<dyn crate::lyrics::LyricsWeb>>,
+    /// How many clients may be connected at once (`MAX_CLIENTS`); one more is told why and
+    /// closed. Every client holds a descriptor and some memory.
+    pub max_clients: usize,
+    /// How long a connection that has not sent a single request may stay connected
+    /// (`CLIENT_IDLE`). One that has asked or watched is a client and stays.
+    pub client_idle: Duration,
 }
 
 impl std::fmt::Debug for Options {
@@ -123,6 +129,8 @@ impl std::fmt::Debug for Options {
             .field("mpris", &self.mpris)
             .field("browser", &self.browser.is_some())
             .field("lyrics_web", &self.lyrics_web.is_some())
+            .field("max_clients", &self.max_clients)
+            .field("client_idle", &self.client_idle)
             .finish()
     }
 }
@@ -135,9 +143,22 @@ impl Default for Options {
             mpris: None,
             browser: None,
             lyrics_web: None,
+            max_clients: MAX_CLIENTS,
+            client_idle: CLIENT_IDLE,
         }
     }
 }
+
+/// Clients connected at once. The bar's widget holds one (the engine's own `play` command and
+/// a script or two make a few more); this stops idle connections from using up the
+/// descriptors (a limit of 1,024) and memory, which cost the daemon its ability to accept.
+pub const MAX_CLIENTS: usize = 64;
+
+/// A connection that sends nothing at all (no request, no `watch`) for this long is closed.
+/// Once it has sent one, it is a client and stays as long as it likes: the bar widget asks for
+/// the status as soon as it connects and then only listens, for hours, and a listener must
+/// not be told to leave.
+pub const CLIENT_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// Why the daemon stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +278,52 @@ struct Shared {
     browser: Option<Arc<dyn Browser>>,
     /// Lyrics answers kept for every client, and the engine's Lyrics tabs.
     lyrics: LyricsCache,
+    /// `Options::client_idle`.
+    client_idle: Duration,
+}
+
+/// Lets a log line through the first time, and then once per `every` at most, counting what
+/// it held back. For lines a client or the system can make the daemon write over and over
+/// (a refused connection, a failing accept): one a minute is enough to see it, and a
+/// journal flooded at ten lines a second helps nobody.
+struct LogGate {
+    last: Option<Instant>,
+    held_back: u64,
+}
+
+impl LogGate {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    fn new() -> LogGate {
+        LogGate {
+            last: None,
+            held_back: 0,
+        }
+    }
+
+    /// `Some(n)` when the line may be written now, `n` being how many were held back since the
+    /// last one; `None` when it is held back.
+    fn allow(&mut self, now: Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.duration_since(last) < Self::EVERY => {
+                self.held_back += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.held_back))
+            }
+        }
+    }
+}
+
+/// " (and N more since the last)" for a log line that held some back, else nothing.
+fn more_since(held_back: u64) -> String {
+    if held_back == 0 {
+        String::new()
+    } else {
+        format!(" ({held_back} more since the last such line)")
+    }
 }
 
 /// Serves the socket until `quit`, idle, or the engine stopping. Leaves the engine running.
@@ -285,9 +352,13 @@ async fn serve_with(
         events,
         hub,
         browser: options.browser,
+        client_idle: options.client_idle,
     });
     // Dropping the set when this returns aborts every client task.
     let mut clients = JoinSet::new();
+    let max_clients = options.max_clients;
+    let mut refused_log = LogGate::new();
+    let mut accept_log = LogGate::new();
     let policy = options.idle;
     let root = options.power_supply_root;
     let mut playing = false;
@@ -307,14 +378,42 @@ async fn serve_with(
                     let allowed = stream
                         .peer_cred()
                         .is_ok_and(|c| peer_allowed(c.uid(), my_uid));
-                    if allowed {
-                        clients.spawn(client(stream, shared.clone()));
-                    } else {
+                    if !allowed {
                         eprintln!("ytmfast: refused a connection from another user");
+                    } else if clients.len() >= max_clients {
+                        // Told why, in one line, then closed: a script that keeps opening
+                        // connections finds out, and the clients inside are not crowded.
+                        // Written without waiting (one short line into a new socket's empty
+                        // buffer always fits), so a refused client can't hold the hub up, and
+                        // the descriptor is closed at once, not after a task has run.
+                        if let Ok(mut plain) = stream.into_std() {
+                            let _ = io::Write::write_all(
+                                &mut plain,
+                                protocol::error_reply(
+                                    None,
+                                    "unavailable",
+                                    "too many connections; close one and try again",
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        if let Some(held_back) = refused_log.allow(Instant::now()) {
+                            eprintln!(
+                                "ytmfast: refused a connection: {max_clients} clients are \
+                                 already connected{}",
+                                more_since(held_back)
+                            );
+                        }
+                    } else {
+                        clients.spawn(client(stream, shared.clone()));
                     }
                 }
                 Err(e) => {
-                    eprintln!("ytmfast: accept failed: {e}");
+                    // Out of descriptors, say: the same error every 100 ms until one frees,
+                    // so the journal gets the first and then one a minute.
+                    if let Some(held_back) = accept_log.allow(Instant::now()) {
+                        eprintln!("ytmfast: accept failed: {e}{}", more_since(held_back));
+                    }
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             },
@@ -451,14 +550,22 @@ async fn client(stream: UnixStream, shared: Arc<Shared>) {
     // `watch {"position": false}` turns this off (ruling P22): a bar with every panel closed
     // shows no position, and a line a second while playing would wake the shell for nothing.
     let mut watch_position = true;
+    // A connection that never sends a request is not using the socket: it is closed after
+    // `client_idle`, so connections left open can't use up the daemon's descriptors. The first
+    // request (a `watch` is one) makes it a client, and the wait ends for good.
+    let quiet = tokio::time::sleep(shared.client_idle);
+    tokio::pin!(quiet);
+    let mut spoke = false;
 
     let close = loop {
         tokio::select! {
+            () = &mut quiet, if !spoke => break Close::Flush,
             line = lines.next(), if reading => match line {
                 Ok(Line::Text(text)) => {
                     if text.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
+                    spoke = true;
                     let reply = match handle(&shared, &text).await {
                         Handled::Reply(reply) => reply,
                         Handled::Quit(reply) => {
@@ -1117,6 +1224,25 @@ pub fn bind_socket(path: &Path) -> io::Result<(std::os::unix::net::UnixListener,
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_repeating_log_line_is_written_once_a_minute() {
+        // A failing accept comes every 100 ms (`ACCEPT_BACKOFF`): 120 lines in 12 s without the
+        // gate, one with it, and one a minute after.
+        let start = Instant::now();
+        let mut gate = LogGate::new();
+        let mut written = Vec::new();
+        for tick in 0..1300u64 {
+            let now = start + Duration::from_millis(100 * tick);
+            if let Some(held_back) = gate.allow(now) {
+                written.push((tick, held_back));
+            }
+        }
+        // At 0 s, then at 60 s and 120 s: each says how many it held back.
+        assert_eq!(written, [(0, 0), (600, 599), (1200, 599)]);
+        assert_eq!(more_since(0), "");
+        assert!(more_since(599).contains("599 more"));
+    }
 
     #[test]
     fn peer_uid_checked() {
