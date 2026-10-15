@@ -109,9 +109,41 @@ const ALL_AGREE: &str = r#"(_input) => {
   return _results.values().next().value;
 }"#;
 
+/// How many brackets (`(`, `[`, `{`) may be open at once. Real players stay far below this
+/// (their deepest nesting is in the low hundreds); the parser's stack is good for much more.
+const MAX_NESTING: usize = 1000;
+
+/// True when more than `limit` brackets are ever open at once. Counts every bracket byte,
+/// string and regex contents included: that can only over-count, and an over-count only
+/// sends the script to the QuickJS path, which gives the same answers.
+fn nests_deeper_than(src: &str, limit: usize) -> bool {
+    let mut depth = 0usize;
+    for b in src.bytes() {
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The preprocessed player, as `jsc` would make it (same behaviour, not the same text), or
 /// `None` when the player doesn't have the shape `core` expects.
 pub fn preprocess(player: &str) -> Option<String> {
+    // Before the parser: oxc recurses once per nesting level on this thread's stack (a
+    // script nested deeper than the stack is a stack overflow, which ends the whole daemon
+    // and not just this call), and its tree grows with the script's size, outside every
+    // QuickJS limit. Both are left to the QuickJS path, which has its own limits.
+    if player.len() > super::player_js::MAX_PLAYER_SCRIPT || nests_deeper_than(player, MAX_NESTING)
+    {
+        return None;
+    }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, player, SourceType::script())
         .with_options(ParseOptions {
@@ -414,5 +446,86 @@ mod tests {
         assert!(preprocess("(function () {").is_none(), "syntax error");
         assert!(preprocess("\"use strict\"; (function () {})();").is_none());
         assert!(preprocess("f();").is_none());
+    }
+
+    /// `[[[[ ... ]]]]` nested `depth` deep, inside the usual wrapper shape so the parser
+    /// reaches the deep part.
+    fn nested(depth: usize) -> String {
+        let mut s = String::from("var p = {};\n(function (g) {\n var w = this; g.x = ");
+        s.push_str(&"[".repeat(depth));
+        s.push_str(&"]".repeat(depth));
+        s.push_str(";\n})(p);\n");
+        s
+    }
+
+    /// Child side of `a_deeply_nested_player_is_left_to_the_js_path`: the prep on a thread
+    /// with the solver thread's stack. Does nothing unless the parent asks.
+    #[test]
+    fn child_prep_deep_nesting() {
+        if std::env::var_os("YTMFAST_PREP_CHILD").is_none() {
+            return;
+        }
+        let src = nested(2_000_000);
+        assert!(src.len() < crate::net::MAX_ANSWER);
+        let t = std::thread::Builder::new()
+            .stack_size(super::super::THREAD_STACK)
+            .spawn(move || preprocess(&src).is_none())
+            .unwrap();
+        assert!(
+            t.join().unwrap(),
+            "a script this deep must be left to the JS path"
+        );
+    }
+
+    /// A script nested deeper than the thread's stack would overflow the native stack: a
+    /// SIGSEGV, not a panic, so it would end the whole daemon (and a cached copy would end it
+    /// again at every restart). Run in a child process, from a copy named `omarchy-crash-*` so
+    /// the crash watcher stays quiet.
+    #[test]
+    fn a_deeply_nested_player_is_left_to_the_js_path() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("YTMFAST_PREP_CHILD").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("omarchy-crash-ytmfast");
+        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        let status = std::process::Command::new(&copy)
+            .args([
+                "--exact",
+                "solver::prep::tests::child_prep_deep_nesting",
+                "--nocapture",
+            ])
+            .env("YTMFAST_PREP_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.signal().is_none() && status.success(),
+            "the child ended with {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_over_the_size_cap_is_left_to_the_js_path() {
+        let mut s = String::from("var p = {};\n(function (g) {\n var w = this; g.x = [");
+        s.push_str(&"0,".repeat(super::super::player_js::MAX_PLAYER_SCRIPT / 2));
+        s.push_str("];\n})(p);\n");
+        assert!(s.len() > super::super::player_js::MAX_PLAYER_SCRIPT);
+        assert!(preprocess(&s).is_none());
+    }
+
+    #[test]
+    fn ordinary_nesting_still_prepares() {
+        // The scan counts brackets, so it must not mistake a real player's nesting for an attack.
+        let mut s = String::from(TINY);
+        s = s.replace(
+            "var window = this;",
+            &format!(
+                "var window = this; var deep = {}1{};",
+                "[".repeat(200),
+                "]".repeat(200)
+            ),
+        );
+        assert!(preprocess(&s).is_some());
     }
 }

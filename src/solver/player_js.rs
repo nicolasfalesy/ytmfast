@@ -8,7 +8,7 @@
 //! (the solver's output), for the last `KEEP_PLAYERS` versions.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -25,6 +25,11 @@ pub const WEB_BASE: &str = "https://www.youtube.com";
 /// on every few days; three covers a roll-back or an A/B split without the folder growing
 /// (each version is about 3 MB of script plus 4 MB preprocessed).
 pub const KEEP_PLAYERS: usize = 3;
+
+/// The biggest player script taken, downloaded or read back from the cache (real ones are
+/// about 3 MB). The Rust prep parses it in memory with no other limit, so a script near the
+/// 32 MiB answer cap would cost over a GiB before QuickJS's own limits apply.
+pub const MAX_PLAYER_SCRIPT: usize = 8 << 20;
 
 /// File suffix of the downloaded script, next to the solver's `{id}.js` preprocessed file.
 pub const BASE_SUFFIX: &str = "base.js";
@@ -71,7 +76,7 @@ async fn get_text(client: &reqwest::Client, url: Url) -> Result<String, Error> {
             status.as_u16()
         )));
     }
-    let body = net::read_capped(resp, net::MAX_ANSWER).await?;
+    let body = net::read_capped(resp, MAX_PLAYER_SCRIPT).await?;
     String::from_utf8(body).map_err(|_| Error::StreamFailed("the player script is not text".into()))
 }
 
@@ -142,7 +147,18 @@ pub fn cache_path(dir: &Path, id: &str, suffix: &str) -> Option<PathBuf> {
 /// recently used version, not just the oldest download.
 pub fn load_cached(dir: &Path, id: &str, suffix: &str) -> Option<String> {
     let path = cache_path(dir, id, suffix)?;
-    let text = fs::read_to_string(&path).ok()?;
+    // Over the cap is not a player we stored (a download is refused at the same size): it is
+    // not read, so a planted or grown file can't cost the memory of a 32 MiB parse.
+    // Read through `take`, so a file that grows while it is read is cut off too.
+    let mut text = String::new();
+    fs::File::open(&path)
+        .ok()?
+        .take(MAX_PLAYER_SCRIPT as u64 + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > MAX_PLAYER_SCRIPT {
+        return None;
+    }
     // Best effort: a failed touch only makes the pruning order a little less exact.
     if let Ok(f) = fs::File::options().write(true).open(&path) {
         let _ = f.set_modified(SystemTime::now());
@@ -323,5 +339,39 @@ mod tests {
             assert!(dir.join(format!("{id}.js")).exists(), "{id}");
         }
         assert!(dir.join("unrelated.txt").exists());
+    }
+
+    #[test]
+    fn a_cached_script_over_the_cap_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("0000000a.base.js"),
+            vec![b' '; MAX_PLAYER_SCRIPT + 1],
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("0000000b.base.js"),
+            vec![b' '; MAX_PLAYER_SCRIPT],
+        )
+        .unwrap();
+        assert_eq!(load_cached(tmp.path(), "0000000a", BASE_SUFFIX), None);
+        assert!(load_cached(tmp.path(), "0000000b", BASE_SUFFIX).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_script_over_the_cap_is_refused() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_PLAYER_SCRIPT + 1]),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let http = net::client("ytmfast-test/0");
+        let e = fetch_player(&http, &base, "0000000a").await.unwrap_err();
+        assert_eq!(e.code(), "network", "{e}");
     }
 }
