@@ -78,6 +78,13 @@ pub trait Renew: Send + Sync {
     fn stamp(&self) -> Option<i64> {
         None
     }
+
+    /// `Some(stamp)` when the answer is known without reading the browser's file (it is
+    /// unchanged since the last `stamp`: one `stat`, cheap enough for the runtime's own thread);
+    /// `None` when `stamp` must run off the runtime.
+    fn cached_stamp(&self) -> Option<Option<i64>> {
+        None
+    }
 }
 
 struct Renewal {
@@ -354,8 +361,20 @@ impl Innertube {
         let Some(r) = &self.renewal else {
             return false;
         };
-        let hook = r.hook.clone();
-        let Ok(Some(stamp)) = tokio::task::spawn_blocking(move || hook.stamp()).await else {
+        // The once-a-minute look: when the browser's cookie file is unchanged this is a stat, and
+        // it is answered right here. A blocking-pool thread (made, woken and ended again each
+        // minute) is only worth it for the rare read of a changed file.
+        let stamp = match r.hook.cached_stamp() {
+            Some(known) => known,
+            None => {
+                let hook = r.hook.clone();
+                match tokio::task::spawn_blocking(move || hook.stamp()).await {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                }
+            }
+        };
+        let Some(stamp) = stamp else {
             return false;
         };
         let current = self

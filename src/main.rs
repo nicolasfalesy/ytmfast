@@ -388,6 +388,17 @@ impl Renew for BraveRenew {
         *last = Some((key.0, key.1, stamp));
         stamp
     }
+
+    fn cached_stamp(&self) -> Option<Option<i64>> {
+        let db = chromium::find_database(&self.profile)?;
+        let meta = std::fs::metadata(&db).ok()?;
+        let key = (meta.len(), meta.modified().ok()?);
+        let last = self.last_look.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some((len, time, stamp)) if (len, time) == key => Some(stamp),
+            _ => None,
+        }
+    }
 }
 
 /// `session` (whose account check found `account`) when that is the account `want`, with the

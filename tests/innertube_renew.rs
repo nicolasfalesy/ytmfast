@@ -48,6 +48,10 @@ struct Hook {
     seen: Mutex<Vec<Session>>,
     /// What `stamp` answers: the browser's sign-in stamp.
     stamp: Mutex<Option<i64>>,
+    /// Whether `cached_stamp` answers (the browser's file is unchanged), and how often the
+    /// blocking `stamp` was called.
+    cached: std::sync::atomic::AtomicBool,
+    stamp_calls: AtomicUsize,
 }
 
 impl Hook {
@@ -58,6 +62,8 @@ impl Hook {
             delay,
             seen: Mutex::new(Vec::new()),
             stamp: Mutex::new(None),
+            cached: std::sync::atomic::AtomicBool::new(false),
+            stamp_calls: AtomicUsize::new(0),
         })
     }
 
@@ -80,7 +86,14 @@ impl Renew for Hook {
     }
 
     fn stamp(&self) -> Option<i64> {
+        self.stamp_calls.fetch_add(1, Ordering::SeqCst);
         *self.stamp.lock().unwrap()
+    }
+
+    fn cached_stamp(&self) -> Option<Option<i64>> {
+        self.cached
+            .load(Ordering::SeqCst)
+            .then(|| *self.stamp.lock().unwrap())
     }
 }
 
@@ -185,6 +198,31 @@ async fn requests_signed_out_together_renew_once() {
     let (a, b) = tokio::join!(home(&rig), home(&rig));
     assert_eq!((a, b), (Ok(()), Ok(())));
     assert_eq!(hook.calls(), 1);
+}
+
+/// The once-a-minute look at an unchanged browser file is answered from the hook's cache on the
+/// runtime's own thread: the blocking `stamp` (a thread of the blocking pool, made and ended
+/// each minute) is only called when the file changed. Same results either way.
+#[tokio::test]
+async fn an_unchanged_browser_file_is_answered_without_a_blocking_call() {
+    let hook = Hook::new(true, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    *hook.stamp.lock().unwrap() = Some(100);
+    // Changed (nothing cached yet): the blocking call reads it, and the copy is taken.
+    assert!(rig.api.follow_browser().await);
+    assert_eq!(hook.stamp_calls.load(Ordering::SeqCst), 1);
+    // Unchanged from now on: a minute's look is answered without `stamp`, 60 times over.
+    hook.cached.store(true, Ordering::SeqCst);
+    for _ in 0..60 {
+        assert!(!rig.api.follow_browser().await);
+    }
+    assert_eq!(hook.stamp_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls(), 1);
+    // The cached answer still moves things when it is newer than the copy.
+    *hook.stamp.lock().unwrap() = Some(200);
+    assert!(rig.api.follow_browser().await);
+    assert_eq!(hook.stamp_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.calls(), 2);
 }
 
 #[tokio::test]
