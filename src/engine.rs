@@ -349,6 +349,12 @@ const PRELOAD_LEAD_SECS: f64 = 10.0;
 /// Constraints), so a crash or a power loss loses at most that much of the song.
 const SAVE_EVERY_TICKS: u32 = 30;
 
+/// A volume, mute, seek, shuffle or repeat change is saved this long after the last one (a
+/// trailing-edge debounce): a volume drag sends several changes a second, and each save is a
+/// full rewrite of state.json with two fsyncs. A pause, stop, quit or song change saves at
+/// once and takes the pending changes with it; the 30 s save while playing does too.
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+
 /// How many songs' like statuses (and Lyrics tabs) are kept (the last learned), so a song
 /// played again (or gone back to) needs no new request.
 const LIKES_KEPT: usize = 100;
@@ -656,6 +662,10 @@ pub struct Engine {
     /// Something worth saving changed (a song, the queue, a pause, a seek, the volume). Saved
     /// once the command or event at hand is handled, so a burst of changes is one snapshot.
     dirty: bool,
+    /// When a change that can wait (volume, mute, seek, shuffle, repeat) is saved, if nothing
+    /// else saves first (`SAVE_DEBOUNCE` after the last such change). Any save clears it: the
+    /// snapshot holds those changes too.
+    save_at: Option<Instant>,
     /// Position ticks since the last save; `SAVE_EVERY_TICKS` of them save again. The ticker
     /// only runs while playing, so this 30 s timer only exists then too.
     ticks_since_save: u32,
@@ -784,6 +794,7 @@ impl Engine {
             ticker: None,
             writer: None,
             dirty: false,
+            save_at: None,
             ticks_since_save: 0,
             restored: false,
             seeked_to: None,
@@ -890,6 +901,8 @@ impl Engine {
                 Some(n) = self.like_news_rx.recv() => self.on_like_news(n),
                 Some(e) = audio.recv() => self.on_audio(e),
                 () = next_tick(&mut self.ticker) => self.on_tick(),
+                // A burst of volume, seek, mute, shuffle or repeat changes has settled.
+                () = save_due(self.save_at) => self.dirty = true,
             }
             if self.dirty {
                 self.write_state();
@@ -1007,13 +1020,13 @@ impl Engine {
             }
             EngineCmd::Shuffle(on) => {
                 self.queue.set_shuffle(on);
-                self.emit_queue();
-                self.emit_state();
+                self.emit_queue_soon();
+                self.emit_state_unsaved();
             }
             EngineCmd::Repeat(repeat) => {
                 self.queue.set_repeat(repeat);
-                self.emit_queue();
-                self.emit_state();
+                self.emit_queue_soon();
+                self.emit_state_unsaved();
                 // Repeat off can leave the queue short of songs.
                 self.maybe_refill();
             }
@@ -2012,7 +2025,7 @@ impl Engine {
             seeked: true,
         });
         self.seeked_to = Some(at);
-        self.dirty = true;
+        self.save_soon();
     }
 
     /// The output's volume was changed in a mixer: the status shows it and it is saved, but
@@ -2040,8 +2053,8 @@ impl Engine {
         }
         self.status.volume = v;
         self.status.muted = false;
-        self.dirty = true;
-        self.emit_state();
+        self.save_soon();
+        self.emit_state_unsaved();
     }
 
     /// Also unmutes: setting the volume while muted means the user wants to hear it.
@@ -2053,8 +2066,8 @@ impl Engine {
         self.player.set_volume(v);
         self.status.volume = v;
         self.status.muted = false;
-        self.dirty = true;
-        self.emit_state();
+        self.save_soon();
+        self.emit_state_unsaved();
     }
 
     /// The output's volume goes to 0 (or back to `status.volume`); the volume itself is kept,
@@ -2066,8 +2079,8 @@ impl Engine {
         self.player
             .set_volume(if on { 0.0 } else { self.status.volume });
         self.status.muted = on;
-        self.dirty = true;
-        self.emit_state();
+        self.save_soon();
+        self.emit_state_unsaved();
     }
 
     /// The song shown changed: its like status is what is known of it (often nothing yet),
@@ -2368,6 +2381,10 @@ impl Engine {
         }
         let seconds = self.player.position();
         self.status.position = seconds;
+        // A whole second after a seek (the tick restarts then) the audio thread has taken it,
+        // so its position is the true one; a save made now (the debounced one or the 30 s one)
+        // must not write the seek's target any more.
+        self.seeked_to = None;
         if let Some(r) = &self.report {
             r.tick(seconds);
         }
@@ -2669,10 +2686,26 @@ impl Engine {
         }
     }
 
+    /// A change to save after `SAVE_DEBOUNCE` of quiet (restarting that wait), not at once.
+    fn save_soon(&mut self) {
+        self.save_at = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
     /// Also marks the state for saving: every queue change, and every song change (which
     /// moves the current item), comes through here.
     fn emit_queue(&mut self) {
         self.dirty = true;
+        self.emit_queue_event();
+    }
+
+    /// `emit_queue` for a change that can wait to be saved (shuffle and repeat only move how
+    /// the queue is played, not what it holds).
+    fn emit_queue_soon(&mut self) {
+        self.save_soon();
+        self.emit_queue_event();
+    }
+
+    fn emit_queue_event(&mut self) {
         self.queue_rev += 1;
         let QueueView {
             items,
@@ -2697,6 +2730,14 @@ impl Engine {
         if matches!(status.state, PlayState::Paused | PlayState::Stopped) {
             self.dirty = true;
         }
+        self.emit(EngineEvent::State(status));
+    }
+
+    /// `emit_state` for a change that is saved on its own schedule (`save_soon`): a volume or
+    /// mute change, shuffle or repeat, made while paused or stopped, must not save at once
+    /// just because the state it reports is a paused one.
+    fn emit_state_unsaved(&mut self) {
+        let status = self.snapshot();
         self.emit(EngineEvent::State(status));
     }
 
@@ -2750,6 +2791,7 @@ impl Engine {
     /// Hands a snapshot to the writer (which writes it on its own thread).
     fn write_state(&mut self) {
         self.dirty = false;
+        self.save_at = None;
         self.ticks_since_save = 0;
         if self.writer.is_some() {
             let saved = self.saved();
@@ -2852,6 +2894,14 @@ fn song_meta(song: &SongItem, resolved: Option<&TrackMeta>) -> Option<TrackMeta>
             .clone()
             .or_else(|| resolved.and_then(|m| m.thumbnail.clone())),
     })
+}
+
+/// Waits until a change that waited to be saved is due; never, while none is.
+async fn save_due(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Waits for the position clock's next tick; never, while there is no clock.
@@ -6144,11 +6194,14 @@ mod tests {
         assert_eq!(saves.lock().unwrap().last().unwrap().position, paused_at);
         // A seek, a volume change and a queue change are each saved. (Each followed by a
         // status round trip: `saves_settle` blocks this thread, which the engine shares.)
+        // (A seek and a volume change wait out `SAVE_DEBOUNCE` first.)
         r.send(EngineCmd::Seek(0.5)).await;
+        tokio::time::sleep(SAVE_DEBOUNCE + Duration::from_millis(100)).await;
         r.status().await;
         assert_eq!(saves_settle(&saves, base + 3), base + 3, "seek saves");
         assert_eq!(saves.lock().unwrap().last().unwrap().position, 0.5);
         r.send(EngineCmd::Volume(0.25)).await;
+        tokio::time::sleep(SAVE_DEBOUNCE + Duration::from_millis(100)).await;
         r.status().await;
         assert_eq!(saves_settle(&saves, base + 4), base + 4, "volume saves");
         r.send(EngineCmd::QueueAdd {
@@ -6166,6 +6219,76 @@ mod tests {
         let last = saves.lock().unwrap().last().unwrap().clone();
         assert_eq!(last.volume, 0.25);
         assert_eq!(last.queue.len(), 2);
+    }
+
+    /// A volume drag, a run of seeks, mute and shuffle/repeat toggles are saved once their
+    /// burst has settled (2 s after the last), not once each: 20 volume changes in a second are
+    /// one rewrite of state.json (two fsyncs), not 20. A pause (or stop, quit, song change)
+    /// still saves at once, and takes the pending changes with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_volume_changes_is_one_save() {
+        let (writer, saves) = recorder();
+        let mut r = rig(Setup {
+            writer: Some(writer),
+            ..Setup::default()
+        })
+        .await;
+        let (_dog, mut bark) = watchdog(Duration::from_secs(30));
+        r.play("AAAAAAAAAAA").await;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut r, &mut bark).await
+                && s.state == PlayState::Playing
+            {
+                break;
+            }
+        }
+        let base = saves_settle(&saves, 1);
+        for i in 0..20 {
+            r.send(EngineCmd::Volume(0.1 + 0.04 * i as f32)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        r.status().await;
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            saves.lock().unwrap().len(),
+            base,
+            "nothing while it goes on"
+        );
+        tokio::time::sleep(SAVE_DEBOUNCE + Duration::from_millis(100)).await;
+        r.status().await;
+        assert_eq!(
+            saves_settle(&saves, base + 1),
+            base + 1,
+            "one save for the whole burst"
+        );
+        let last = saves.lock().unwrap().last().unwrap().clone();
+        assert!(
+            (last.volume - 0.86).abs() < 1e-4,
+            "the last value: {}",
+            last.volume
+        );
+        // A burst of toggles that ends in a pause: the pause saves at once, with them in it,
+        // and the timer they started has nothing left to save.
+        r.send(EngineCmd::Shuffle(true)).await;
+        r.send(EngineCmd::Volume(0.3)).await;
+        r.send(EngineCmd::Pause).await;
+        loop {
+            if let EngineEvent::State(s) = next_real(&mut r, &mut bark).await
+                && s.state == PlayState::Paused
+            {
+                break;
+            }
+        }
+        assert_eq!(saves_settle(&saves, base + 2), base + 2, "the pause saves");
+        let last = saves.lock().unwrap().last().unwrap().clone();
+        assert!(last.shuffle && (last.volume - 0.3).abs() < 1e-4);
+        tokio::time::sleep(SAVE_DEBOUNCE * 3).await;
+        r.status().await;
+        assert_eq!(
+            saves_settle(&saves, base + 3),
+            base + 2,
+            "no second save from the settled timer"
+        );
     }
 
     #[tokio::test(start_paused = true)]
