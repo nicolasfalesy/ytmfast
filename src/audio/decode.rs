@@ -637,7 +637,9 @@ fn find_elst(moov: &[u8]) -> Option<i64> {
     let version = *elst.first()?;
     let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?);
     let entry = if version == 1 { 20 } else { 12 };
-    (0..count as usize).find_map(|i| {
+    // `count` is the file's own number, up to 4 billion: the walk ends at the first entry the
+    // box cannot hold (every later one is past the end too), not after `count` empty tries.
+    for i in 0..count as usize {
         let e = elst.get(8 + i * entry..8 + (i + 1) * entry)?;
         let media_time = if version == 1 {
             i64::from_be_bytes(e[8..16].try_into().ok()?)
@@ -645,8 +647,11 @@ fn find_elst(moov: &[u8]) -> Option<i64> {
             i64::from(i32::from_be_bytes(e[4..8].try_into().ok()?))
         };
         // -1 is an empty edit (a gap before the media): skip it.
-        (media_time >= 0).then_some(media_time)
-    })
+        if media_time >= 0 {
+            return Some(media_time);
+        }
+    }
+    None
 }
 
 /// The payload of the first child box of type `kind` in `parent`.
@@ -838,5 +843,23 @@ mod tests {
         assert_eq!(out, [0.1, 0.1, 0.2, 0.2]);
         to_stereo(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 3, &mut out);
         assert_eq!(out, [0.1, 0.2, 0.4, 0.5]);
+    }
+
+    /// The entry count is the file's own 32-bit number: a 16-byte `elst` that claims 4
+    /// billion entries must end at its first missing one, not count to the end (this runs
+    /// on the audio thread, where playback commands wait for it).
+    #[test]
+    fn an_edit_list_claiming_billions_of_entries_ends_at_its_box() {
+        let mut p = vec![0, 0, 0, 0];
+        p.extend_from_slice(&u32::MAX.to_be_bytes());
+        let moov = bx(b"trak", &bx(b"edts", &bx(b"elst", &p)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(find_elst(&moov));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("find_elst was still counting entries after 2 s");
+        assert_eq!(got, None);
     }
 }
