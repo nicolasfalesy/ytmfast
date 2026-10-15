@@ -25,3 +25,8 @@ tone_c_44k.m4a  3 s of an 880 Hz sine, stereo, AAC-LC 96 kb/s in MP4 (the rate c
   ffmpeg -f lavfi -i sine=frequency=880:sample_rate=44100:duration=3 -ac 2 \
     -c:a aac -b:a 96k -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
     -movflags +faststart tone_c_44k.m4a
+
+damaged_trun_index.m4a, damaged_stream_position.m4a, damaged_zero_rate.m4a  copies of
+  sine440_44k_frag.m4a with 2, 6 and 4 bytes changed (found by a mutation run against the
+  demuxer). The first two made symphonia panic in the MP4 reader; the third states a sample rate
+  of 0. tests/damaged_audio.rs holds what each must give now: an error, never a panic.

@@ -14,7 +14,8 @@
 //! A track at another sample rate can't share the output: the old track plays out, the output
 //! is opened again at the new rate, and the gap that costs is measured and logged.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -134,6 +135,11 @@ impl Readers {
     }
 }
 
+/// The error for a dead audio thread. Not `StreamFailed`: no song is at fault.
+fn thread_gone() -> Error {
+    Error::Internal("the audio thread stopped".into())
+}
+
 fn lock(readers: &Mutex<Readers>) -> MutexGuard<'_, Readers> {
     readers.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -142,6 +148,12 @@ fn lock(readers: &Mutex<Readers>) -> MutexGuard<'_, Readers> {
 pub struct AudioPlayer {
     commands: Sender<Command>,
     events: Receiver<AudioEvent>,
+    /// A sender of the same channel, for news the audio thread can no longer give because it
+    /// is gone (`send`). Held by the handle, which the engine drops before it waits for the
+    /// event channel to close, so it keeps nothing open at quit.
+    news: Sender<AudioEvent>,
+    /// Set once a command found the audio thread gone, so the journal hears it once.
+    gone: AtomicBool,
     /// Seconds into the track, as f64 bits, kept fresh by the audio thread.
     position: Arc<AtomicU64>,
     /// Cancels the loaded and the preloaded tracks' readers. The audio thread can be blocked
@@ -181,6 +193,10 @@ impl AudioPlayer {
         let readers = Arc::new(Mutex::new(Readers::default()));
         let gap_us = Arc::new(AtomicU64::new(NO_GAP));
         let advanced = Arc::new(AtomicU64::new(0));
+        let news = events_tx.clone();
+        // The thread's last word if it panics anywhere outside the decoder (which turns its own
+        // panics into errors): its own sender, dropped when the thread ends.
+        let last_words = events_tx.clone();
         let worker = Worker {
             sink,
             inbox,
@@ -196,11 +212,19 @@ impl AudioPlayer {
         };
         let thread = std::thread::Builder::new()
             .name("ytmfast-audio".into())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                // The worker is dropped inside the closure, so a panic still frees its sink.
+                if catch_unwind(AssertUnwindSafe(|| worker.run())).is_err() {
+                    eprintln!("ytmfast: the audio thread stopped after an internal error");
+                    let _ = last_words.send(AudioEvent::Error(thread_gone()));
+                }
+            })
             .expect("the audio thread should start");
         AudioPlayer {
             commands,
             events,
+            news,
+            gone: AtomicBool::new(false),
             position,
             readers,
             gap_us,
@@ -335,8 +359,19 @@ impl AudioPlayer {
     }
 
     fn send(&self, command: Command) {
-        // Fails only once the thread has gone (it never exits on its own before `Quit`).
-        let _ = self.commands.send(command);
+        // Fails only once the thread has gone: it exits on its own only before `Quit` if it
+        // panicked outside the decoder. That is said once in the journal, and a `load` is
+        // answered like any failed load (its `Loading`, then the error), so the engine
+        // reports the song as failed instead of showing it loading for good.
+        if let Err(failed) = self.commands.send(command) {
+            if !self.gone.swap(true, Ordering::Relaxed) {
+                eprintln!("ytmfast: the audio thread is gone; restart ytmfast to get sound back");
+            }
+            if matches!(failed.0, Command::Load { .. }) {
+                let _ = self.news.send(AudioEvent::Loading);
+                let _ = self.news.send(AudioEvent::Error(thread_gone()));
+            }
+        }
     }
 }
 
@@ -1207,6 +1242,44 @@ mod tests {
         let full = peak(1.0);
         let half = peak(0.5);
         assert!((half / full - 0.5).abs() < 1e-4, "{half} vs {full}");
+    }
+
+    #[test]
+    fn a_dead_audio_thread_is_reported_not_ignored() {
+        // A sink that panics when opened ends the audio thread outside the decoder's own guard.
+        struct Bomb;
+        impl Sink for Bomb {
+            fn open(&mut self, _: u32, _: u16) -> Result<(), Error> {
+                panic!("test sink: open");
+            }
+            fn write(&mut self, _: &[f32]) -> Result<(), Error> {
+                Ok(())
+            }
+            fn pause(&mut self, _: bool) {}
+            fn flush(&mut self) {}
+            fn set_volume(&mut self, _: f32) {}
+            fn delay_frames(&self) -> u64 {
+                0
+            }
+        }
+        let p = AudioPlayer::spawn(Box::new(Bomb));
+        let events = p.events();
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        // The thread's last word, so the song in flight is reported failed.
+        match next_event(&events) {
+            AudioEvent::Error(e) => assert_eq!(e.code(), "internal"),
+            e => panic!("wanted an error, got {e:?}"),
+        }
+        // The next load finds nobody to take it: it is answered, not dropped.
+        while p.thread.as_ref().is_some_and(|t| !t.is_finished()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        p.load(fixture("sine440_48k.webm"), OPUS_MIME, 1.0, 0.0, None);
+        assert_eq!(raw_event(&events), AudioEvent::Loading);
+        match raw_event(&events) {
+            AudioEvent::Error(e) => assert_eq!(e.code(), "internal"),
+            e => panic!("wanted an error, got {e:?}"),
+        }
     }
 
     #[test]

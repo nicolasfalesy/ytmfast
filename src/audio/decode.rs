@@ -19,6 +19,8 @@
 //! exactly on MP4 and within 1 ms on WebM (again its ms timestamps).
 
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_OPUS};
@@ -125,16 +127,36 @@ pub struct Decoder {
     /// The container's extension and type, for that second probe.
     ext: &'static str,
     kind: String,
+    /// A dependency panicked while decoding this track: its state can't be trusted, so every
+    /// later call fails the same way (the audio thread drops the track on the first error).
+    broken: bool,
+}
+
+/// Runs `f`, turning a panic into `None`. symphonia's demuxers panic on some damaged files
+/// (indexing past a table, arithmetic on a bad size), and the file comes off the network.
+/// Without this the panic would end the audio thread, and the daemon would stay up playing
+/// nothing. The panic's own message still goes to the journal (the default hook prints it).
+fn caught<T>(f: impl FnOnce() -> Result<T, Error>) -> Option<Result<T, Error>> {
+    catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
+/// What a caught panic is reported as: the track is damaged, from the user's side.
+fn damaged() -> Error {
+    Error::StreamFailed("damaged audio".into())
 }
 
 impl Decoder {
     /// Opens a track. `mime` is the format's type from the player answer, such as
-    /// `audio/webm; codecs="opus"` or `audio/mp4; codecs="mp4a.40.2"`.
+    /// `audio/webm; codecs="opus"` or `audio/mp4; codecs="mp4a.40.2"`. A panic inside the
+    /// demuxer is an error (`damaged audio`), not a crash.
     pub fn open(reader: TrackReader, mime: &str) -> Result<Decoder, Error> {
-        let spare = reader.sibling();
-        let mut dec = Self::open_source(reader, mime)?;
-        dec.spare = Some(spare);
-        Ok(dec)
+        caught(|| {
+            let spare = reader.sibling();
+            let mut dec = Self::open_source(reader, mime)?;
+            dec.spare = Some(spare);
+            Ok(dec)
+        })
+        .unwrap_or_else(|| Err(damaged()))
     }
 
     fn open_source<R: MediaSource + 'static>(mut source: R, mime: &str) -> Result<Decoder, Error> {
@@ -184,6 +206,8 @@ impl Decoder {
         } else if params.codec == CODEC_ID_AAC {
             let rate = params
                 .sample_rate
+                // A stated rate of 0 would divide by zero in every seek (`frames_to_ts`).
+                .filter(|r| *r > 0)
                 .ok_or_else(|| Error::StreamFailed("the track has no sample rate".into()))?;
             // gapless off: this module does the trimming, and must not have it done twice if
             // a later symphonia starts reading edit lists.
@@ -236,6 +260,7 @@ impl Decoder {
             spare: None,
             ext,
             kind: kind.to_string(),
+            broken: false,
         };
         dec.fill_next()?;
         match &dec.next {
@@ -275,6 +300,18 @@ impl Decoder {
 
     /// The next frames, interleaved stereo; `None` at the end of the track.
     pub fn next_frames(&mut self) -> Result<Option<&[f32]>, Error> {
+        if self.broken {
+            return Err(damaged());
+        }
+        let Some(range) = caught(|| self.next_range()) else {
+            self.broken = true;
+            return Err(damaged());
+        };
+        Ok(range?.map(|r| &self.out[r]))
+    }
+
+    /// `next_frames`, as the range of `out` that holds them.
+    fn next_range(&mut self) -> Result<Option<Range<usize>>, Error> {
         loop {
             let Some(packet) = self.next.take() else {
                 return Ok(None);
@@ -314,13 +351,26 @@ impl Decoder {
                 }
                 continue;
             }
-            return Ok(Some(&self.out[lo as usize * 2..hi as usize * 2]));
+            return Ok(Some(lo as usize * 2..hi as usize * 2));
         }
     }
 
     /// Moves to `seconds`, clamped to the track (at most 1 s before the end, so a seek never
     /// lands on the very end), and returns where output resumes.
     pub fn seek(&mut self, seconds: f64) -> Result<f64, Error> {
+        if self.broken {
+            return Err(damaged());
+        }
+        match caught(|| self.seek_unguarded(seconds)) {
+            Some(r) => r,
+            None => {
+                self.broken = true;
+                Err(damaged())
+            }
+        }
+    }
+
+    fn seek_unguarded(&mut self, seconds: f64) -> Result<f64, Error> {
         let mut target = if seconds.is_finite() {
             seconds.max(0.0)
         } else {
