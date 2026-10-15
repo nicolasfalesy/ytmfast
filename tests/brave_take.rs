@@ -73,9 +73,9 @@ fn a_take_reads_the_cookies_file_once() {
     let read = rchar() - before;
     assert_eq!(session.cookies.len(), 3);
     assert_eq!(stamp, Some(7_000));
-    // Once, with room for the few KB the process reads besides.
+    // Once, plus 20% for the few KB the process reads besides.
     assert!(
-        read < size + size / 4,
+        read < size + size / 5,
         "the take read {read} bytes of a {size}-byte file ({} times)",
         read / size
     );

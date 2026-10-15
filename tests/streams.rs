@@ -1357,6 +1357,36 @@ async fn known_details_keep_oembed_off_the_critical_path() {
     assert!(reqs.iter().all(|q| q.url.path() != "/oembed"));
 }
 
+/// The 50-minute player refresh with the same version as before costs one small request (the
+/// version lookup, about 8.6 KB on the wire when the audit measured it, limit 10.4 KB) and no
+/// download of the 3 MB player script: it is read from the disk copy.
+#[tokio::test]
+async fn a_refresh_to_the_same_player_version_downloads_no_script() {
+    let expire = now() + 6 * 3600;
+    let r = rig(
+        Some(answer(url_format(&stream_url(expire, "")))),
+        FakeSolver::mapping(&[]),
+        FakeYtDlp::failing(),
+    )
+    .await;
+    r.streams.resolve(VIDEO).await.unwrap();
+    let before = r.server.received_requests().await.unwrap().len();
+    r.streams.refresh_player().await;
+    let reqs = r.server.received_requests().await.unwrap();
+    let new: Vec<_> = reqs[before..].iter().map(|q| q.url.path()).collect();
+    assert_eq!(
+        new,
+        ["/iframe_api"],
+        "the refresh made these requests: {new:?}"
+    );
+    assert!(
+        reqs[before..]
+            .iter()
+            .all(|q| q.body.len() + q.url.as_str().len() < 1024),
+        "the refresh request is small"
+    );
+}
+
 #[tokio::test]
 async fn details_missing_everywhere_still_plays() {
     let expire = now() + 6 * 3600;

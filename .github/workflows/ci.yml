@@ -95,3 +95,41 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release --locked
+
+  # The shipped binary (the real release profile, fat LTO) must not grow by more than 20% over
+  # what the audit measured after its fixes (19,154,008 bytes on 2026-10-14).
+  binary-size:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Install toolchain and libraries
+        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Note the compiler version
+        id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-size-${{ steps.rustc.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-size-${{ steps.rustc.outputs.version }}-
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      - name: Check its size
+        run: |
+          size=$(stat -c %s target/release/ytmfast)
+          echo "ytmfast is $size bytes (limit 22990000)"
+          test "$size" -le 22990000

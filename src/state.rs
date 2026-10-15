@@ -1087,6 +1087,46 @@ mod tests {
         }
     }
 
+    /// state.json is rewritten whole on every save, so its size is the wear per save. A full
+    /// 500-song queue of realistic songs was 201,130 bytes when the audit measured it
+    /// (2026-10-14); the limit is that plus 20%. (The time of a save depends on the disk and is
+    /// not pinned here: 1.08 ms for these 500 songs on the laptop's SSD.)
+    #[test]
+    fn a_full_queue_stays_within_its_size_limit() {
+        const LIMIT: u64 = 241_400;
+        let queue: Vec<SongItem> = (0..500)
+            .map(|i| SongItem {
+                video_id: format!("{i:011}"),
+                title: format!("A realistic song title number {i} (Official Audio)"),
+                artists: vec!["Some Artist".into(), "Another Artist".into()],
+                album: Some("An Album Name".into()),
+                album_id: "MPREb_abcdefghijk".into(),
+                thumbnail: Some(format!(
+                    "https://lh3.googleusercontent.com/{}=w544-h544-l90-rj",
+                    "x".repeat(110)
+                )),
+                length_seconds: 200,
+                playlist_id: None,
+                radio: false,
+            })
+            .collect();
+        let saved = Saved {
+            version: VERSION,
+            queue,
+            volume: 0.5,
+            ..Saved::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &saved).unwrap();
+        let size = std::fs::metadata(dir.path().join(FILE_NAME)).unwrap().len();
+        assert!(
+            size <= LIMIT,
+            "state.json is {size} bytes, the limit is {LIMIT}"
+        );
+        // And the limit is not slack: the file really is about this big.
+        assert!(size > 150_000, "state.json is {size} bytes");
+    }
+
     #[test]
     fn a_failing_save_is_logged_first_then_once_a_minute() {
         let mut gate = LogGate::new();
