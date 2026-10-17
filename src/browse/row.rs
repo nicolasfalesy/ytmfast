@@ -9,12 +9,15 @@ use super::{
 };
 
 /// The renderers that are one row each.
-pub(crate) const ITEM_KEYS: [&str; 5] = [
+pub(crate) const ITEM_KEYS: [&str; 6] = [
     "musicResponsiveListItemRenderer",
     "musicTwoRowItemRenderer",
     "musicCardShelfRenderer",
     "playlistPanelVideoRenderer",
     "musicMultiRowListItemRenderer",
+    // Explore's buttons (New releases, Charts, Moods & genres) and the mood and genre tiles:
+    // each opens another page. Not in Page.js, which had no Explore tab.
+    "musicNavigationButtonRenderer",
 ];
 
 /// A renderer's picture: one near 120 px, as an https link on an allowed host, or "".
@@ -221,6 +224,12 @@ pub(crate) fn item(key: &str, r: &Value) -> Option<Row> {
             it.title = text(r.get("title"));
             it.subtitle = text(r.get("subtitle"));
             it.play = play_of(r.get("thumbnailOverlay"));
+        }
+        "musicNavigationButtonRenderer" => {
+            it.title = text(r.get("buttonText"));
+            // The button's browse link (with the `params` a mood or genre page needs) is its
+            // `clickCommand`; it plays nothing.
+            nav = r.get("clickCommand");
         }
         "musicCardShelfRenderer" => {
             it.title = text(r.get("title"));

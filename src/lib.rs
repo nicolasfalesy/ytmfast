@@ -11,6 +11,7 @@ pub mod loggate;
 pub mod lyrics;
 pub mod mpris;
 pub mod net;
+pub mod offsets;
 pub mod paths;
 pub mod queue;
 pub mod report;

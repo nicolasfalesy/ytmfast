@@ -29,6 +29,7 @@ use ytmfast::engine::{
 use ytmfast::error::Error;
 use ytmfast::innertube::{MoreKind, NextPage, NextRequest, SongItem, SongNext};
 use ytmfast::lyrics::{Fetched, Found, LyricsWeb, SongFacts};
+use ytmfast::offsets::LyricsOffsets;
 use ytmfast::queue::Repeat;
 use ytmfast::streams::{Resolver, Stream};
 
@@ -53,6 +54,10 @@ struct FakeBrowser {
     tabs: HashMap<String, String>,
     /// Lyrics by lyrics page id (a page not here has no text).
     lyrics: HashMap<String, Lyrics>,
+    /// Related tabs by video id (a song not here has none).
+    related: HashMap<String, String>,
+    /// Where the rig keeps lyrics shifts, when a test wants to look at them.
+    offsets: Option<Arc<LyricsOffsets>>,
 }
 
 impl FakeBrowser {
@@ -117,6 +122,7 @@ impl Browser for FakeBrowser {
         Ok(SongNext {
             like: None,
             lyrics_tab: self.tabs.get(video_id).cloned(),
+            related_tab: self.related.get(video_id).cloned(),
         })
     }
 
@@ -183,6 +189,7 @@ fn status() -> Status {
         shuffle: false,
         repeat: Repeat::Off,
         liked: None,
+        sleep: None,
     }
 }
 
@@ -277,6 +284,7 @@ fn rig_with(mut browser: FakeBrowser, facts: Facts, web: Option<Arc<dyn LyricsWe
     std::fs::write(ac.join("type"), "Mains\n").unwrap();
     std::fs::write(ac.join("online"), "1\n").unwrap();
     let options = Options {
+        lyrics_offsets: browser.offsets.take(),
         browser: Some(Arc::new(browser)),
         lyrics_web: web,
         power_supply_root: power,
@@ -1178,12 +1186,13 @@ async fn lyrics_found() {
             "source": "Source: Musixmatch", "synced": false, "words": false,
             "lines": [{"text": "First line"}, {"text": "Second line"}, {"text": ""},
                       {"text": "Chorus"}],
+            "offset": 0.0,
         }})
     );
     assert_eq!(
         serde_json::to_string(&v["data"]).unwrap(),
-        r#"{"source":"Source: Musixmatch","synced":false,"words":false,"lines":[{"text":"First line"},{"text":"Second line"},{"text":""},{"text":"Chorus"}]}"#,
-        "the field order is the spec's"
+        r#"{"source":"Source: Musixmatch","synced":false,"words":false,"lines":[{"text":"First line"},{"text":"Second line"},{"text":""},{"text":"Chorus"}],"offset":0.0}"#,
+        "the field order is the spec's, the shift last"
     );
     assert_eq!(
         r.calls(),
@@ -1544,7 +1553,8 @@ async fn lyrics_timed_from_lrclib() {
     assert_eq!(
         v["data"],
         json!({"source": "LRCLIB", "synced": true, "words": false,
-               "lines": [{"t": 1.5, "text": "One"}, {"t": 4.25, "text": "Two"}]})
+               "lines": [{"t": 1.5, "text": "One"}, {"t": 4.25, "text": "Two"}],
+               "offset": 0.0})
     );
     assert!(
         r.calls().is_empty(),
@@ -1687,4 +1697,178 @@ async fn lyrics_asked_before_the_details_land_wait_for_them() {
     assert_eq!(v["data"]["lines"][1]["t"], 4.25);
     assert!(started.elapsed() >= Duration::from_millis(200), "it waited");
     assert!(calls.lock().unwrap().is_empty(), "YouTube Music not asked");
+}
+
+/// A Related page for the tests: one shelf with one song.
+fn related_page() -> Page {
+    Page {
+        header: PageHeader::default(),
+        sections: vec![section("You might also like", vec![song_row(SONG)])],
+        cont: String::new(),
+    }
+}
+
+const RELATED_TAB: &str = "MPTRt_fakeTab";
+
+/// `related` reads the song's Related tab from its `next`, then browses that page; nothing
+/// else is asked, and the reply is an ordinary page.
+#[tokio::test]
+async fn related_browses_the_songs_related_tab() {
+    let r = rig(FakeBrowser {
+        related: HashMap::from([(SONG.to_string(), RELATED_TAB.to_string())]),
+        pages: HashMap::from([(RELATED_TAB.to_string(), related_page())]),
+        ..FakeBrowser::default()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "related", json!({"videoId": SONG})).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["data"]["sections"][0]["title"], "You might also like");
+    assert_eq!(v["data"]["sections"][0]["items"][0]["videoId"], SONG);
+    assert_eq!(
+        r.calls(),
+        [format!("next {SONG}"), format!("browse {RELATED_TAB} -")]
+    );
+}
+
+/// A song with no Related tab (a user upload, say) gets an empty page, not an error, and
+/// costs one request.
+#[tokio::test]
+async fn related_for_a_song_with_no_tab_is_an_empty_page() {
+    let r = rig(FakeBrowser::default());
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "related", json!({"videoId": SONG})).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["data"]["sections"], json!([]));
+    assert_eq!(r.calls(), [format!("next {SONG}")]);
+}
+
+/// Failures and bad ids answer the asker alone, with a code and no value in the message.
+#[tokio::test]
+async fn related_failures_and_bad_ids_answer_the_asker() {
+    let r = rig(FakeBrowser {
+        fail: Some(Error::SignedOut),
+        ..FakeBrowser::default()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c.ask(1, "related", json!({"videoId": SONG})).await;
+    assert_eq!(code(&v), "signed_out", "{v}");
+    for (n, args) in [
+        json!({}),
+        json!({"videoId": "short"}),
+        json!({"videoId": 5}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let v = c.ask(n as u64 + 2, "related", args).await;
+        assert_eq!(code(&v), "bad_request", "{v}");
+    }
+    assert_eq!(r.calls(), [format!("next {SONG}")], "only the first asked");
+}
+
+/// `queue.clear` and `queue.undo` are the engine's: the reply carries what it answered.
+#[tokio::test]
+async fn queue_clear_and_undo_are_answered_by_the_engine() {
+    let mut r = rig(FakeBrowser::default());
+    let mut c = connect(&r.path).await;
+    c.send(json!({"id": 1, "cmd": "queue.clear"})).await;
+    let EngineCmd::QueueClear { reply } = r.command().await else {
+        panic!("wanted a clear");
+    };
+    reply.send(4).unwrap();
+    assert_eq!(c.reply(1).await["data"], json!({"removed": 4}));
+    c.send(json!({"id": 2, "cmd": "queue.undo"})).await;
+    let EngineCmd::QueueUndo { reply } = r.command().await else {
+        panic!("wanted an undo");
+    };
+    reply.send(4).unwrap();
+    assert_eq!(c.reply(2).await["data"], json!({"restored": 4}));
+}
+
+/// `sleep` reaches the engine as the matching command.
+#[tokio::test]
+async fn sleep_reaches_the_engine() {
+    use ytmfast::engine::SleepSet;
+    let mut r = rig(FakeBrowser::default());
+    let mut c = connect(&r.path).await;
+    for (id, args, want) in [
+        (
+            1,
+            json!({"minutes": 15}),
+            SleepSet::In(Duration::from_secs(900)),
+        ),
+        (2, json!({"song": true}), SleepSet::SongEnd),
+        (3, json!({"off": true}), SleepSet::Off),
+    ] {
+        let v = c.ask(id, "sleep", args).await;
+        assert_eq!(v["ok"], true, "{v}");
+        match r.command().await {
+            EngineCmd::Sleep(got) => assert_eq!(got, want),
+            other => panic!("wanted a sleep: {other:?}"),
+        }
+    }
+    let v = c.ask(4, "sleep", json!({"minutes": 0})).await;
+    assert_eq!(code(&v), "bad_request", "{v}");
+}
+
+/// A shift set with `lyrics.offset` is kept, answered, and shows on the song's lyrics.
+#[tokio::test]
+async fn a_lyrics_shift_is_kept_and_shows_with_the_lyrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let offsets = Arc::new(LyricsOffsets::open(dir.path()));
+    let r = rig(FakeBrowser {
+        offsets: Some(offsets.clone()),
+        ..with_lyrics()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c
+        .ask(1, "lyrics.offset", json!({"videoId": SONG, "seconds": 0.5}))
+        .await;
+    assert_eq!(v["data"], json!({"offset": 0.5, "saved": true}), "{v}");
+    assert_eq!(offsets.get(SONG), 0.5);
+    assert!(dir.path().join("lyrics-offsets.json").exists());
+    let v = c.ask(2, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["offset"], 0.5, "{v}");
+    // The kept lyrics answer carries a shift set after it was found, too.
+    let v = c
+        .ask(
+            3,
+            "lyrics.offset",
+            json!({"videoId": SONG, "seconds": -1.25}),
+        )
+        .await;
+    assert_eq!(v["data"]["offset"], -1.25, "{v}");
+    let v = c.ask(4, "lyrics", json!({"videoId": SONG})).await;
+    assert_eq!(v["data"]["offset"], -1.25, "{v}");
+    // Out of range or not a number: refused, and the kept shift stands.
+    for args in [
+        json!({"videoId": SONG, "seconds": 31}),
+        json!({"videoId": SONG, "seconds": "1"}),
+        json!({"videoId": "bad", "seconds": 1}),
+    ] {
+        let v = c.ask(5, "lyrics.offset", args).await;
+        assert_eq!(code(&v), "bad_request", "{v}");
+    }
+    assert_eq!(offsets.get(SONG), -1.25);
+}
+
+/// A shift that cannot be written is still held while the daemon runs, and the reply says it
+/// was not saved.
+#[tokio::test]
+async fn a_lyrics_shift_that_cannot_be_saved_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let offsets = Arc::new(LyricsOffsets::open(&dir.path().join("missing")));
+    let r = rig(FakeBrowser {
+        offsets: Some(offsets.clone()),
+        ..FakeBrowser::default()
+    });
+    let mut c = connect(&r.path).await;
+    let v = c
+        .ask(
+            1,
+            "lyrics.offset",
+            json!({"videoId": SONG, "seconds": 0.25}),
+        )
+        .await;
+    assert_eq!(v["data"], json!({"offset": 0.25, "saved": false}), "{v}");
 }

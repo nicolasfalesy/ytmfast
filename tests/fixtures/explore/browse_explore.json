@@ -1,0 +1,149 @@
+{
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "gridRenderer": {
+                      "items": [
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "New releases"}]},
+                            "iconStyle": {"icon": {"iconType": "ALBUM"}},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_new_releases"}}
+                          }
+                        },
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "Charts"}]},
+                            "iconStyle": {"icon": {"iconType": "TRENDING_UP"}},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_charts"}}
+                          }
+                        },
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "Moods & genres"}]},
+                            "iconStyle": {"icon": {"iconType": "SENTIMENT_SATISFIED"}},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_moods_and_genres"}}
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": {"runs": [{"text": "New albums & singles", "navigationEndpoint": {"browseEndpoint": {"browseId": "FEmusic_new_releases_albums"}}}]},
+                          "moreContentButton": {
+                            "buttonRenderer": {
+                              "style": "STYLE_TEXT",
+                              "text": {"runs": [{"text": "More"}]},
+                              "navigationEndpoint": {"browseEndpoint": {"browseId": "FEmusic_new_releases_albums"}}
+                            }
+                          }
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj", "width": 226, "height": 226}]}}},
+                            "title": {"runs": [{"text": "First New Album", "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_fakeExploreA"}}}]},
+                            "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "Artist One"}]},
+                            "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_fakeExploreA"}},
+                            "thumbnailOverlay": {
+                              "musicItemThumbnailOverlayRenderer": {
+                                "content": {"musicPlayButtonRenderer": {"playNavigationEndpoint": {"watchPlaylistEndpoint": {"playlistId": "OLAK5uy_fakeExploreA"}}}}
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/fake=w226-h226-l90-rj", "width": 226, "height": 226}]}}},
+                            "title": {"runs": [{"text": "A New Single", "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_fakeExploreB"}}}]},
+                            "subtitle": {"runs": [{"text": "Single"}, {"text": " • "}, {"text": "Artist Two"}]},
+                            "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_fakeExploreB"}},
+                            "thumbnailOverlay": {
+                              "musicItemThumbnailOverlayRenderer": {
+                                "content": {"musicPlayButtonRenderer": {"playNavigationEndpoint": {"watchPlaylistEndpoint": {"playlistId": "OLAK5uy_fakeExploreB"}}}}
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": {"runs": [{"text": "Trending"}]}
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/fake=w60-h60-l90-rj", "width": 60, "height": 60}]}}},
+                            "flexColumns": [
+                              {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Trending Song One"}]}}},
+                              {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Artist Three"}, {"text": " • "}, {"text": "1.2M plays"}]}}}
+                            ],
+                            "playlistItemData": {"videoId": "fakeTrend01"},
+                            "overlay": {
+                              "musicItemThumbnailOverlayRenderer": {
+                                "content": {"musicPlayButtonRenderer": {"playNavigationEndpoint": {"watchEndpoint": {"videoId": "fakeTrend01", "playlistId": "RDAMVMfakeTrend01"}}}}
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://lh3.googleusercontent.com/fake=w60-h60-l90-rj", "width": 60, "height": 60}]}}},
+                            "flexColumns": [
+                              {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Trending Song Two"}]}}},
+                              {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Artist Four"}, {"text": " • "}, {"text": "900K plays"}]}}}
+                            ],
+                            "playlistItemData": {"videoId": "fakeTrend02"},
+                            "overlay": {
+                              "musicItemThumbnailOverlayRenderer": {
+                                "content": {"musicPlayButtonRenderer": {"playNavigationEndpoint": {"watchEndpoint": {"videoId": "fakeTrend02", "playlistId": "RDAMVMfakeTrend02"}}}}
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": {"runs": [{"text": "New music videos"}]}
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/vi/fakeVideo01/hqdefault.jpg?sqp=fake", "width": 226, "height": 126}]}}},
+                            "title": {"runs": [{"text": "A New Video", "navigationEndpoint": {"watchEndpoint": {"videoId": "fakeVideo01"}}}]},
+                            "subtitle": {"runs": [{"text": "Artist Five"}, {"text": " • "}, {"text": "3.4M views"}]},
+                            "navigationEndpoint": {"watchEndpoint": {"videoId": "fakeVideo01"}}
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

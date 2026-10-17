@@ -383,6 +383,34 @@ async fn lyrics_two_requests() {
 
 /// Task 6: the lyrics' `next` and its browse, as two calls, so a song whose Lyrics tab is
 /// already known (from the like lookup's `next`) costs only the browse.
+/// The Related path end to end against the local server: a song's `next` names its Related
+/// tab, and browsing that tab gives the hand-made Related page (`fixtures/explore`). Both
+/// requests go to the mock base; nothing leaves the machine.
+#[tokio::test]
+async fn song_next_names_the_related_tab_and_browse_reads_its_page() {
+    const RELATED: &str = include_str!("fixtures/explore/browse_related.json");
+    let rig = rig().await;
+    endpoint("next", json_answer(NEXT_FOR_LYRICS))
+        .expect(1)
+        .mount(&rig.server)
+        .await;
+    endpoint("browse", json_answer(RELATED))
+        .expect(1)
+        .mount(&rig.server)
+        .await;
+    let next = rig.api.song_next("fakeV000797").await.unwrap();
+    let tab = next
+        .related_tab
+        .expect("the real fixture has a Related tab");
+    assert_eq!(tab, "fake000804");
+    let page = rig.api.browse(&tab, None).await.unwrap();
+    assert_eq!(page.sections[0].title, "You might also like");
+    assert_eq!(page.sections[0].items[0].video_id, "fakeRelat01");
+    let reqs = requests(&rig).await;
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(web_remix(&reqs[1], "browse")["browseId"], "fake000804");
+}
+
 #[tokio::test]
 async fn song_next_reads_the_like_and_the_lyrics_tab() {
     let rig = rig().await;

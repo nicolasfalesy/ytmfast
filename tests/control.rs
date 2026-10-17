@@ -226,6 +226,7 @@ fn paused_status(id: &str) -> Status {
         shuffle: false,
         repeat: Repeat::Off,
         liked: None,
+        sleep: None,
     }
 }
 

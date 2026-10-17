@@ -59,6 +59,9 @@ pub struct SongNext {
     pub like: Option<LikeStatus>,
     /// The lyrics page's browse id, shape-checked; `None` when the song has no Lyrics tab.
     pub lyrics_tab: Option<String>,
+    /// The Related tab's browse id, shape-checked (`browse::parse_related_tab`); `None` when
+    /// the song has no Related tab. The socket's `related` browses it.
+    pub related_tab: Option<String>,
 }
 
 /// One song in a queue. Serializable because the queue is saved across restarts and sent to

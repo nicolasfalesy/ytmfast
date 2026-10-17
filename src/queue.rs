@@ -37,6 +37,24 @@ pub struct QueueItem {
     pub song: SongItem,
 }
 
+/// The items a clear took out of the queue, with the original order they were part of.
+#[derive(Debug, Clone)]
+pub struct UpNext {
+    items: Vec<QueueItem>,
+    /// The queue's whole original order before the clear, while shuffled.
+    original: Option<Vec<u64>>,
+}
+
+impl UpNext {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// Repeat mode; on the wire `"off" | "all" | "one"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -428,6 +446,31 @@ impl Queue {
                 let at = self.current.map_or(0, |c| c + 1);
                 self.items.splice(at..at, items);
             }
+        }
+    }
+
+    /// Takes every item after the current one out (all of them, when no item is current yet).
+    /// The current item and the ones already played stay. `restore_up_next` puts them back.
+    pub fn clear_up_next(&mut self) -> UpNext {
+        let from = self.current.map_or(0, |c| c + 1).min(self.items.len());
+        let items: Vec<QueueItem> = self.items.drain(from..).collect();
+        // The whole original order as it was, for putting it back as it was.
+        let original = self.original.clone();
+        if let Some(order) = &mut self.original {
+            let gone: HashSet<u64> = items.iter().map(|i| i.id).collect();
+            order.retain(|id| !gone.contains(id));
+        }
+        UpNext { items, original }
+    }
+
+    /// Puts back what `clear_up_next` took, right after the current item and in both orders
+    /// as they were. Only for a queue that has not changed since: the items come back with
+    /// their ids, and no cap check is made (they were in the queue a moment ago).
+    pub fn restore_up_next(&mut self, up: UpNext) {
+        let at = self.current.map_or(0, |c| c + 1).min(self.items.len());
+        self.items.splice(at..at, up.items);
+        if up.original.is_some() {
+            self.original = up.original;
         }
     }
 
@@ -1362,5 +1405,56 @@ mod tests {
         assert_eq!(q.len(), MAX_ITEMS);
         assert_eq!(cur(&q), Some("s0".into()));
         assert_eq!(q.items().last().unwrap().song.video_id, "s999");
+    }
+
+    #[test]
+    fn clear_up_next_keeps_the_played_songs_and_the_current_one() {
+        let mut q = queue(6, 2);
+        let ids: Vec<u64> = q.items().iter().map(|i| i.id).collect();
+        let up = q.clear_up_next();
+        assert_eq!(up.len(), 3);
+        assert_eq!(vids(&q), vid_list(&["s0", "s1", "s2"]));
+        assert_eq!(cur(&q), Some("s2".into()));
+        // Nothing after the current song: clearing again takes nothing.
+        assert!(q.clear_up_next().is_empty());
+        // The undo puts them back, same ids, same places.
+        q.restore_up_next(up);
+        assert_eq!(vids(&q), vid_list(&["s0", "s1", "s2", "s3", "s4", "s5"]));
+        assert_eq!(q.items().iter().map(|i| i.id).collect::<Vec<_>>(), ids);
+        assert_eq!(cur(&q), Some("s2".into()));
+    }
+
+    #[test]
+    fn clear_up_next_with_no_current_item_takes_everything() {
+        let mut q = Queue::with_seed(1);
+        q.add(songs(3), AddAt::End);
+        assert_eq!(cur(&q), None);
+        let up = q.clear_up_next();
+        assert_eq!(up.len(), 3);
+        assert!(q.is_empty());
+        q.restore_up_next(up);
+        assert_eq!(vids(&q), vid_list(&["s0", "s1", "s2"]));
+        assert_eq!(cur(&q), None);
+    }
+
+    #[test]
+    fn clear_up_next_while_shuffled_keeps_both_orders_in_step() {
+        let mut q = queue(8, 0);
+        q.set_shuffle(true);
+        let shuffled = vids(&q);
+        let up = q.clear_up_next();
+        assert_eq!(q.len(), 1);
+        assert_orders_agree(&q);
+        // Songs added meanwhile would break the undo's premise; the engine refuses it then, so
+        // here the queue is as the clear left it.
+        q.restore_up_next(up);
+        assert_eq!(vids(&q), shuffled, "the shuffled order is back");
+        assert_orders_agree(&q);
+        q.set_shuffle(false);
+        assert_eq!(
+            vids(&q),
+            vid_list(&["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"]),
+            "and so is the original one"
+        );
     }
 }

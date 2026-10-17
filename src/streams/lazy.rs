@@ -268,6 +268,7 @@ mod tests {
             Ok(SongNext {
                 like: Some(LikeStatus::Dislike),
                 lyrics_tab: None,
+                related_tab: None,
             })
         }
         /// Refused with the session's first cookie value as the text, so a test can tell
@@ -315,6 +316,7 @@ mod tests {
             Ok(SongNext {
                 like: None,
                 lyrics_tab: Some(self.0.clone()),
+                related_tab: None,
             })
         }
         async fn lyrics_page(&self, _: &str) -> Result<Option<Lyrics>, Error> {

@@ -1,0 +1,50 @@
+{
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "gridRenderer": {
+                      "header": {"gridHeaderRenderer": {"title": {"runs": [{"text": "Moods & moments"}]}}},
+                      "items": [
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "Chill"}]},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_moods_and_genres_category", "params": "ggMPOg1uXzFmYWtlQ2hpbGw%3D"}}
+                          }
+                        },
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "Focus"}]},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_moods_and_genres_category", "params": "ggMPOg1uXzFmYWtlRm9jdXM%3D"}}
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "gridRenderer": {
+                      "header": {"gridHeaderRenderer": {"title": {"runs": [{"text": "Genres"}]}}},
+                      "items": [
+                        {
+                          "musicNavigationButtonRenderer": {
+                            "buttonText": {"runs": [{"text": "Jazz"}]},
+                            "clickCommand": {"browseEndpoint": {"browseId": "FEmusic_moods_and_genres_category", "params": "ggMPOg1uXzFmYWtlSmF6eg%3D%3D"}}
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

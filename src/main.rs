@@ -648,11 +648,14 @@ async fn serve(
     // The queue, song and second from before the restart (paused: resume never plays by
     // itself), and saving from now on. Without a state folder the engine still plays; it
     // just starts fresh each time.
+    let mut lyrics_offsets = None;
     match paths::state_dir() {
         Ok(dir) => {
             if let Some(saved) = state::load(&dir) {
                 engine.restore(saved);
             }
+            // The lyrics shifts the user set per song, in a file of their own beside it.
+            lyrics_offsets = Some(Arc::new(ytmfast::offsets::LyricsOffsets::open(&dir)));
             engine.save_with(state::Writer::spawn(dir));
         }
         Err(e) => eprintln!(
@@ -669,6 +672,7 @@ async fn serve(
         mpris: Some(ytmfast::mpris::Bus::Session),
         browser: Some(backend),
         lyrics_web: Some(Arc::new(ytmfast::lyrics::HttpWeb::new())),
+        lyrics_offsets,
         idle: (!stay).then(control::idle::IdlePolicy::default),
         ..control::Options::default()
     };

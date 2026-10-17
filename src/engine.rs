@@ -58,6 +58,11 @@ use crate::state::{self, Saved, Writer};
 use crate::streams::{Resolver, Stream, TrackMeta};
 use url::Url;
 
+mod clear;
+mod sleep;
+
+pub use sleep::{SLEEP_MAX, SleepKind, SleepSet, SleepView};
+
 /// Where the queue's songs come from: YouTube Music's `next` (`Innertube::next`) in
 /// production; a trait so the engine's tests can answer with their own pages. Used as
 /// `Arc<dyn QueueSource>`, hence async-trait (ruling R1).
@@ -175,6 +180,19 @@ pub enum EngineCmd {
     /// Silences the output (its volume to 0) and keeps `Status::volume` for unmuting; `false`
     /// puts that volume back. Setting the volume while muted (`Volume`, or a mixer) unmutes.
     Mute(bool),
+    /// Takes every song after the current one out of the queue (the song playing keeps
+    /// playing). Answers how many it took out; they can be put back for a few seconds
+    /// (`QueueUndo`). See `clear.rs`.
+    QueueClear {
+        reply: oneshot::Sender<usize>,
+    },
+    /// Puts back what the last `QueueClear` took out, if nothing has changed the queue since
+    /// and `clear::UNDO_FOR` has not passed. Answers how many came back (0 for none).
+    QueueUndo {
+        reply: oneshot::Sender<usize>,
+    },
+    /// Sets the sleep timer, or turns it off. See `sleep.rs`.
+    Sleep(SleepSet),
     /// What the per-song cache knows of the song's Lyrics tab, learned from a `next` that
     /// named the song (its queue's, or its like lookup's): the socket's `lyrics` then needs no
     /// `next` of its own (ruling P6's carry). `None` when nothing is known.
@@ -322,6 +340,9 @@ pub struct Status {
     /// `next` answer when it named the song, else a request of its own when the song starts
     /// (ruling P1), or from a like.
     pub liked: Option<LikeStatus>,
+    /// The sleep timer, when one is set (`EngineCmd::Sleep`): worked out when the status is
+    /// taken, so the time left in it is the time left then.
+    pub sleep: Option<SleepView>,
 }
 
 /// Starts a track's download. `TrackBuffer::start` in production; tests swap in one that
@@ -712,6 +733,15 @@ pub struct Engine {
     lyrics_waits: Vec<(String, oneshot::Sender<Option<crate::lyrics::SongFacts>>)>,
     like_news_tx: mpsc::UnboundedSender<LikeNews>,
     like_news_rx: mpsc::UnboundedReceiver<LikeNews>,
+    /// The sleep timer (`sleep.rs`). `None` costs nothing: no timer is waiting on it.
+    sleep: Option<sleep::SleepTimer>,
+    /// How long the fade before sleep lasts. `sleep::FADE`; tests shorten it.
+    sleep_fade: Duration,
+    /// What the last `QueueClear` took out, for `QueueUndo` (`clear.rs`).
+    cleared: Option<clear::Cleared>,
+    /// After a clear, no radio is fetched for the emptied queue until the song is nearly over
+    /// (`clear.rs`), so the queue stays empty instead of filling at once.
+    refill_hold: bool,
 }
 
 impl Engine {
@@ -768,7 +798,12 @@ impl Engine {
                 shuffle: false,
                 repeat: Repeat::Off,
                 liked: None,
+                sleep: None,
             },
+            sleep: None,
+            sleep_fade: sleep::FADE,
+            cleared: None,
+            refill_hold: false,
             generation: 0,
             queue_generation: 0,
             queue_rev: 0,
@@ -901,6 +936,9 @@ impl Engine {
     pub async fn run(mut self) {
         let (mut audio, forwarder) = forward_audio_events(&self.player);
         loop {
+            // Worked out before the wait (it reads the player), and again each turn, so a
+            // seek or a pause moves it.
+            let sleep_at = self.sleep_wake();
             tokio::select! {
                 cmd = self.commands.recv() => match cmd {
                     None | Some(EngineCmd::Quit) => break,
@@ -914,6 +952,8 @@ impl Engine {
                 () = next_tick(&mut self.ticker) => self.on_tick(),
                 // A burst of volume, seek, mute, shuffle or repeat changes has settled.
                 () = save_due(self.save_at) => self.dirty = true,
+                // The sleep timer's next step: never, while none is set.
+                () = save_due(sleep_at) => self.on_sleep(),
                 () = save_failed(&self.save_health) => self.on_save_failed(),
             }
             if self.dirty {
@@ -1063,6 +1103,13 @@ impl Engine {
                 reply,
             } => self.like(video_id, status, reply),
             EngineCmd::Mute(on) => self.mute(on),
+            EngineCmd::QueueClear { reply } => {
+                let _ = reply.send(self.queue_clear());
+            }
+            EngineCmd::QueueUndo { reply } => {
+                let _ = reply.send(self.queue_undo());
+            }
+            EngineCmd::Sleep(set) => self.sleep_set(set),
             // Neither changes what plays: no preload check below.
             EngineCmd::LyricsTab { video_id, reply } => {
                 let _ = reply.send(self.likes.tab(&video_id));
@@ -1219,6 +1266,9 @@ impl Engine {
         self.continuation = None;
         self.exhausted = false;
         self.continuation_radio = false;
+        // A new queue is a fresh start: nothing held back from a clear, nothing to undo.
+        self.refill_hold = false;
+        self.cleared = None;
         self.waiting = false;
         self.at_end = false;
         self.skip_streak = 0;
@@ -1500,6 +1550,7 @@ impl Engine {
     fn maybe_refill(&mut self) {
         if self.loading.is_some()
             || self.refilling.is_some()
+            || self.refill_hold
             || self.exhausted
             || !self.queue.needs_more()
         {
@@ -1532,6 +1583,8 @@ impl Engine {
     /// Moves on to the next item: `auto` when the song ended by itself (only then does repeat
     /// one play it again). At the end of the queue it waits for songs on the way, or stops.
     fn advance(&mut self, auto: bool, keep_pause: bool) {
+        // Moving on with nothing queued asks for the radio (a clear held it back).
+        self.refill_hold = false;
         let paused = keep_pause && self.status.state == PlayState::Paused;
         if self.queue.next(auto).is_some() {
             self.start_current(0.0);
@@ -1612,6 +1665,9 @@ impl Engine {
                 .extend((first..self.queue.next_id()).map(|id| (id, at)));
         }
         self.emit_queue();
+        // The user queued something after a clear: the queue is theirs again, and the radio
+        // follows it as it follows any queue.
+        self.refill_hold = false;
         if self.waiting {
             self.waiting = false;
             self.advance(false, true);
@@ -1701,6 +1757,8 @@ impl Engine {
         let Some(item) = self.queue.current().cloned() else {
             return;
         };
+        // A skip or a new play moves "end of the song" on to this song.
+        self.sleep_song_changed();
         self.waiting = false;
         self.at_end = false;
         self.resume_from = None;
@@ -1959,6 +2017,8 @@ impl Engine {
         }
         self.ticker = None;
         self.status.state = PlayState::Paused;
+        // Paused by hand while the music fades: the timer is over, the volume comes back.
+        self.sleep_paused();
         self.emit_state();
     }
 
@@ -2060,6 +2120,14 @@ impl Engine {
         if !v.is_finite() {
             return;
         }
+        // While the sleep timer fades, the sound server tells us of our own steps too; a
+        // mixer turned by hand during it means the listener is awake (`sleep.rs`).
+        if self.sleep_fading() {
+            if self.sleep_is_our_echo(v) {
+                return;
+            }
+            self.sleep_volume_touched();
+        }
         let v = v.clamp(0.0, 1.0);
         if v == self.status.volume && !self.status.muted {
             return;
@@ -2078,6 +2146,8 @@ impl Engine {
         if v.is_nan() {
             return;
         }
+        // Turning the volume while the sleep timer fades: the listener is awake.
+        self.sleep_volume_touched();
         let v = v.clamp(0.0, 1.0);
         self.player.set_volume(v);
         self.status.volume = v;
@@ -2092,6 +2162,7 @@ impl Engine {
         if on == self.status.muted {
             return;
         }
+        self.sleep_volume_touched();
         self.player
             .set_volume(if on { 0.0 } else { self.status.volume });
         self.status.muted = on;
@@ -2321,7 +2392,11 @@ impl Engine {
                 if failed {
                     self.drop_preload();
                 }
+                // "End of the song" (sleep timer): the next song is made current and waits,
+                // paused.
+                let sleep_over = self.sleep_take_song_end();
                 self.advance(true, true);
+                self.sleep_song_over(sleep_over);
             }
             AudioEvent::Error(e) => {
                 self.status.position = self.player.position();
@@ -2416,6 +2491,14 @@ impl Engine {
     /// The audio thread moved on to the preload with this id: its song is current now, as if
     /// it had been loaded (but with no load, and no `Buffering`: it is already playing).
     fn on_advanced(&mut self, ticket: u64) {
+        // "End of the song" (sleep timer): the song that just played was the last one wanted,
+        // so the next, already playing from its first frame, is paused at once.
+        let sleep_over = self.sleep_take_song_end();
+        self.advance_to_preload(ticket);
+        self.sleep_song_over(sleep_over);
+    }
+
+    fn advance_to_preload(&mut self, ticket: u64) {
         // The old song played to its end, whichever item comes next: its report ends there
         // (the player's position is already the new track's, so its length stands in).
         let old_end = self.song_end();
@@ -2526,6 +2609,8 @@ impl Engine {
     /// From 10 s before the current song's end (`PRELOAD_LEAD_SECS`), makes the next item
     /// ready and hands it to the audio thread. Once per next item.
     fn maybe_preload(&mut self, position: f64) {
+        // The same moment the radio held back by a clear is asked for (`clear.rs`).
+        self.release_refill_hold(position);
         if !(self.loaded && self.started) || self.preload.is_some() {
             return;
         }
@@ -2690,6 +2775,7 @@ impl Engine {
         }
         self.status.shuffle = self.queue.shuffle();
         self.status.repeat = self.queue.repeat();
+        self.status.sleep = self.sleep_view();
         self.status.clone()
     }
 
@@ -2741,6 +2827,9 @@ impl Engine {
 
     fn emit_queue_event(&mut self) {
         self.queue_rev += 1;
+        // Whatever changed the queue, a clear's undo no longer knows where its songs go
+        // (`queue_clear` keeps its own undo after telling this).
+        self.cleared = None;
         let QueueView {
             items,
             current_id,
@@ -3217,6 +3306,7 @@ mod tests {
             Ok(SongNext {
                 like,
                 lyrics_tab: self.tabs.get(video_id).cloned(),
+                related_tab: None,
             })
         }
 
@@ -3292,6 +3382,9 @@ mod tests {
         writer: Option<Writer>,
         /// Reports plays to a recording fake.
         reports: bool,
+        /// How long the sleep timer's fade lasts, in ms (10 s when left out): the test songs
+        /// are 2 s long.
+        fade_ms: Option<u64>,
     }
 
     struct Rig {
@@ -3492,6 +3585,9 @@ mod tests {
             setup.fast,
             setup.no_output,
         );
+        if let Some(ms) = setup.fade_ms {
+            engine.sleep_fade = Duration::from_millis(ms);
+        }
         if let Some(saved) = setup.saved {
             engine.restore(saved);
         }
@@ -7006,6 +7102,7 @@ mod tests {
             next: SongNext {
                 like: Some(Dislike),
                 lyrics_tab: Some("MPLYtfake_E".into()),
+                related_tab: None,
             },
         })
         .await;
@@ -7094,6 +7191,7 @@ mod tests {
             result: Ok(SongNext {
                 like: Some(Like),
                 lyrics_tab: Some("MPLYtfake_A".into()),
+                related_tab: None,
             }),
         });
         assert_eq!(engine.status.liked, None);
@@ -7325,4 +7423,6 @@ mod tests {
         eventually("the volume is back", || r.stats.volume() == 0.4).await;
         assert!(!r.status().await.muted);
     }
+
+    mod ideas;
 }

@@ -12,6 +12,12 @@ on the account. MPRIS has next, previous, shuffle and loop too. Step 3 added bro
 the bar widget already reads: browse (Home, the Library, playlists, albums, artists and podcasts, page by page),
 search (mixed results and the Songs, Albums and other filters), like and dislike, mute, and a song's lyrics.
 
+Later additions, all in [docs/protocol.md](docs/protocol.md): a sleep timer (`sleep`: the music fades out over 10
+seconds and pauses, after a set time or at the end of the song), `queue.clear` with `queue.undo` for 10 seconds, a
+song's Related page (`related`), the Explore page (an ordinary `browse` of `FEmusic_explore`, whose buttons are
+page rows), and a per-song shift for synced lyrics (`lyrics.offset`, kept in `lyrics-offsets.json` beside
+`state.json`).
+
 It is built to replace the Electron app behind a bar widget (the widget switches over in step 4), at a fraction of
 the cost (full method in [docs/benchmarks.md](docs/benchmarks.md)):
 

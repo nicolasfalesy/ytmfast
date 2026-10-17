@@ -36,6 +36,7 @@ fn stopped() -> Status {
         shuffle: false,
         repeat: Repeat::Off,
         liked: None,
+        sleep: None,
     }
 }
 

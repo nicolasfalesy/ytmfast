@@ -223,6 +223,7 @@ fn stopped() -> Status {
         shuffle: false,
         repeat: Repeat::Off,
         liked: None,
+        sleep: None,
     }
 }
 
@@ -249,6 +250,7 @@ fn playing(id: &str, position: f64) -> Status {
         shuffle: false,
         repeat: Repeat::Off,
         liked: None,
+        sleep: None,
     }
 }
 

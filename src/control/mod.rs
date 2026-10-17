@@ -45,6 +45,7 @@ use crate::engine::{Engine, EngineCmd, EngineEvent, QueueView, Status};
 use crate::error::Error;
 use crate::loggate::{LogGate, more_since};
 use crate::mpris;
+use crate::offsets::LyricsOffsets;
 use idle::IdlePolicy;
 use lyrics::{EngineTabs, LyricsCache};
 use protocol::{BAD_REQUEST, MAX_LINE, Request};
@@ -115,6 +116,10 @@ pub struct Options {
     /// reaches them by accident: `lyrics` then gives YouTube Music's plain lyrics only. The
     /// daemon passes `lyrics::HttpWeb`.
     pub lyrics_web: Option<Arc<dyn crate::lyrics::LyricsWeb>>,
+    /// Where the per-song lyrics shifts are kept (`lyrics.offset`). `None` keeps them in
+    /// memory only, so a test never writes a file by accident; the daemon passes the state
+    /// folder's.
+    pub lyrics_offsets: Option<Arc<LyricsOffsets>>,
     /// How many clients may be connected at once (`MAX_CLIENTS`); one more is told why and
     /// closed. Every client holds a descriptor and some memory.
     pub max_clients: usize,
@@ -131,6 +136,7 @@ impl std::fmt::Debug for Options {
             .field("mpris", &self.mpris)
             .field("browser", &self.browser.is_some())
             .field("lyrics_web", &self.lyrics_web.is_some())
+            .field("lyrics_offsets", &self.lyrics_offsets.is_some())
             .field("max_clients", &self.max_clients)
             .field("client_idle", &self.client_idle)
             .finish()
@@ -145,6 +151,7 @@ impl Default for Options {
             mpris: None,
             browser: None,
             lyrics_web: None,
+            lyrics_offsets: None,
             max_clients: MAX_CLIENTS,
             client_idle: CLIENT_IDLE,
         }
@@ -280,6 +287,8 @@ struct Shared {
     browser: Option<Arc<dyn Browser>>,
     /// Lyrics answers kept for every client, and the engine's Lyrics tabs.
     lyrics: LyricsCache,
+    /// How far each song's synced lyrics are shifted (`lyrics.offset`).
+    offsets: Arc<LyricsOffsets>,
     /// `Options::client_idle`.
     client_idle: Duration,
     /// The queue's JSON, kept per revision (`queue.get`, `watch` turned on, `queue` events).
@@ -308,6 +317,9 @@ async fn serve_with(
     let mut monitor = events.subscribe();
     let shared = Arc::new(Shared {
         lyrics: LyricsCache::new(Arc::new(EngineTabs(cmds.clone())), options.lyrics_web),
+        offsets: options
+            .lyrics_offsets
+            .unwrap_or_else(|| Arc::new(LyricsOffsets::in_memory())),
         cmds,
         events,
         hub,
@@ -437,6 +449,17 @@ async fn wait(timer: &mut Option<Pin<Box<Sleep>>>) {
 async fn query_status(cmds: &mpsc::Sender<EngineCmd>) -> Option<Status> {
     let (tx, rx) = oneshot::channel();
     cmds.send(EngineCmd::Status(tx)).await.ok()?;
+    rx.await.ok()
+}
+
+/// Sends the command `make` builds around a reply channel and waits for the answer; `None`
+/// when the engine is gone.
+async fn ask<T>(
+    cmds: &mpsc::Sender<EngineCmd>,
+    make: impl FnOnce(oneshot::Sender<T>) -> EngineCmd,
+) -> Option<T> {
+    let (tx, rx) = oneshot::channel();
+    cmds.send(make(tx)).await.ok()?;
     rx.await.ok()
 }
 
@@ -770,8 +793,44 @@ async fn handle(shared: &Shared, text: &[u8]) -> Handled {
         | Request::Search { .. }
         | Request::More { .. }
         | Request::Lyrics { .. }
+        | Request::Related { .. }
         | Request::Like { .. }) => {
             return Handled::Browse(id, request, None);
+        }
+        // Answered by the engine, which alone knows what the queue held.
+        Request::QueueClear => {
+            return Handled::Reply(
+                match ask(&shared.cmds, |reply| EngineCmd::QueueClear { reply }).await {
+                    Some(removed) => protocol::ok_reply(id, json!({ "removed": removed })),
+                    None => gone(),
+                },
+            );
+        }
+        Request::QueueUndo => {
+            return Handled::Reply(
+                match ask(&shared.cmds, |reply| EngineCmd::QueueUndo { reply }).await {
+                    Some(restored) => protocol::ok_reply(id, json!({ "restored": restored })),
+                    None => gone(),
+                },
+            );
+        }
+        Request::Sleep(set) => EngineCmd::Sleep(set),
+        // Not the engine's: a note kept for the widget, in a small file. The write runs off
+        // the socket's task (a disk can be slow), and a failed write is told in the reply,
+        // not as an error: the shift still holds until the daemon stops.
+        Request::LyricsOffset { video_id, seconds } => {
+            let offsets = shared.offsets.clone();
+            let kept = task::spawn_blocking(move || {
+                let result = offsets.set(&video_id, seconds);
+                (offsets.get(&video_id), result.is_ok())
+            })
+            .await;
+            return Handled::Reply(match kept {
+                Ok((offset, saved)) => {
+                    protocol::ok_reply(id, json!({ "offset": offset, "saved": saved }))
+                }
+                Err(_) => gone(),
+            });
         }
         Request::Play {
             video_id,
@@ -869,10 +928,23 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
                 .get(browser.as_ref(), &video_id)
                 .await
                 .map(|lyrics| match lyrics {
-                    // Within a line: `lyrics::fits` held every answer to it.
-                    Some(l) => protocol::data_reply(id, &l),
+                    // Within a line: `lyrics::fits` held every answer to it (the shift adds
+                    // a few bytes at most; `lyrics_reply`).
+                    Some(l) => lyrics_reply(id, &l, shared.offsets.get(&video_id)),
                     None => protocol::ok_reply(id, json!({ "none": true })),
                 }),
+            // The Related tab is read from the song's own `next`, then browsed like any
+            // page. A song with no Related tab gets an empty page, not an error.
+            Request::Related { video_id } => {
+                async {
+                    let Some(tab) = browser.song_next(&video_id).await?.related_tab else {
+                        return Ok::<_, Error>(protocol::data_reply(id, &browse::Page::default()));
+                    };
+                    let page = browser.browse(&tab, None).await?;
+                    Ok(protocol::data_reply(id, &page))
+                }
+                .await
+            }
             Request::PlayPage { browse_id, params } => {
                 match browser.browse(&browse_id, params.as_deref()).await {
                     Ok(page) => {
@@ -903,6 +975,18 @@ async fn answer(shared: Arc<Shared>, id: u64, request: Request, epoch: Option<u6
         Ok(line) => line,
         Err(e) => protocol::error_reply(Some(id), e.code(), &e.to_string()),
     }
+}
+
+/// The lyrics reply: the lyrics as found, and how far this song's lyrics are shifted
+/// (`offsets`), `0` when they are not. The kept answers hold the lyrics alone, so a shift set
+/// after they were found still shows on the next ask.
+fn lyrics_reply<T: serde::Serialize>(id: u64, lyrics: &T, offset: f64) -> String {
+    // Plain strings, numbers and lists: serializing can't fail.
+    let mut data = serde_json::to_value(lyrics).expect("lyrics serialize");
+    if let Value::Object(map) = &mut data {
+        map.insert("offset".into(), json!(offset));
+    }
+    protocol::ok_reply(id, data)
 }
 
 /// A like's reply line: ok once YouTube took it. A failure is the asker's alone, with its code

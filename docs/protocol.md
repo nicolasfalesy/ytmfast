@@ -58,7 +58,12 @@ failing) arrives as events.
 | `search`       | `query`, `params` (optional)                            | a search page (below)       |
 | `more`         | `kind`: `"browse"` or `"search"`, `token`               | a next page (below)         |
 | `playPage`     | `browseId`, `params` (optional)                         | `{}`, or `{"superseded": true}` |
-| `lyrics`       | `videoId`                                               | `{source, synced, words, lines}` or `{"none": true}` (below) |
+| `lyrics`       | `videoId`                                               | `{source, synced, words, lines, offset}` or `{"none": true}` (below) |
+| `lyrics.offset`| `videoId`, `seconds` (-30 to 30)                        | `{"offset", "saved"}` (below) |
+| `related`      | `videoId`                                               | a page (below)              |
+| `queue.clear`  | none                                                    | `{"removed": n}`            |
+| `queue.undo`   | none                                                    | `{"restored": n}`           |
+| `sleep`        | one of `minutes` (1 to 720), `song: true`, `off: true`  | `{}`                        |
 
 A `videoId` is 11 characters of `A-Z`, `a-z`, `0-9`, `_` and `-`. A `playlistId` is 1 to
 256 of the same characters. A `queueId` and an `index` are whole numbers from 0 up.
@@ -127,6 +132,30 @@ song even after the queue changes around it.
 shuffled order while shuffle is on); an `index` past the end moves it to the end. For a
 `queueId` that isn't in the queue, the reply is still `"ok": true`, and an `unavailable`
 error event says nothing was done.
+
+`queue.clear` takes every song after the current one out of the queue and answers how many it
+took (`{"removed": 3}`). The song playing keeps playing, and the songs already heard stay
+behind it, so Previous still reaches them. Nothing else changes, and the radio is not
+asked for at once: it waits until the song is within 10 seconds of its end (or the user
+skips, or adds a song), so the cleared queue stays cleared while the song plays and the
+music still carries on after it.
+
+`queue.undo` puts back what the last `queue.clear` took out, in its place after the current
+song and with the same `queueId`s, and answers how many came back (`{"restored": 3}`). It
+works for 10 seconds, and only while nothing else has changed the queue (an add, a remove, a
+move, a skip, shuffle, a new play: any `queue` event after the clear's own). Otherwise it
+answers `{"restored": 0}` and changes nothing; so does an undo with nothing cleared.
+
+`sleep` sets the sleep timer, with exactly one of `minutes` (a whole number from 1 to 720:
+the music fades out and pauses that long from now), `song: true` (the same at the end of
+the song playing: the fade covers its last seconds, and the next song is made current,
+paused) and `off: true` (no timer). Setting it again replaces the timer. The fade is 10
+seconds long (less when less time is left), in small steps of the stream's volume; the saved
+volume, `volume` in the state and MPRIS's `Volume` never move, and the stream goes back to that
+volume once the music has paused, so the next play is not silent. Turning the volume or mute
+(or a mixer) while it fades means the user is awake: the timer ends and the volume they set
+stands. So does pausing by hand. A timer that runs out while nothing plays just ends. While
+a timer is set the state shows it (`sleep`, below).
 
 `shuffle` with `on: true` mixes the queue, with the current song moved first; with `false`
 it goes back to the original order, at the same song. Songs that join later while it is on
@@ -354,6 +383,30 @@ failed (no network, a timeout, a server error, an answer too big) is sent but no
 the next ask tries again. When YouTube Music's step itself fails and nothing else was found,
 the reply is that error (see Errors), not `none`.
 
+A synced song's lyrics can drift against the audio, and the reply carries `offset`: how far
+the user shifted this song's lyrics, in seconds (`0` when never; positive means later, so a
+client shows the line that starts at `t` when the song is at `t + offset`). `lyrics.offset`
+sets it, from -30 to 30 and rounded to the millisecond, and answers `{"offset": 0.5, "saved":
+true}`; `0` forgets the song. It is kept for the last 500 songs in `lyrics-offsets.json` in
+the state folder (0600), apart from `state.json`. `saved: false` means the file could not be
+written: the shift still holds until the daemon stops. A client changes it by sending the new
+absolute value, so two clients never undo each other by a lost step.
+
+### related
+
+`{"videoId": "dQw4w9WgXcQ"}` gives the song's Related page, as YouTube Music shows it: the
+Related tab of the song's `next`, browsed. The reply is a page as for `browse` (shelves such
+as "You might also like", "Recommended playlists", "Similar artists"). A song with no Related
+tab gets an empty page, `{"header": {...}, "sections": [], "cont": ""}`.
+
+### Explore
+
+There is no command for Explore: it is the ordinary `browse` of `FEmusic_explore`. Its
+buttons (New releases, Charts, Moods & genres) come back as rows with `kind: "page"`, a
+`browseId` (`FEmusic_new_releases`, `FEmusic_charts`, `FEmusic_moods_and_genres`) and no
+`play`; a mood or genre tile is the same with a `params`. A client opens a `page` row with
+`browse {browseId, params}`.
+
 ### Errors
 
 A failed browsing request is answered with the error, to that client only, never as an
@@ -405,6 +458,11 @@ The state, on every change (and as the `status` reply's data, without `"event"`)
   with that song (a song played by id), else from one small request when the song starts,
   and at once after a `like` of it. A song whose status could not be read stays `null` until
   it starts again.
+- `sleep` is `null` with no sleep timer, else `{"mode": "timer" | "song", "left": seconds |
+  null, "fading": bool}`: `left` is the whole seconds until a `timer` ends, as of this line
+  (`null` for `song`), and `fading` says the fade has begun. A client counts down from `left`
+  itself; the engine sends no line a second for it, only a new state when the timer is set,
+  turned off, starts to fade or ends.
 
 The position, once a second while playing and after every seek:
 

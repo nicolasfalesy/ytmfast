@@ -369,21 +369,41 @@ pub fn parse_more(r: &Value) -> MorePage {
 /// The browse id of a song's lyrics page (`MPLYt…`), from the song's `next` answer: the watch-next
 /// panel's Lyrics tab. `None` when the song has no lyrics tab.
 pub fn parse_lyrics_tab(next: &Value) -> Option<String> {
+    tab_of(next, LYRICS_TAB)
+}
+
+/// The browse id of a song's Related page, from the song's `next` answer: the watch-next
+/// panel's Related tab. `None` when the song has no Related tab.
+pub fn parse_related_tab(next: &Value) -> Option<String> {
+    tab_of(next, RELATED_TAB)
+}
+
+/// The `pageType` of the watch-next panel's tabs that lead to another page.
+const LYRICS_TAB: &str = "MUSIC_PAGE_TYPE_TRACK_LYRICS";
+const RELATED_TAB: &str = "MUSIC_PAGE_TYPE_TRACK_RELATED";
+
+/// The browse id of the watch-next panel's tab of this page type.
+fn tab_of(next: &Value, page_type: &str) -> Option<String> {
     let tabs = next.pointer(
         "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs",
     )?;
-    lyrics_tab_in(
+    tab_in(
         tabs.as_array()
             .into_iter()
             .flatten()
             .filter_map(|t| t.pointer("/tabRenderer/endpoint")),
+        page_type,
     )
 }
 
 /// `parse_lyrics_tab` over the tabs' `tabRenderer.endpoint`s alone: the queue's own reader
 /// (`innertube::next`) keeps just those, not the whole answer.
 pub fn lyrics_tab_in<'a>(endpoints: impl IntoIterator<Item = &'a Value>) -> Option<String> {
-    // The last lyrics tab wins, as in Page.js (its forEach kept overwriting).
+    tab_in(endpoints, LYRICS_TAB)
+}
+
+fn tab_in<'a>(endpoints: impl IntoIterator<Item = &'a Value>, want: &str) -> Option<String> {
+    // The last tab of the type wins, as in Page.js (its forEach kept overwriting).
     let mut found = None;
     for e in endpoints {
         let Some(b) = e.get("browseEndpoint") else {
@@ -394,7 +414,7 @@ pub fn lyrics_tab_in<'a>(endpoints: impl IntoIterator<Item = &'a Value>) -> Opti
                 "/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType",
             )
             .and_then(Value::as_str);
-        if page_type == Some("MUSIC_PAGE_TYPE_TRACK_LYRICS") {
+        if page_type == Some(want) {
             found = Some(b);
         }
     }

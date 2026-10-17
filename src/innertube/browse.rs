@@ -141,6 +141,7 @@ impl Innertube {
             like: browse::parse_like_for(&next, video_id),
             // `parse_lyrics_tab` shape-checks the id it returns.
             lyrics_tab: browse::parse_lyrics_tab(&next),
+            related_tab: browse::parse_related_tab(&next),
         })
     }
 

@@ -12,7 +12,9 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::browse::{Endpoint, LikeStatus, id_ok, token_ok};
-use crate::engine::{EngineEvent, PlayState, QueueView, Status};
+use std::time::Duration;
+
+use crate::engine::{EngineEvent, PlayState, QueueView, SLEEP_MAX, SleepKind, SleepSet, Status};
 use crate::innertube::{MoreKind, SongItem, check_query};
 use crate::queue::{AddAt, QueueItem, Repeat};
 use crate::state::{MAX_ARTISTS, MAX_TEXT, is_playlist_id};
@@ -117,6 +119,23 @@ pub enum Request {
     Lyrics {
         video_id: String,
     },
+    /// A song's Related page: the Related tab of its `next`, browsed (`control::answer`).
+    /// Answered like a browsing command, to the asking client only.
+    Related {
+        video_id: String,
+    },
+    /// Takes the songs after the current one out of the queue (`EngineCmd::QueueClear`).
+    QueueClear,
+    /// Puts back what `QueueClear` took out, within a few seconds (`EngineCmd::QueueUndo`).
+    QueueUndo,
+    /// The sleep timer (`EngineCmd::Sleep`): a number of minutes, the end of the song, or off.
+    Sleep(SleepSet),
+    /// Sets how far a song's synced lyrics are shifted, in seconds (positive = later). Kept per
+    /// song in a small file (`crate::offsets`); answered with the value kept.
+    LyricsOffset {
+        video_id: String,
+        seconds: f64,
+    },
     /// Which events this client gets: `queue: false` stops its `queue` events, `position:
     /// false` its `position` events (each on by default). A field left out keeps its switch;
     /// at least one is given. Handled by the client's own task, not the engine
@@ -219,6 +238,21 @@ impl Request {
             }
             Request::Mute { on } => ("mute", Some(json!({ "on": on }))),
             Request::Lyrics { video_id } => ("lyrics", Some(json!({ "videoId": video_id }))),
+            Request::Related { video_id } => ("related", Some(json!({ "videoId": video_id }))),
+            Request::QueueClear => ("queue.clear", None),
+            Request::QueueUndo => ("queue.undo", None),
+            Request::Sleep(set) => (
+                "sleep",
+                Some(match set {
+                    SleepSet::In(d) => json!({ "minutes": d.as_secs() / 60 }),
+                    SleepSet::SongEnd => json!({ "song": true }),
+                    SleepSet::Off => json!({ "off": true }),
+                }),
+            ),
+            Request::LyricsOffset { video_id, seconds } => (
+                "lyrics.offset",
+                Some(json!({ "videoId": video_id, "seconds": seconds })),
+            ),
             Request::Watch { queue, position } => {
                 let mut args = Map::new();
                 if let Some(q) = queue {
@@ -457,6 +491,26 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
                 _ => return Err(VIDEO_ID_RULE),
             },
         },
+        "related" => Request::Related {
+            video_id: match field(args, "videoId") {
+                Some(Value::String(s)) if is_video_id(s) => s.clone(),
+                _ => return Err(VIDEO_ID_RULE),
+            },
+        },
+        "queue.clear" => Request::QueueClear,
+        "queue.undo" => Request::QueueUndo,
+        "sleep" => Request::Sleep(parse_sleep(args)?),
+        "lyrics.offset" => Request::LyricsOffset {
+            video_id: match field(args, "videoId") {
+                Some(Value::String(s)) if is_video_id(s) => s.clone(),
+                _ => return Err(VIDEO_ID_RULE),
+            },
+            seconds: args
+                .get("seconds")
+                .and_then(Value::as_f64)
+                .filter(|s| s.is_finite() && s.abs() <= crate::offsets::MAX_SECONDS)
+                .ok_or(OFFSET_RULE)?,
+        },
         "watch" => {
             // Null counts as left out, as for every other optional field (`field`).
             let switch = |name, rule| match field(args, name) {
@@ -473,6 +527,35 @@ fn parse_command(cmd: &str, args: &Map<String, Value>) -> Result<Request, &'stat
         "quit" => Request::Quit,
         _ => return Err("unknown command"),
     })
+}
+
+const OFFSET_RULE: &str = "seconds must be a number from -30 to 30";
+const SLEEP_RULE: &str =
+    "sleep takes one of minutes (a whole number from 1 to 720), song (true) or off (true)";
+
+/// `sleep`: exactly one of `minutes`, `song: true` and `off: true`. Two at once would leave
+/// it unclear which was meant, so that is refused rather than guessed at.
+fn parse_sleep(args: &Map<String, Value>) -> Result<SleepSet, &'static str> {
+    let given: Vec<&str> = ["minutes", "song", "off"]
+        .into_iter()
+        .filter(|k| field(args, k).is_some())
+        .collect();
+    let [only] = given.as_slice() else {
+        return Err(SLEEP_RULE);
+    };
+    match *only {
+        "minutes" => {
+            let max = SLEEP_MAX.as_secs() / 60;
+            args.get("minutes")
+                .and_then(Value::as_u64)
+                .filter(|m| (1..=max).contains(m))
+                .map(|m| SleepSet::In(Duration::from_secs(m * 60)))
+                .ok_or(SLEEP_RULE)
+        }
+        "song" if args.get("song") == Some(&Value::Bool(true)) => Ok(SleepSet::SongEnd),
+        "off" if args.get("off") == Some(&Value::Bool(true)) => Ok(SleepSet::Off),
+        _ => Err(SLEEP_RULE),
+    }
 }
 
 /// `browse` and `playPage`'s page.
@@ -759,6 +842,22 @@ pub fn status_data(status: &Status) -> Map<String, Value> {
     m.insert("repeat".into(), json!(repeat_name(status.repeat)));
     // "like", "dislike", "none", or null until known.
     m.insert("liked".into(), json!(status.liked));
+    // The sleep timer: null, or its kind (`"timer"` with the whole seconds left, or `"song"`)
+    // and whether the fade has begun.
+    m.insert(
+        "sleep".into(),
+        match &status.sleep {
+            None => Value::Null,
+            Some(s) => json!({
+                "mode": match s.kind {
+                    SleepKind::Timer => "timer",
+                    SleepKind::SongEnd => "song",
+                },
+                "left": s.left,
+                "fading": s.fading,
+            }),
+        },
+    );
     m
 }
 
@@ -1718,6 +1817,7 @@ mod tests {
             shuffle: true,
             repeat: Repeat::All,
             liked: Some(LikeStatus::Dislike),
+            sleep: None,
         };
         let v: Value =
             serde_json::from_str(&event_line(&EngineEvent::State(status.clone()))).unwrap();
@@ -1728,7 +1828,7 @@ mod tests {
                    "thumbnail": "https://i.ytimg.com/x.jpg", "position": 1.235, "volume": 80,
                    "muted": true, "album": "Album", "albumId": "MPREb_abc", "queueId": 7,
                    "shuffle": true,
-                   "repeat": "all", "liked": "dislike"})
+                   "repeat": "all", "liked": "dislike", "sleep": null})
         );
         // The status reply is the same without "event".
         let mut data = v.as_object().unwrap().clone();
@@ -1748,6 +1848,7 @@ mod tests {
             shuffle: false,
             repeat: Repeat::Off,
             liked: None,
+            sleep: None,
         };
         assert_eq!(
             Value::Object(status_data(&empty)),
@@ -1755,7 +1856,7 @@ mod tests {
                    "lengthSeconds": null, "thumbnail": null, "position": 0.0, "volume": 100,
                    "muted": false, "album": null, "albumId": "", "queueId": null,
                    "shuffle": false,
-                   "repeat": "off", "liked": null})
+                   "repeat": "off", "liked": null, "sleep": null})
         );
         // Each like status by its socket name.
         for (liked, name) in [
@@ -1796,6 +1897,138 @@ mod tests {
         assert_eq!(
             v,
             json!({"event": "error", "code": "network", "message": "network error: timed out"})
+        );
+    }
+
+    fn quiet_status() -> Status {
+        Status {
+            state: PlayState::Paused,
+            video_id: None,
+            meta: None,
+            album: None,
+            album_id: String::new(),
+            queue_id: None,
+            position: 0.0,
+            volume: 1.0,
+            muted: false,
+            shuffle: false,
+            repeat: Repeat::Off,
+            liked: None,
+            sleep: None,
+        }
+    }
+
+    #[test]
+    fn the_sleep_timer_shows_in_the_state() {
+        use crate::engine::SleepView;
+        let timer = Status {
+            sleep: Some(SleepView {
+                kind: SleepKind::Timer,
+                left: Some(1799),
+                fading: false,
+            }),
+            ..quiet_status()
+        };
+        assert_eq!(
+            status_data(&timer)["sleep"],
+            json!({"mode": "timer", "left": 1799, "fading": false})
+        );
+        let song = Status {
+            sleep: Some(SleepView {
+                kind: SleepKind::SongEnd,
+                left: None,
+                fading: true,
+            }),
+            ..quiet_status()
+        };
+        assert_eq!(
+            status_data(&song)["sleep"],
+            json!({"mode": "song", "left": null, "fading": true})
+        );
+        assert_eq!(status_data(&quiet_status())["sleep"], Value::Null);
+    }
+
+    #[test]
+    fn the_new_commands_parse_and_round_trip() {
+        let id = "dQw4w9WgXcQ";
+        let cases = [
+            (r#"{"id":1,"cmd":"queue.clear"}"#, Request::QueueClear),
+            (r#"{"id":1,"cmd":"queue.undo"}"#, Request::QueueUndo),
+            (
+                r#"{"id":1,"cmd":"related","args":{"videoId":"dQw4w9WgXcQ"}}"#,
+                Request::Related {
+                    video_id: id.into(),
+                },
+            ),
+            (
+                r#"{"id":1,"cmd":"sleep","args":{"minutes":30}}"#,
+                Request::Sleep(SleepSet::In(Duration::from_secs(30 * 60))),
+            ),
+            (
+                r#"{"id":1,"cmd":"sleep","args":{"song":true}}"#,
+                Request::Sleep(SleepSet::SongEnd),
+            ),
+            (
+                r#"{"id":1,"cmd":"sleep","args":{"off":true}}"#,
+                Request::Sleep(SleepSet::Off),
+            ),
+            (
+                r#"{"id":1,"cmd":"lyrics.offset","args":{"videoId":"dQw4w9WgXcQ","seconds":-0.25}}"#,
+                Request::LyricsOffset {
+                    video_id: id.into(),
+                    seconds: -0.25,
+                },
+            ),
+        ];
+        for (line, want) in cases {
+            let (got_id, got) = parse_request(line.as_bytes()).unwrap();
+            assert_eq!((got_id, &got), (1, &want), "{line}");
+            // What a client library sends parses back to the same request.
+            let (_, again) = parse_request(want.to_line(1).trim_end().as_bytes()).unwrap();
+            assert_eq!(again, want, "{line}");
+        }
+    }
+
+    #[test]
+    fn bad_sleep_and_offset_requests_are_refused_with_a_reason() {
+        let refuse = |line: &str| parse_request(line.as_bytes()).unwrap_err().message;
+        // Exactly one of minutes, song and off.
+        for args in [
+            r#"{}"#,
+            r#"{"minutes":0}"#,
+            r#"{"minutes":721}"#,
+            r#"{"minutes":-5}"#,
+            r#"{"minutes":1.5}"#,
+            r#"{"minutes":"30"}"#,
+            r#"{"song":false}"#,
+            r#"{"off":"yes"}"#,
+            r#"{"minutes":30,"song":true}"#,
+            r#"{"song":true,"off":true}"#,
+        ] {
+            let line = format!(r#"{{"id":2,"cmd":"sleep","args":{args}}}"#);
+            assert_eq!(refuse(&line), SLEEP_RULE, "{args}");
+        }
+        // The longest timer is 12 hours, and null counts as left out.
+        assert!(parse_request(br#"{"id":2,"cmd":"sleep","args":{"minutes":720}}"#).is_ok());
+        assert!(
+            parse_request(br#"{"id":2,"cmd":"sleep","args":{"minutes":5,"song":null}}"#).is_ok()
+        );
+        for args in [
+            r#"{"videoId":"dQw4w9WgXcQ"}"#,
+            r#"{"videoId":"dQw4w9WgXcQ","seconds":31}"#,
+            r#"{"videoId":"dQw4w9WgXcQ","seconds":"1"}"#,
+            r#"{"videoId":"dQw4w9WgXcQ","seconds":null}"#,
+        ] {
+            let line = format!(r#"{{"id":2,"cmd":"lyrics.offset","args":{args}}}"#);
+            assert_eq!(refuse(&line), OFFSET_RULE, "{args}");
+        }
+        assert_eq!(
+            refuse(r#"{"id":2,"cmd":"lyrics.offset","args":{"videoId":"short","seconds":1}}"#),
+            VIDEO_ID_RULE
+        );
+        assert_eq!(
+            refuse(r#"{"id":2,"cmd":"related","args":{"videoId":"x"}}"#),
+            VIDEO_ID_RULE
         );
     }
 }
