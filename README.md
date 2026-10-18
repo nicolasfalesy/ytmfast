@@ -87,9 +87,19 @@ a notice.
 cargo build --release
 ```
 
-Building needs Rust, clang, pkg-config, and the PipeWire and libopus development files (Arch:
+Building needs Rust (CI uses the version pinned in `rust-toolchain.toml`), clang, pkg-config, and the PipeWire and libopus development files (Arch:
 `pipewire` and `opus`). Running needs the same two libraries (`libpipewire-0.3.so.0` and
 `libopus.so.0`). `yt-dlp` is used as a fallback for stream links when it is installed.
+
+## Checks
+
+`hooks/pre-push` runs the same checks as CI (`cargo fmt --check`, clippy with `-D warnings`, debug and
+release `cargo test`, and the release binary size limit), and refuses to run when the Rust on the machine
+is not the version pinned in `rust-toolchain.toml`. Turn it on once per clone:
+
+```sh
+git config core.hooksPath hooks
+```
 
 ## Run with systemd
 

@@ -22,9 +22,10 @@ on:
 permissions:
   contents: read
 
+# Pinned (his pick, 2026-10-18): ubuntu-latest moved to 26 on 2026-10-19; move on purpose, not by surprise.
 jobs:
   cargo-audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:latest
     steps:
       # git first, so actions/checkout makes a real clone instead of a tarball download.

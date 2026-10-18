@@ -1,0 +1,26 @@
+#!/bin/sh
+# Runs CI's checks before every push (his rule: never push red): format, clippy, debug tests,
+# release tests and the release binary size limit (the audit workflow is not run here).
+# Enable once per clone or worktree: git config core.hooksPath hooks
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+# CI installs rust-toolchain.toml's version; a different laptop rustc would make this hook's verdict
+# disagree with CI's. After a laptop Rust update, bump the channel there (his pick, 2026-10-18).
+want=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+have=$(rustc --version | cut -d' ' -f2)
+[ "$have" = "$want" ] || { echo "pre-push: the laptop has Rust $have but CI is pinned to $want: bump rust-toolchain.toml" >&2; exit 1; }
+# Builds never go in /tmp (RAM-backed, shared quota); one target dir per project.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/claude-builds/ytmfast/target}"
+# On battery, run through nic-build when it is installed (keeps builds off the P-cores).
+run=""
+if command -v nic-build >/dev/null 2>&1; then run="nic-build"; fi
+$run cargo fmt --check
+$run cargo clippy --all-targets --locked -- -D warnings
+$run cargo test --locked
+# Same release-test settings as CI's release-tests job (no LTO, 16 codegen units: faster, still optimized).
+CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 $run cargo test --release --locked
+# Same limit as CI's binary-size job (real release profile, fat LTO). Keep the number in step with ci.yml.
+$run cargo build --release --locked
+size=$(stat -c %s "$CARGO_TARGET_DIR/release/ytmfast")
+echo "ytmfast is $size bytes (limit 22990000)"
+test "$size" -le 22990000

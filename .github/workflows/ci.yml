@@ -12,9 +12,10 @@ permissions:
 # tag's commit (`gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq .object.sha`) and change
 # both the SHA and the comment.
 
+# Pinned (his pick, 2026-10-18): ubuntu-latest moved to 26 on 2026-10-19; move on purpose, not by surprise.
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Arch, not the Ubuntu image: it matches the system ytmfast targets, and Ubuntu's
     # libpipewire is too old for the pipewire crate later steps use.
     container: archlinux:latest
@@ -26,17 +27,22 @@ jobs:
         # clang: the pipewire crate's bindgen. opus: the system libopus the decoder links.
         # dbus: the MPRIS tests start a private dbus-daemon. No cmake or make: nothing in the
         # tree runs them since the bundled libopus went (a clean build with both blocked passes).
-        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git dbus
+        run: pacman -Syu --noconfirm rustup clang pkgconf pipewire opus sqlite ffmpeg git dbus
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The job never pushes: the token is not left in the clone's git config.
           persist-credentials: false
 
+      - name: Rust (the version in rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+
       - name: Note the compiler version
         id: rustc
-        # Arch's rust package moves often; keying the cache on its version stops a new
-        # compiler from restoring a target folder it can't reuse.
+        # Keying the cache on the compiler version stops a new compiler (after a bump of
+        # rust-toolchain.toml) from restoring a target folder it can't reuse.
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -62,7 +68,7 @@ jobs:
   # optimized (the restarted-output test did, 5 runs in 5, while the debug run above was
   # green), so the debug run alone is not enough.
   release-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:latest
     env:
       CARGO_TERM_COLOR: always
@@ -73,11 +79,16 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - name: Install toolchain and libraries
-        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite ffmpeg git dbus
+        run: pacman -Syu --noconfirm rustup clang pkgconf pipewire opus sqlite ffmpeg git dbus
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Rust (the version in rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
 
       - name: Note the compiler version
         id: rustc
@@ -99,17 +110,22 @@ jobs:
   # The shipped binary (the real release profile, fat LTO) must not grow by more than 20% over
   # what the audit measured after its fixes (19,154,008 bytes on 2026-10-14).
   binary-size:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:latest
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Install toolchain and libraries
-        run: pacman -Syu --noconfirm rust clang pkgconf pipewire opus sqlite git
+        run: pacman -Syu --noconfirm rustup clang pkgconf pipewire opus sqlite git
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Rust (the version in rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
 
       - name: Note the compiler version
         id: rustc
