@@ -1,6 +1,6 @@
 # The laptop's Rust (Arch's rust package, from his pinned mirror). CI installs exactly this, so a green
 # hooks/pre-push means green CI; the hook refuses to run when the laptop's rustc differs: bump it here then.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
