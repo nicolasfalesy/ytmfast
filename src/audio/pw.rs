@@ -224,13 +224,6 @@ impl Drop for PipeWireSink {
     }
 }
 
-/// The slider value to PipeWire's channel volume. Channel volumes are linear gain, and mixers
-/// (wpctl, pavucontrol, desktop volume popups) show their cube root; cubing makes the slider
-/// and the mixer show the same number, and makes the slider feel even across its range.
-fn channel_volume(v: f32) -> f32 {
-    v * v * v
-}
-
 impl Sink for PipeWireSink {
     fn open(&mut self, rate: u32, channels: u16) -> Result<(), Error> {
         if channels != 2 {
@@ -442,7 +435,10 @@ impl Output {
                 let _done = done_tx;
                 let setup = Setup {
                     rate,
-                    volume: channel_volume(volume.slider),
+                    // The slider value IS the channel volume (linear gain), the curve of YouTube Music's own
+                    // player (Nick, 2026-10-18: the old cube made 75% about -7.5 dB, "so quiet").
+                    // Mixers show the cube root, so pavucontrol's percent differs from the slider.
+                    volume: volume.slider,
                     paused,
                     watch,
                     consumer,
@@ -522,7 +518,7 @@ impl Output {
 
 struct Setup {
     rate: u32,
-    /// PipeWire channel volume (already mapped from the slider value).
+    /// PipeWire channel volume (the slider value itself).
     volume: f32,
     paused: bool,
     watch: Watchers,
@@ -666,7 +662,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
             let _ = control_stream.set_active(on);
         }
         Control::Volume(ours) => {
-            let v = volume.borrow_mut().change(channel_volume(ours.slider));
+            let v = volume.borrow_mut().change(ours.slider);
             set_volume(&control_stream, v);
             // The volume before the seq: a reader that sees the seq sees this volume (or a
             // mixer's, set after it).
@@ -697,7 +693,7 @@ fn run(setup: Setup, ready: &std::sync::mpsc::SyncSender<Result<(), Error>>) -> 
 /// sending the volume again there would undo a change the user made in a mixer since (step 1
 /// parked Minor 5).
 struct VolumeGate {
-    /// PipeWire channel volume (already mapped from the slider value).
+    /// PipeWire channel volume (the slider value itself).
     value: f32,
     /// The stream has run once: its controls stay as set from now on.
     settled: bool,
@@ -738,7 +734,7 @@ impl VolumeGate {
             return None;
         }
         self.value = v;
-        Some(v.cbrt().min(1.0))
+        Some(v.min(1.0))
     }
 
     /// The stream's new state: what to send now, if anything.
@@ -977,9 +973,9 @@ mod tests {
         v.state(&StreamState::Streaming);
         // Our own value coming back is no change (no loop between our set and the readback).
         assert_eq!(v.readback(&[0.125, 0.125]), None);
-        // A mixer's: adopted, as the slider value (the cube root), from the loudest channel.
+        // A mixer's: adopted as the slider value, from the loudest channel.
         let slider = v.readback(&[0.064, 0.027]).unwrap();
-        assert!((slider - 0.4).abs() < 1e-5, "{slider}");
+        assert!((slider - 0.064).abs() < 1e-5, "{slider}");
         // It is the gate's value now: it coming back again is no change either.
         assert_eq!(v.readback(&[0.064, 0.064]), None);
         assert_eq!(v.readback(&[]), None);
@@ -1006,13 +1002,6 @@ mod tests {
         shared.volume.store(0.2f32.to_bits(), Ordering::Release);
         sink.open(48_000, 2).unwrap();
         assert_eq!(VOLUMES.with(|v| v.take()), [0.7]);
-    }
-
-    #[test]
-    fn volume_is_cubic() {
-        assert_eq!(channel_volume(1.0), 1.0);
-        assert_eq!(channel_volume(0.0), 0.0);
-        assert!((channel_volume(0.5) - 0.125).abs() < 1e-7);
     }
 
     // Connections made by `fake_connect`, per test thread (tests run in parallel).

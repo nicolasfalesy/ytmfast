@@ -317,14 +317,14 @@ fn volume_not_reapplied_on_pause() {
     player.play();
     assert_eq!(next_event(&events), AudioEvent::Started);
     let node = common::link(&dir);
-    // Ours: 0.5 on the slider is 0.125 on the channels (cubic).
-    common::wait_for_volume(&dir, node, 0.125);
+    // Ours: 0.5 on the slider is 0.5 on the channels (linear).
+    common::wait_for_volume(&dir, node, 0.5);
     // The user turns it down in a mixer.
     common::set_volume(&dir, node, 0.3);
     common::wait_for_volume(&dir, node, 0.3);
-    // The player reports the mixer's change (as the slider value, the cube root).
+    // The player reports the mixer's change as the slider value (the same number).
     match next_event(&events) {
-        AudioEvent::VolumeChanged(v) => assert!((v - 0.3f32.cbrt()).abs() < 1e-3, "{v}"),
+        AudioEvent::VolumeChanged(v) => assert!((v - 0.3).abs() < 1e-3, "{v}"),
         other => panic!("expected the mixer's volume, got {other:?}"),
     }
     player.pause();

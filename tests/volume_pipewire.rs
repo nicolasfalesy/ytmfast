@@ -67,13 +67,13 @@ fn a_mixer_volume_is_read_back_and_kept_on_a_new_stream() {
     player.play();
     assert_eq!(next_event(&events), AudioEvent::Started);
     let node = common::link(&dir);
-    // Ours: 0.5 on the slider is 0.125 on the channels (cubic). It is not reported back.
-    common::wait_for_volume(&dir, node, 0.125);
+    // Ours: 0.5 on the slider is 0.5 on the channels (linear). It is not reported back.
+    common::wait_for_volume(&dir, node, 0.5);
     let seen = events_for(&events, Duration::from_millis(300));
     assert_eq!(volume_changes(&seen), [] as [f32; 0], "{seen:?}");
 
-    // The user turns it down in a mixer: 0.064 on the channels is 0.4 on the slider.
-    common::set_volume(&dir, node, 0.064);
+    // The user turns it down in a mixer: 0.4 on the channels is 0.4 on the slider.
+    common::set_volume(&dir, node, 0.4);
     let seen = events_for(&events, Duration::from_millis(500));
     let changes = volume_changes(&seen);
     assert_eq!(changes.len(), 1, "{seen:?}");
@@ -87,7 +87,7 @@ fn a_mixer_volume_is_read_back_and_kept_on_a_new_stream() {
     // drop it, so the link goes to the new one (node ids can be reused, so not by its id).
     std::thread::sleep(Duration::from_millis(300));
     let new_node = common::link(&dir);
-    common::wait_for_volume(&dir, new_node, 0.064);
+    common::wait_for_volume(&dir, new_node, 0.4);
 
     // A change of ours still applies, and is not reported back either.
     player.set_volume(1.0);
