@@ -11,6 +11,16 @@ use ytmfast::auth::{Cookie, Session};
 use ytmfast::error::Error;
 use ytmfast::streams::ytdlp::{YtDlp, YtDlpCommand};
 
+/// One of these tests at a time. Why: a test writes its stand-in script and then executes it
+/// (the system-yt-dlp test runs the script itself, not through `/bin/sh`). If another test
+/// forks a child in the gap between the script's write and its exec, that child briefly holds
+/// the script's write descriptor, and the exec fails with ETXTBSY ("Text file busy", seen as
+/// `StreamFailed("could not run yt-dlp")`). Measured 2026-10-18 with the binary looped under
+/// 32 busy loops: 4 failures in 560 runs. The tests are tiny (0.06 s together), so taking turns
+/// costs nothing. It also keeps `set_var` away from another test's spawn and keeps the
+/// memory-peak test from counting its neighbours.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn session() -> Session {
     Session {
         cookies: vec![Cookie {
@@ -58,6 +68,7 @@ fn has_line(log: &str, line: &str) -> bool {
 
 #[tokio::test]
 async fn the_child_gets_an_allowlisted_environment_only() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     // SAFETY: names no other test reads.
     unsafe {
         std::env::set_var("YTMFAST_TEST_CANARY", "from-the-daemon");
@@ -117,6 +128,7 @@ async fn path_the_child_sees(system: bool) -> String {
 
 #[tokio::test]
 async fn the_system_yt_dlp_gets_a_fixed_path() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     // yt-dlp finds its JS runtime (deno) through PATH, and the service's PATH can begin with
     // folders the user's own tools can write to: a deno found there would run with the
     // user's sign-in. The system copy gets only the system folders.
@@ -127,6 +139,7 @@ async fn the_system_yt_dlp_gets_a_fixed_path() {
 
 #[tokio::test]
 async fn a_yt_dlp_found_through_path_keeps_the_engines_path() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     // It came from PATH, so it (and what it starts) needs that PATH to be found at all.
     // SAFETY: as above.
     unsafe { std::env::set_var("PATH", "/home/someone/shims:/usr/bin:/bin") };
@@ -138,6 +151,7 @@ async fn a_yt_dlp_found_through_path_keeps_the_engines_path() {
 
 #[tokio::test]
 async fn yt_dlp_is_told_not_to_load_plugins() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let (_, log) = run("echo '{}'").await;
     // `--ignore-config` alone does not stop it loading Python plugins from user-writable
     // plugin folders, and it holds the user's sign-in.
@@ -159,6 +173,7 @@ fn peak_kib() -> u64 {
 
 #[tokio::test]
 async fn output_over_the_cap_is_cut_off_while_it_is_read() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let _ = std::fs::write("/proc/self/clear_refs", "5");
     let before = peak_kib();
     // 160 MiB from the stand-in: five times the 32 MiB answer cap.
@@ -173,6 +188,7 @@ async fn output_over_the_cap_is_cut_off_while_it_is_read() {
 
 #[tokio::test]
 async fn an_answer_under_the_cap_still_comes_back_whole() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let (out, _) = run("printf '{\"id\":\"x\"}'").await;
     assert_eq!(out.unwrap(), b"{\"id\":\"x\"}");
 }
