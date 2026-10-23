@@ -14,6 +14,10 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/claude-builds/ytmfast/
 # On battery, run through nic-build when it is installed (keeps builds off the P-cores).
 run=""
 if command -v nic-build >/dev/null 2>&1; then run="nic-build"; fi
+# Dependencies: RustSec advisories, licences, bans and sources (deny.toml), the same check as
+# .github/workflows/deny.yml. It builds nothing, so it runs first.
+command -v cargo-deny >/dev/null 2>&1 || { echo "pre-push: cargo-deny is not installed (sudo pacman -S cargo-deny)" >&2; exit 1; }
+cargo deny --workspace --locked check
 $run cargo fmt --check
 $run cargo clippy --all-targets --locked -- -D warnings
 $run cargo test --locked
