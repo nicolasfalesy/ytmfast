@@ -14,6 +14,16 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/claude-builds/ytmfast/
 # On battery, run through nic-build when it is installed (keeps builds off the P-cores).
 run=""
 if command -v nic-build >/dev/null 2>&1; then run="nic-build"; fi
+# Dependencies: RustSec advisories, licences, bans and sources (deny.toml), the same check as
+# .github/workflows/deny.yml. It builds nothing, so it runs first.
+# The cargo-deny version CI installs (.github/workflows/deny.yml) is the only one this hook
+# accepts: another version could read deny.toml differently. After a laptop update, bump the
+# version and sha256 there (as with rust-toolchain.toml).
+pin=$(sed -n 's/^ *dir=cargo-deny-\([0-9.]*\)-.*/\1/p' .github/workflows/deny.yml)
+command -v cargo-deny >/dev/null 2>&1 || { echo "pre-push: cargo-deny is not installed (cargo install --locked cargo-deny@$pin)" >&2; exit 1; }
+deny=$(cargo deny --version | cut -d' ' -f2)
+[ "$deny" = "$pin" ] || { echo "pre-push: the laptop has cargo-deny $deny but CI pins $pin: install $pin, or bump .github/workflows/deny.yml" >&2; exit 1; }
+cargo deny --workspace --locked check
 $run cargo fmt --check
 $run cargo clippy --all-targets --locked -- -D warnings
 $run cargo test --locked

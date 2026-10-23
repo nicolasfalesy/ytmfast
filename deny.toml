@@ -1,0 +1,52 @@
+# cargo deny: RustSec advisories, licences, banned crates and crate sources. hooks/pre-push and
+# .github/workflows/deny.yml both run `cargo deny --locked check` (his pick, 2026-10-22). The policy is
+# nic-bitwarden's, plus three licences found in these tools' dependencies (his pick, 2026-10-23).
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+# Every advisory and every yanked crate fails the check; an exception is listed here with its reason.
+yanked = "deny"
+# cargo-deny only fails unsound advisories on direct dependencies unless told otherwise.
+unsound = "all"
+# The default today, written out so a new cargo-deny default cannot loosen it.
+unmaintained = "all"
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "IJG",
+]
+confidence-threshold = 0.9
+# One list for every repo, so a licence it does not use yet is not worth a warning.
+unused-allowed-license = "allow"
+# Crates with publish = false (all of his own) are skipped by the licence check.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between his own unpublished crates have no version to pin.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -93,6 +93,8 @@ Building needs Rust (CI uses the version pinned in `rust-toolchain.toml`), clang
 
 ## Checks
 
+`hooks/pre-push` first runs `cargo deny --workspace --locked check` (deny.toml: RustSec advisories, yanked crates, licences, wildcard and duplicate versions, and crate sources). It needs exactly the cargo-deny version `.github/workflows/deny.yml` pins (0.20.2 today): `cargo install --locked cargo-deny@0.20.2`, or Arch's package while it is that version. `.github/workflows/deny.yml` runs the same check in CI on every push and pull request, and every Monday.
+
 `hooks/pre-push` runs the same checks as CI (`cargo fmt --check`, clippy with `-D warnings`, debug and
 release `cargo test`, and the release binary size limit), and refuses to run when the Rust on the machine
 is not the version pinned in `rust-toolchain.toml`. Turn it on once per clone:
