@@ -16,7 +16,11 @@ run=""
 if command -v nic-build >/dev/null 2>&1; then run="nic-build"; fi
 # Dependencies: RustSec advisories, licences, bans and sources (deny.toml), the same check as
 # .github/workflows/deny.yml. It builds nothing, so it runs first.
-command -v cargo-deny >/dev/null 2>&1 || { echo "pre-push: cargo-deny is not installed (sudo pacman -S cargo-deny)" >&2; exit 1; }
+command -v cargo-deny >/dev/null 2>&1 || { echo "pre-push: cargo-deny is not installed (sudo pacman -S cargo-deny, or cargo install --locked cargo-deny@0.20.2)" >&2; exit 1; }
+# CI pins cargo-deny 0.20.2 (.github/workflows/deny.yml); another version could read deny.toml
+# differently. After a laptop update, bump the pin there (as with rust-toolchain.toml).
+deny=$(cargo deny --version | cut -d' ' -f2)
+[ "$deny" = 0.20.2 ] || { echo "pre-push: the laptop has cargo-deny $deny but CI pins 0.20.2: bump .github/workflows/deny.yml" >&2; exit 1; }
 cargo deny --workspace --locked check
 $run cargo fmt --check
 $run cargo clippy --all-targets --locked -- -D warnings
