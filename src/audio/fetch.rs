@@ -34,13 +34,18 @@ use crate::streams::Stream;
 const CHUNK: u64 = 10 << 20;
 
 /// The per-track cap from the spec: a bogus length can't make the engine allocate more.
-/// 128 MiB (his pick, 2026-10-24; it was 32 MiB). The engine prefers itag 774/141 at 256 kbps,
-/// about 32 KB/s, so 32 MiB cut off anything over roughly 17-25 minutes (DJ mixes, album-length
-/// uploads); 128 MiB is about 70 minutes. The whole track is held in memory, so the peak is one
-/// cap for the playing track plus one for the preloaded next track (256 MiB), on top of the
-/// idle ~57 MB, under the service's `MemoryMax=512M` (hardening.conf). Raising this much further
-/// needs that limit looked at first.
+/// 128 MiB (chosen 2026-10-24; it was 32 MiB). The engine prefers itag 774/141 at a nominal
+/// 256 kbps (about 32 KB/s): 32 MiB ran out after about 17 minutes, and about 25 for
+/// lower-bitrate VBR uploads (DJ mixes, album-length uploads). 128 MiB is about 70 minutes at
+/// 256 kbps. The whole track is held in memory, so the peak is about 256 MiB of track data at
+/// most (the playing track plus the preloaded next one), plus `Vec` growth when the length is
+/// unknown. Child processes such as yt-dlp and deno share the service's memory limit
+/// (`MemoryMax` in hardening.conf), so raise that before raising this much further.
 pub const MAX_TRACK: u64 = 128 << 20;
+
+// Pins the two-track budget (playing + preloaded) against the service's MemoryMax. The limit is
+// being raised, not lowered; if it ever drops below this, the build must say so.
+const _: () = assert!(2 * MAX_TRACK < (512 << 20));
 
 /// Waits before each retry in a failure streak; once they are used up, the next failure
 /// ends the download (the first try plus five retries).
@@ -192,7 +197,12 @@ impl Shared {
 
     /// Sets the track's length, or checks it against the one already known.
     fn set_total(&self, total: u64) -> Result<(), Error> {
-        if total > MAX_TRACK {
+        self.set_total_within(total, MAX_TRACK)
+    }
+
+    /// `set_total` with the cap as a parameter, so a test can reach the edge without 128 MiB.
+    fn set_total_within(&self, total: u64, cap: u64) -> Result<(), Error> {
+        if total > cap {
             return Err(too_large());
         }
         let mut st = self.lock();
@@ -221,8 +231,13 @@ impl Shared {
 
     /// Appends bytes that continue the track, refusing to grow past the cap.
     fn append(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.append_within(bytes, MAX_TRACK)
+    }
+
+    /// `append` with the cap as a parameter (see `set_total_within`).
+    fn append_within(&self, bytes: &[u8], cap: u64) -> Result<(), Error> {
         let mut st = self.lock();
-        if (st.data.len() + bytes.len()) as u64 > MAX_TRACK {
+        if (st.data.len() + bytes.len()) as u64 > cap {
             return Err(too_large());
         }
         st.data.extend_from_slice(bytes);
@@ -233,6 +248,17 @@ impl Shared {
     fn progress(&self) -> (u64, Option<u64>) {
         let st = self.lock();
         (st.data.len() as u64, st.total)
+    }
+}
+
+/// The log line for a failed download. A track over the cap gets its own line, so a cut-off
+/// long mix can be told apart from a network failure. Any other error logs the code only
+/// (ruling R6): messages never carry the link, but a log needs no more than the code.
+fn failure_log(e: &Error) -> String {
+    if *e == too_large() {
+        format!("ytmfast: track too large (over {} MiB)", MAX_TRACK >> 20)
+    } else {
+        format!("ytmfast: track download failed ({})", e.code())
     }
 }
 
@@ -295,9 +321,7 @@ impl TrackBuffer {
                     let end = match job.run(declared).await {
                         Ok(()) => End::Done,
                         Err(e) => {
-                            // The code only (ruling R6): messages never carry the link, but a
-                            // log needs no more than the code.
-                            eprintln!("ytmfast: track download failed ({})", e.code());
+                            eprintln!("{}", failure_log(&e));
                             End::Failed(e)
                         }
                     };
@@ -827,32 +851,47 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_is_128_mib_and_refuses_one_byte_more() {
-        assert_eq!(MAX_TRACK, 128 * 1024 * 1024, "his pick, 2026-10-24");
+    fn the_cap_is_128_mib_and_the_refusal_says_so() {
+        assert_eq!(MAX_TRACK, 128 * 1024 * 1024, "chosen 2026-10-24");
         assert_eq!(
-            too_large().to_string(),
-            Error::StreamFailed("the track is too large (over 128 MiB)".into()).to_string()
+            too_large(),
+            Error::StreamFailed("the track is too large (over 128 MiB)".into())
         );
+    }
+
+    #[test]
+    fn a_track_of_exactly_the_cap_is_fine_and_one_byte_more_is_refused() {
+        // A small cap, so the edge costs no memory (the real one is 128 MiB).
+        const CAP: u64 = 1000;
         let shared = Shared {
-            // Zeroed pages are not touched until written, so this costs no real memory.
             state: Mutex::new(State {
-                data: vec![0u8; (MAX_TRACK - 2) as usize],
+                data: vec![0u8; (CAP - 2) as usize],
                 total: None,
                 end: None,
                 waiting: 0,
             }),
             wake: Condvar::new(),
         };
-        // A track of exactly the cap is fine, in the length check and while appending.
-        shared.set_total(MAX_TRACK).unwrap();
-        shared.append(&[1, 2]).unwrap();
-        assert_eq!(shared.progress().0, MAX_TRACK);
-        assert_eq!(shared.append(&[3]), Err(too_large()), "one byte over");
+        assert_eq!(shared.set_total_within(CAP + 1, CAP), Err(too_large()));
+        shared.set_total_within(CAP, CAP).unwrap();
+        shared.append_within(&[1, 2], CAP).unwrap();
+        assert_eq!(shared.progress().0, CAP);
         assert_eq!(
-            shared.progress().0,
-            MAX_TRACK,
-            "the refused byte is not kept"
+            shared.append_within(&[3], CAP),
+            Err(too_large()),
+            "one byte over"
         );
+        assert_eq!(shared.progress().0, CAP, "the refused byte is not kept");
+    }
+
+    #[test]
+    fn a_too_large_track_has_its_own_log_line() {
+        assert_eq!(
+            failure_log(&too_large()),
+            "ytmfast: track too large (over 128 MiB)"
+        );
+        let other = failure_log(&Error::StreamFailed("link https://x/?sig=SECRET".into()));
+        assert_eq!(other, "ytmfast: track download failed (stream_failed)");
     }
 
     #[test]
