@@ -848,7 +848,11 @@ mod tests {
         shared.append(&[1, 2]).unwrap();
         assert_eq!(shared.progress().0, MAX_TRACK);
         assert_eq!(shared.append(&[3]), Err(too_large()), "one byte over");
-        assert_eq!(shared.progress().0, MAX_TRACK, "the refused byte is not kept");
+        assert_eq!(
+            shared.progress().0,
+            MAX_TRACK,
+            "the refused byte is not kept"
+        );
     }
 
     #[test]
