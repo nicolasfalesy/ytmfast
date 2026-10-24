@@ -40,12 +40,18 @@ const CHUNK: u64 = 10 << 20;
 /// 256 kbps. The whole track is held in memory, so the peak is about 256 MiB of track data at
 /// most (the playing track plus the preloaded next one), plus `Vec` growth when the length is
 /// unknown. Child processes such as yt-dlp and deno share the service's memory limit
-/// (`MemoryMax` in hardening.conf), so raise that before raising this much further.
+/// (`MemoryMax=768M` in hardening.conf), so raise that before raising this much further.
 pub const MAX_TRACK: u64 = 128 << 20;
 
-// Pins the two-track budget (playing + preloaded) against the service's MemoryMax. The limit is
-// being raised, not lowered; if it ever drops below this, the build must say so.
-const _: () = assert!(2 * MAX_TRACK < (512 << 20));
+/// Room kept for the child processes (yt-dlp, deno) that share the service's cgroup with the
+/// track buffers.
+const CHILD_HEADROOM: u64 = 256 << 20;
+
+// Pins the budget (the playing track, the preloaded next one, and the children) against
+// `MemoryMax=768M` in hardening.conf (omarchy-desktop,
+// home/.config/systemd/user/ytmfast.service.d/hardening.conf). Lower that limit, or raise this
+// cap, and the build says so.
+const _: () = assert!(2 * MAX_TRACK + CHILD_HEADROOM < (768 << 20));
 
 /// Waits before each retry in a failure streak; once they are used up, the next failure
 /// ends the download (the first try plus five retries).
