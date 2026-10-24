@@ -111,7 +111,9 @@ play-history URLs for **report**.
 ### audio
 
 - **Fetch:** an HTTP range reader (`reqwest`, rustls) downloads the whole track in large bursts. That lets the
-  Wi-Fi radio sleep between songs. Cap 32 MiB a track. If the connection drops, it resumes from the last byte.
+  Wi-Fi radio sleep between songs. Cap 128 MiB a track (about 70 minutes at 256 kbps; it was 32 MiB, which cut off tracks over
+  roughly 17-25 minutes, raised on his pick 2026-10-24). The whole track is in memory: peak 256 MiB with the
+  next track preloaded, under the service's 512 MiB limit. If the connection drops, it resumes from the last byte.
   If the link expires mid-song (HTTP 403), it fetches a new link and resumes from the same byte.
 - **Demux:** `symphonia` (Matroska/WebM for Opus, ISO MP4 for AAC), with seeking through the file's index.
 - **Decode:** libopus (the `opus` crate) for Opus; symphonia's pure-Rust decoder for AAC.

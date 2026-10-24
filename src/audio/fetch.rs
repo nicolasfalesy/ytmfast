@@ -34,7 +34,13 @@ use crate::streams::Stream;
 const CHUNK: u64 = 10 << 20;
 
 /// The per-track cap from the spec: a bogus length can't make the engine allocate more.
-pub const MAX_TRACK: u64 = 32 << 20;
+/// 128 MiB (his pick, 2026-10-24; it was 32 MiB). The engine prefers itag 774/141 at 256 kbps,
+/// about 32 KB/s, so 32 MiB cut off anything over roughly 17-25 minutes (DJ mixes, album-length
+/// uploads); 128 MiB is about 70 minutes. The whole track is held in memory, so the peak is one
+/// cap for the playing track plus one for the preloaded next track (256 MiB), on top of the
+/// idle ~57 MB, under the service's `MemoryMax=512M` (hardening.conf). Raising this much further
+/// needs that limit looked at first.
+pub const MAX_TRACK: u64 = 128 << 20;
 
 /// Waits before each retry in a failure streak; once they are used up, the next failure
 /// ends the download (the first try plus five retries).
@@ -818,6 +824,31 @@ mod tests {
         shared.set_total(10).unwrap();
         assert!(shared.set_total(11).is_err(), "a different length");
         assert_eq!(shared.set_total(MAX_TRACK + 1), Err(too_large()));
+    }
+
+    #[test]
+    fn the_cap_is_128_mib_and_refuses_one_byte_more() {
+        assert_eq!(MAX_TRACK, 128 * 1024 * 1024, "his pick, 2026-10-24");
+        assert_eq!(
+            too_large().to_string(),
+            Error::StreamFailed("the track is too large (over 128 MiB)".into()).to_string()
+        );
+        let shared = Shared {
+            // Zeroed pages are not touched until written, so this costs no real memory.
+            state: Mutex::new(State {
+                data: vec![0u8; (MAX_TRACK - 2) as usize],
+                total: None,
+                end: None,
+                waiting: 0,
+            }),
+            wake: Condvar::new(),
+        };
+        // A track of exactly the cap is fine, in the length check and while appending.
+        shared.set_total(MAX_TRACK).unwrap();
+        shared.append(&[1, 2]).unwrap();
+        assert_eq!(shared.progress().0, MAX_TRACK);
+        assert_eq!(shared.append(&[3]), Err(too_large()), "one byte over");
+        assert_eq!(shared.progress().0, MAX_TRACK, "the refused byte is not kept");
     }
 
     #[test]
