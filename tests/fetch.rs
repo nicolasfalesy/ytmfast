@@ -494,17 +494,17 @@ async fn gives_up_when_relink_fails() {
 }
 
 #[tokio::test]
-async fn cap_32_mib() {
+async fn cap_128_mib() {
     // A declared length over the cap: refused before any request.
     let srv = server(track(1), plain_for(1)).await;
-    let buf = start(&srv, stream(srv.url("a"), Some(33 * MIB)), no_relink());
+    let buf = start(&srv, stream(srv.url("a"), Some(129 * MIB)), no_relink());
     let e = read_all(buf.reader()).await.unwrap_err();
     assert_eq!(ours(&e).code(), "stream_failed", "{e}");
-    assert!(e.to_string().contains("32 MiB"), "{e}");
+    assert!(e.to_string().contains("128 MiB"), "{e}");
     assert!(srv.reqs().is_empty());
 
-    // No declared length, and the server's Content-Range says 33 MiB.
-    let big = 33 * MIB;
+    // No declared length, and the server's Content-Range says 129 MiB (one MiB over the 128 MiB cap, his pick 2026-10-24).
+    let big = 129 * MIB;
     let srv = server(
         track(1),
         Arc::new(move |_, _: &Req| {
@@ -518,7 +518,7 @@ async fn cap_32_mib() {
     let buf = start(&srv, stream(srv.url("a"), None), no_relink());
     let e = read_all(buf.reader()).await.unwrap_err();
     assert_eq!(ours(&e).code(), "stream_failed", "{e}");
-    assert!(e.to_string().contains("32 MiB"), "{e}");
+    assert!(e.to_string().contains("128 MiB"), "{e}");
     assert_eq!(buf.downloaded(), 0);
 }
 
