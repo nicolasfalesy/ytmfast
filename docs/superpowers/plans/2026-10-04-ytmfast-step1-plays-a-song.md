@@ -25,7 +25,7 @@ Steps 2 to 4 get their own plans.
 - Builds go outside `/tmp` (the build folder is large, and `/tmp` is often in RAM).
 - Network: https only, hosts limited to `*.youtube.com`, `*.googlevideo.com`, `*.google.com`, `*.ytimg.com`,
   `*.ggpht.com`, `*.googleusercontent.com` (one allowlist function, used by every request).
-- Caps: 32 MiB per API answer and per track; 1 MiB per socket line; API timeout 10 s.
+- Caps: 32 MiB per API answer and per track (track cap later raised to 128 MiB); 1 MiB per socket line; API timeout 10 s.
 - Session values and signed stream URLs never appear in logs, errors or test output.
 - Session: in the login keyring via Secret Service (`oo7` 0.6), label "ytmfast session", attribute `application=ytmfast`; never a plain file.
 - State: `$XDG_STATE_HOME/ytmfast/` (0700). Cache: `$XDG_CACHE_HOME/ytmfast/`.
@@ -182,7 +182,7 @@ Steps 2 to 4 get their own plans.
   - `downloads_whole_track_in_bursts`: Range requests of 10 MiB chunks (one here), and the bytes match.
   - `resumes_after_drop`: the server cuts the connection at 1 MiB, and the next request has `Range: bytes=1048576-`.
   - `relinks_on_403`: the first URL answers 403 at 2 MiB, `relink` is called once, and the download continues from 2 MiB on the new URL.
-  - `cap_32_mib`: a 33 MiB content_length gives an Err.
+  - `cap_32_mib`: a 33 MiB content_length gives an Err. (Track cap later raised to 128 MiB; the test is now `cap_128_mib`, with a 129 MiB length.)
   - `seek_beyond_downloaded_waits`: a slow server, `seek(2 MiB)` then `read`, returns the right bytes once they arrive and never hangs past the 10 s test timeout.
   - `gives_up_after_retries`: 5 drops in a row with backoff 1, 2, 4, 8, 16 s (the test uses a paused tokio clock), then the reader gets an io error.
 - [ ] **Step 2: Run** `cargo test --test fetch`. Expected: FAIL.

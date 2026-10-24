@@ -494,17 +494,17 @@ async fn gives_up_when_relink_fails() {
 }
 
 #[tokio::test]
-async fn cap_32_mib() {
+async fn cap_128_mib() {
     // A declared length over the cap: refused before any request.
     let srv = server(track(1), plain_for(1)).await;
-    let buf = start(&srv, stream(srv.url("a"), Some(33 * MIB)), no_relink());
+    let buf = start(&srv, stream(srv.url("a"), Some(129 * MIB)), no_relink());
     let e = read_all(buf.reader()).await.unwrap_err();
     assert_eq!(ours(&e).code(), "stream_failed", "{e}");
-    assert!(e.to_string().contains("32 MiB"), "{e}");
+    assert!(e.to_string().contains("128 MiB"), "{e}");
     assert!(srv.reqs().is_empty());
 
-    // No declared length, and the server's Content-Range says 33 MiB.
-    let big = 33 * MIB;
+    // No declared length, and the server's Content-Range says 129 MiB (one MiB over the 128 MiB cap, chosen 2026-10-24).
+    let big = 129 * MIB;
     let srv = server(
         track(1),
         Arc::new(move |_, _: &Req| {
@@ -518,8 +518,64 @@ async fn cap_32_mib() {
     let buf = start(&srv, stream(srv.url("a"), None), no_relink());
     let e = read_all(buf.reader()).await.unwrap_err();
     assert_eq!(ours(&e).code(), "stream_failed", "{e}");
-    assert!(e.to_string().contains("32 MiB"), "{e}");
+    assert!(e.to_string().contains("128 MiB"), "{e}");
     assert_eq!(buf.downloaded(), 0);
+}
+
+/// A track of `len` bytes that costs almost nothing to make, for sizes where `track()` is slow.
+/// Every MiB starts with its own number, so a resume from the wrong place still shows up.
+fn cheap_track(len: u64) -> Arc<Vec<u8>> {
+    let mut v = vec![0xAB; len as usize];
+    for (i, b) in v.iter_mut().step_by(MIB as usize).enumerate() {
+        *b = i as u8;
+    }
+    Arc::new(v)
+}
+
+/// A track just over the old 32 MiB cap downloads whole: nothing else in the fetch path was
+/// tuned to 32 MiB.
+#[tokio::test]
+async fn a_track_over_the_old_cap_downloads_whole() {
+    let total = 33 * MIB;
+    let data = cheap_track(total);
+    let srv = server(data.clone(), plain_for(total)).await;
+    let buf = start(&srv, stream(srv.url("a"), Some(total)), no_relink());
+    let got = read_all(buf.reader()).await.unwrap();
+    assert!(got == *data, "the bytes differ");
+    assert_eq!(buf.downloaded(), total);
+}
+
+/// The same track, with the connection cut half way through the chunk that crosses 30 MiB:
+/// the resume past the old cap picks up from the last byte.
+#[tokio::test]
+async fn a_track_over_the_old_cap_resumes_after_a_drop_near_30_mib() {
+    let total = 33 * MIB;
+    let data = cheap_track(total);
+    let cut_at = 30 * MIB + MIB / 2;
+    let cut_once = Arc::new(AtomicBool::new(false));
+    let srv = server(
+        data.clone(),
+        Arc::new(move |_, req: &Req| {
+            let (start, end) = req.span(total);
+            let crosses = start <= cut_at && cut_at < end;
+            Reply::Part {
+                start,
+                end,
+                cut: (crosses && !cut_once.swap(true, Ordering::SeqCst)).then_some(cut_at),
+                slow: false,
+            }
+        }),
+    )
+    .await;
+    let buf = start(&srv, stream(srv.url("a"), Some(total)), no_relink());
+    let got = read_all(buf.reader()).await.unwrap();
+    assert!(got == *data, "the bytes differ");
+    let resumed = srv.reqs().into_iter().any(|r| {
+        r.range
+            .as_deref()
+            .is_some_and(|r| r.starts_with(&format!("bytes={cut_at}-")))
+    });
+    assert!(resumed, "no request resumed at {cut_at}: {:?}", srv.reqs());
 }
 
 #[tokio::test]
