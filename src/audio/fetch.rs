@@ -49,8 +49,8 @@ const CHILD_HEADROOM: u64 = 256 << 20;
 
 // Pins the budget (the playing track, the preloaded next one, and the children) against
 // `MemoryMax=768M` in hardening.conf (omarchy-desktop,
-// home/.config/systemd/user/ytmfast.service.d/hardening.conf). Lower that limit, or raise this
-// cap, and the build says so.
+// home/.config/systemd/user/ytmfast.service.d/hardening.conf). The 768 MiB is written here by
+// hand: the build cannot see the deployed limit, so change both together.
 const _: () = assert!(2 * MAX_TRACK + CHILD_HEADROOM < (768 << 20));
 
 /// Waits before each retry in a failure streak; once they are used up, the next failure
