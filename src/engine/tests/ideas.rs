@@ -442,7 +442,22 @@ async fn a_mixer_turning_the_stream_mid_fade_cancels_the_timer_too() {
         .await;
     eventually("the fade begins", || r.stats.volume() < 1.0).await;
     r.stats.mixer_volume(0.3);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for what the engine does, not for a time: the timer is over once it has taken in the
+    // mixer's change (the guard only stops a hang).
+    let t = std::time::Instant::now();
+    while r.status().await.sleep.is_some() {
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "the timer is cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!r.stats.paused(), "cancelled, not run out");
+    // A fade step of ours may have been sent just before the mixer's change, and landed after
+    // it. The audio thread takes its commands in order, so once a pause has landed, everything
+    // sent before it has: the volume it shows is where the engine left it.
+    r.send(EngineCmd::Pause).await;
+    eventually("paused", || r.stats.paused()).await;
     assert_eq!(r.stats.volume(), 0.3, "the mixer's volume stands");
     assert_eq!(r.status().await.sleep, None);
     assert_eq!(r.status().await.volume, 0.3);

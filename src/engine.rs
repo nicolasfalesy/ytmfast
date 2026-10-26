@@ -2115,20 +2115,28 @@ impl Engine {
     /// have reached the output before a mute of ours still on its way there, whose 0 would
     /// then land last and leave the song silent under an "unmuted" status. Sent after it,
     /// this set always lands last. (Not when unmuted: the output already has the volume, and
-    /// the sink keeps the echo of its own sets from coming back as a mixer's.)
+    /// the sink keeps the echo of its own sets from coming back as a mixer's.) The same goes
+    /// for a mixer turned during the sleep timer's fade, against a step of ours still on its way.
     fn mixer_volume(&mut self, v: f32) {
         if !v.is_finite() {
             return;
         }
         // While the sleep timer fades, the sound server tells us of our own steps too; a
         // mixer turned by hand during it means the listener is awake (`sleep.rs`).
-        if self.sleep_fading() {
+        let was_fading = self.sleep_fading();
+        if was_fading {
             if self.sleep_is_our_echo(v) {
                 return;
             }
             self.sleep_volume_touched();
         }
         let v = v.clamp(0.0, 1.0);
+        // A fade step of ours can have been sent after the mixer's change reached the output, and
+        // would stand over it: the listener's volume must land last, so it is sent again (the
+        // timer is over, so no step follows it). Even when it equals the volume we have.
+        if was_fading {
+            self.player.set_volume(v);
+        }
         if v == self.status.volume && !self.status.muted {
             return;
         }
