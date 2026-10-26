@@ -131,6 +131,12 @@ impl NullStats {
     /// as a `PipeWireSink` does when its stream's volume is changed from outside.
     pub fn mixer_volume(&self, v: f32) {
         self.volume.store(v.to_bits(), Ordering::SeqCst);
+        self.mixer_reports(v);
+    }
+
+    /// Only tells the watcher of a mixer change to `v`, without storing it: the output has
+    /// since been set to something else (a late set of ours landed over the mixer's change).
+    pub fn mixer_reports(&self, v: f32) {
         let watcher = self
             .volume_watcher
             .0
