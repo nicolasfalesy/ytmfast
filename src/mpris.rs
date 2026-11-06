@@ -114,10 +114,10 @@ pub async fn serve(
         .build()
         .await
         .map_err(bus_error)?;
-    // Asked for here rather than with `Builder::name`: zbus 5.19's builder requested without
-    // DoNotQueue, and zbus 6's builder adds ALLOW_REPLACEMENT | REPLACE_EXISTING, so a second
-    // daemon could queue for the name or take it over. DO_NOT_QUEUE alone makes a taken name
-    // an error.
+    // Asked for here rather than with `Builder::name`. zbus 5.19's builder asked without
+    // DoNotQueue, so a second daemon queued and took the name when the first one quit. zbus 6's
+    // builder adds ALLOW_REPLACEMENT | REPLACE_EXISTING, so a second daemon would take the name
+    // from a running one at once. DO_NOT_QUEUE alone makes a taken name an error.
     connection
         .request_name_with_flags(BUS_NAME, RequestNameFlags::DO_NOT_QUEUE)
         .await

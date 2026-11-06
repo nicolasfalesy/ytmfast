@@ -474,7 +474,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// Known answers worked out outside this crate: the key with Python's
-    /// `hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)`, the value with
+    /// `hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)`, the values with
     /// `openssl enc -aes-128-cbc -K <key> -iv 2020…20`. The other tests encrypt with the same
     /// crates they decrypt with, so a crate update that broke both sides would pass them.
     #[test]
@@ -485,6 +485,20 @@ mod tests {
         assert_eq!(
             open(&ct, &key, ".youtube.com", 0).as_deref(),
             Some(&b"hello-cookie"[..])
+        );
+        // Version 24 and up (today's Brave): the SHA-256 of the host goes first, made with
+        // `openssl dgst -sha256` and encrypted the same way.
+        let ct24 = hex::decode(concat!(
+            "952468163816c7cc147113d73f083b6aa25bb17159dbfe45297f998fd4932510",
+            "9a48e86e5ea601ff361e47868fa11988"
+        ))
+        .unwrap();
+        let v24 = open(&ct24, &key, ".youtube.com", 24);
+        assert_eq!(v24.as_deref(), Some(&b"hello-cookie"[..]));
+        assert_eq!(
+            open(&ct24, &key, ".google.com", 24),
+            None,
+            "another host's value"
         );
     }
 
