@@ -299,7 +299,7 @@ async fn playback_ping_matches_recipe() {
     let (ts, hash) = signed.split_once('_').unwrap();
     let hash = hash.split_whitespace().next().unwrap();
     let want = Sha1::digest(format!("{ts} fake-sapisid https://music.youtube.com").as_bytes());
-    assert_eq!(hash, format!("{want:x}"));
+    assert_eq!(hash, hex::encode(want));
     report.end(0.5);
 }
 

@@ -24,8 +24,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zbus::fdo::RequestNameFlags;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{ObjectPath, Value};
 use zbus::{Connection, fdo, interface};
+use zbus::{ObjectPath, Variant};
 
 use crate::control::Hub;
 use crate::engine::{EngineCmd, EngineEvent, PlayState, QueueView, Status};
@@ -107,19 +107,18 @@ pub async fn serve(
         Bus::Address(a) => zbus::connection::Builder::address(a.as_str()),
     };
     // The interfaces are registered before the name is requested, so no call that comes
-    // with the name can find them missing.
+    // with the name can find them missing. zbus 6 holds a bad address or path until build().
     let connection = builder
-        .and_then(|b| b.serve_at(OBJECT_PATH, Root { hub }))
-        .and_then(|b| b.serve_at(OBJECT_PATH, player))
-        .map_err(bus_error)?
+        .serve_at(OBJECT_PATH, Root { hub })
+        .serve_at(OBJECT_PATH, player)
         .build()
         .await
         .map_err(bus_error)?;
-    // Asked for here rather than with `Builder::name`: zbus 5.19's builder requests without
-    // DoNotQueue (despite its docs), so a second daemon would sit in the queue and take
-    // over the name when the first one quits. With DoNotQueue a taken name is an error.
+    // Asked for here rather than with `Builder::name`: zbus 5.19's builder requested without
+    // DoNotQueue, and zbus 6's adds ALLOW_REPLACEMENT | REPLACE_EXISTING, so a second daemon
+    // could queue for the name or take it over. DO_NOT_QUEUE alone makes a taken name an error.
     connection
-        .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
+        .request_name_with_flags(BUS_NAME, RequestNameFlags::DO_NOT_QUEUE)
         .await
         .map_err(bus_error)?;
     let follower = tokio::spawn(follow(connection.clone(), state, cmds, events));
@@ -301,31 +300,31 @@ enum Update {
 
 /// The player properties that differ between two views, with their new values. All in one
 /// map, so a new song is one signal rather than one per property.
-fn changes(old: &View, new: &View) -> HashMap<&'static str, Value<'static>> {
+fn changes(old: &View, new: &View) -> HashMap<&'static str, Variant<'static>> {
     let (o, n) = (&old.status, &new.status);
     let mut changed = HashMap::new();
     if playback_status(o.state) != playback_status(n.state) {
-        changed.insert("PlaybackStatus", Value::from(playback_status(n.state)));
+        changed.insert("PlaybackStatus", Variant::from(playback_status(n.state)));
     }
     if o.video_id != n.video_id || o.meta != n.meta || o.album != n.album {
-        changed.insert("Metadata", Value::from(metadata(n)));
+        changed.insert("Metadata", Variant::from(metadata(n)));
     }
     if o.volume != n.volume {
-        changed.insert("Volume", Value::from(f64::from(n.volume)));
+        changed.insert("Volume", Variant::from(f64::from(n.volume)));
     }
     if o.shuffle != n.shuffle {
-        changed.insert("Shuffle", Value::from(n.shuffle));
+        changed.insert("Shuffle", Variant::from(n.shuffle));
     }
     if o.repeat != n.repeat {
-        changed.insert("LoopStatus", Value::from(loop_status(n.repeat)));
+        changed.insert("LoopStatus", Variant::from(loop_status(n.repeat)));
     }
     let (old_next, old_prev) = can_go(&old.queue);
     let (new_next, new_prev) = can_go(&new.queue);
     if old_next != new_next {
-        changed.insert("CanGoNext", Value::from(new_next));
+        changed.insert("CanGoNext", Variant::from(new_next));
     }
     if old_prev != new_prev {
-        changed.insert("CanGoPrevious", Value::from(new_prev));
+        changed.insert("CanGoPrevious", Variant::from(new_prev));
     }
     changed
 }
@@ -400,36 +399,39 @@ fn micros(seconds: f64) -> i64 {
     (seconds * 1e6).round() as i64
 }
 
-fn metadata(status: &Status) -> HashMap<String, Value<'static>> {
+fn metadata(status: &Status) -> HashMap<String, Variant<'static>> {
     let mut m = HashMap::new();
     let id = ObjectPath::try_from(track_id(status.video_id.as_deref()))
         .expect("track_id makes valid object paths");
-    m.insert("mpris:trackid".to_string(), Value::from(id));
+    m.insert("mpris:trackid".to_string(), Variant::from(id));
     if let Some(meta) = status.meta.as_ref().filter(|_| status.video_id.is_some()) {
         // Cleaned again here although every source cleans its text: a NUL in any of these
         // strings gets the whole connection dropped by the bus, and the name with it.
         m.insert(
             "xesam:title".into(),
-            Value::from(crate::text::clean(&meta.title)),
+            Variant::from(crate::text::clean(&meta.title)),
         );
         // A list in the spec: a song can have several artists.
         m.insert(
             "xesam:artist".into(),
-            Value::from(vec![crate::text::clean(&meta.artist)]),
+            Variant::from(vec![crate::text::clean(&meta.artist)]),
         );
         if meta.length_seconds > 0 {
             m.insert(
                 "mpris:length".into(),
-                Value::from(i64::from(meta.length_seconds) * 1_000_000),
+                Variant::from(i64::from(meta.length_seconds) * 1_000_000),
             );
         }
         // The queue item's art when it has some (the engine puts it in `meta` first).
         if let Some(art) = &meta.thumbnail {
-            m.insert("mpris:artUrl".into(), Value::from(art.clone()));
+            m.insert("mpris:artUrl".into(), Variant::from(art.clone()));
         }
     }
     if let Some(album) = status.album.as_ref().filter(|_| status.video_id.is_some()) {
-        m.insert("xesam:album".into(), Value::from(crate::text::clean(album)));
+        m.insert(
+            "xesam:album".into(),
+            Variant::from(crate::text::clean(album)),
+        );
     }
     m
 }
@@ -674,7 +676,7 @@ impl Player {
     }
 
     #[zbus(property)]
-    fn metadata(&self) -> HashMap<String, Value<'static>> {
+    fn metadata(&self) -> HashMap<String, Variant<'static>> {
         metadata(&lock(&self.state).status)
     }
 

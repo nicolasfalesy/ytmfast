@@ -18,7 +18,7 @@ use std::io::{Cursor, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use rusqlite::Connection;
 use rusqlite::limits::Limit;
 use sha2::{Digest, Sha256};
@@ -417,7 +417,7 @@ impl<'a> Keys<'a> {
 /// that belongs to another host.
 fn open(ciphertext: &[u8], key: &[u8; 16], host: &str, meta_version: i64) -> Option<Vec<u8>> {
     let mut plain = cbc::Decryptor::<aes::Aes128>::new(key.into(), &[b' '; 16].into())
-        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
         .ok()?;
     if meta_version >= 24 {
         // The SHA-256 of the host the cookie belongs to, which Chromium prepends so a value
@@ -469,7 +469,7 @@ fn is_pear_main(cmdline: &[u8], profile: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
     use rusqlite::{Connection, params};
     use std::path::PathBuf;
 
@@ -551,7 +551,7 @@ mod tests {
         }
         plaintext.extend_from_slice(value.as_bytes());
         let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            .encrypt_padded_vec::<Pkcs7>(&plaintext);
         let mut out = b"v10".to_vec();
         out.extend_from_slice(&ct);
         out
@@ -568,7 +568,7 @@ mod tests {
         }
         plaintext.extend_from_slice(value.as_bytes());
         let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            .encrypt_padded_vec::<Pkcs7>(&plaintext);
         let mut out = b"v11".to_vec();
         out.extend_from_slice(&ct);
         out

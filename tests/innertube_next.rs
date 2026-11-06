@@ -462,7 +462,7 @@ async fn continuation_request_shape() {
         .expect("authorization scheme");
     let (ts, hash) = signed.split_once('_').unwrap();
     let want = Sha1::digest(format!("{ts} fake-sapisid https://music.youtube.com").as_bytes());
-    assert_eq!(hash, format!("{want:x}"));
+    assert_eq!(hash, hex::encode(want));
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(

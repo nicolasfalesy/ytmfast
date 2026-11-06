@@ -12,11 +12,7 @@ yanked = "deny"
 unsound = "all"
 # The default today, written out so a new cargo-deny default cannot loosen it.
 unmaintained = "all"
-ignore = [
-  { id = "RUSTSEC-2026-0370", reason = "zvariant was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
-  { id = "RUSTSEC-2026-0371", reason = "zbus_names was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
-  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive was folded into zbus 6.0; moving to zbus 6 is its own job (his pick, 2026-10-23)" },
-]
+ignore = []
 
 [licenses]
 allow = [

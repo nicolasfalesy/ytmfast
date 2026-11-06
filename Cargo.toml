@@ -17,9 +17,9 @@ path = "src/main.rs"
 # The audio thread's events (AudioPlayer): a channel any number of listeners can clone.
 crossbeam-channel = "0.5"
 # Chromium "v10" cookie decryption: AES-128-CBC with a PBKDF2-SHA1 key (same versions oo7 already pulls in).
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
-pbkdf2 = { version = "0.12", features = ["hmac"] }
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+pbkdf2 = { version = "0.13", features = ["hmac"] }
 # SessionStore is used as Arc<dyn SessionStore>; plain async fn in a trait is not object safe (ruling R1).
 async-trait = "0.1.92"
 # getuid() for the /run/user/$UID fallback; libc is already in the tree through reqwest.
@@ -36,7 +36,7 @@ icu_normalizer = { version = "2.3", default-features = false, features = ["compi
 regex-lite = "0.1"
 # The session lives in the login keyring over the Secret Service D-Bus API. Default features = tokio +
 # native_crypto (no async-std, no OpenSSL).
-oo7 = "0.6"
+oo7 = "0.7"
 # rustls only (no OpenSSL); http2 because the YouTube hosts speak it and it saves connections.
 # gzip + brotli: the 3 MB player script and the API answers shrink by about two thirds on the
 # wire. `net::read_capped` counts the DECODED chunks, so the 32 MiB cap holds against an
@@ -61,14 +61,17 @@ serde = { version = "1.0.229", features = ["derive"] }
 # No other dependency turns it on; `sections_follow_page_order_not_key_order` fails without it.
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 # SAPISIDHASH is a SHA-1; Chromium v24+ cookies start with a SHA-256 of the host.
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
+# The SAPISIDHASH's hex (0.11 digests no longer format with {:x}). Already in the tree
+# through oo7 and zbus, so no new crate comes in for it.
+hex = "0.4"
 # Demux only the two containers YouTube serves audio in (WebM, MP4), and decode AAC.
 symphonia = { version = "0.6", default-features = false, features = ["mkv", "isomp4", "aac"] }
 thiserror = "2"
 # MPRIS, on zbus directly (already in the tree through oo7): the connection can be pointed at
 # a private test bus by address, with no process-wide DBUS_SESSION_BUS_ADDRESS change.
-zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+zbus = { version = "6.2", default-features = false, features = ["tokio"] }
 # sync: the async lock that keeps session saves in order (innertube), and the solver thread's
 # reply channel. process + time: the yt-dlp fallback, killed after 30 s. net + io-util: the
 # control socket. signal: a clean stop on SIGTERM/SIGINT.

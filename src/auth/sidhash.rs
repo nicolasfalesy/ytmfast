@@ -34,7 +34,7 @@ pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<S
         .filter_map(|(scheme, sid)| {
             let sid = (*sid)?;
             let hash = Sha1::digest(format!("{now_unix} {sid} {origin}").as_bytes());
-            Some(format!("{scheme} {now_unix}_{hash:x}"))
+            Some(format!("{scheme} {now_unix}_{}", hex::encode(hash)))
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -57,7 +57,7 @@ mod tests {
     }
 
     fn sha1_hex(s: &str) -> String {
-        format!("{:x}", Sha1::digest(s.as_bytes()))
+        hex::encode(Sha1::digest(s.as_bytes()))
     }
 
     const ORIGIN: &str = "https://www.youtube.com";
