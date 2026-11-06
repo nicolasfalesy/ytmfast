@@ -18,7 +18,7 @@ use std::io::{Cursor, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use rusqlite::Connection;
 use rusqlite::limits::Limit;
 use sha2::{Digest, Sha256};
@@ -417,7 +417,7 @@ impl<'a> Keys<'a> {
 /// that belongs to another host.
 fn open(ciphertext: &[u8], key: &[u8; 16], host: &str, meta_version: i64) -> Option<Vec<u8>> {
     let mut plain = cbc::Decryptor::<aes::Aes128>::new(key.into(), &[b' '; 16].into())
-        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
         .ok()?;
     if meta_version >= 24 {
         // The SHA-256 of the host the cookie belongs to, which Chromium prepends so a value
@@ -469,9 +469,38 @@ fn is_pear_main(cmdline: &[u8], profile: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
     use rusqlite::{Connection, params};
     use std::path::PathBuf;
+
+    /// Known answers worked out outside this crate: the key with Python's
+    /// `hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)`, the values with
+    /// `openssl enc -aes-128-cbc -K <key> -iv 2020…20`. The other tests encrypt with the same
+    /// crates they decrypt with, so a crate update that broke both sides would pass them.
+    #[test]
+    fn v10_key_and_value_match_outside_tools() {
+        let key = derive_key(b"peanuts");
+        assert_eq!(hex::encode(key), "fd621fe5a2b402539dfa147ca9272778");
+        let ct = hex::decode("05f5608cad46e8079a9cf268dbb57729").unwrap();
+        assert_eq!(
+            open(&ct, &key, ".youtube.com", 0).as_deref(),
+            Some(&b"hello-cookie"[..])
+        );
+        // Version 24 and up (today's Brave): the SHA-256 of the host goes first, made with
+        // `openssl dgst -sha256` and encrypted the same way.
+        let ct24 = hex::decode(concat!(
+            "952468163816c7cc147113d73f083b6aa25bb17159dbfe45297f998fd4932510",
+            "9a48e86e5ea601ff361e47868fa11988"
+        ))
+        .unwrap();
+        let v24 = open(&ct24, &key, ".youtube.com", 24);
+        assert_eq!(v24.as_deref(), Some(&b"hello-cookie"[..]));
+        assert_eq!(
+            open(&ct24, &key, ".google.com", 24),
+            None,
+            "another host's value"
+        );
+    }
 
     /// Chromium time for a Unix time: microseconds since 1601-01-01.
     fn chromium_time(unix: i64) -> i64 {
@@ -551,7 +580,7 @@ mod tests {
         }
         plaintext.extend_from_slice(value.as_bytes());
         let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            .encrypt_padded_vec::<Pkcs7>(&plaintext);
         let mut out = b"v10".to_vec();
         out.extend_from_slice(&ct);
         out
@@ -568,7 +597,7 @@ mod tests {
         }
         plaintext.extend_from_slice(value.as_bytes());
         let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+            .encrypt_padded_vec::<Pkcs7>(&plaintext);
         let mut out = b"v11".to_vec();
         out.extend_from_slice(&ct);
         out

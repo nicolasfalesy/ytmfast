@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use ytmfast::auth::chromium::KeySource;
@@ -68,7 +68,7 @@ fn v11(password: &str, host: &str, value: &str) -> Vec<u8> {
     let mut plaintext = Sha256::digest(host.as_bytes()).to_vec();
     plaintext.extend_from_slice(value.as_bytes());
     let ct = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &[b' '; 16].into())
-        .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        .encrypt_padded_vec::<Pkcs7>(&plaintext);
     [b"v11".as_slice(), &ct].concat()
 }
 

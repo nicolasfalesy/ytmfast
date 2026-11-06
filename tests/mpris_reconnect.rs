@@ -151,7 +151,6 @@ fn fake_engine() -> (mpsc::Sender<EngineCmd>, broadcast::Sender<EngineEvent>) {
 
 async fn client(address: &str) -> Connection {
     zbus::connection::Builder::address(address)
-        .unwrap()
         .build()
         .await
         .unwrap()
@@ -160,7 +159,7 @@ async fn client(address: &str) -> Connection {
 async fn name_has_owner(address: &str) -> bool {
     let Ok(Ok(c)) = tokio::time::timeout(
         Duration::from_secs(2),
-        zbus::connection::Builder::address(address).unwrap().build(),
+        zbus::connection::Builder::address(address).build(),
     )
     .await
     else {

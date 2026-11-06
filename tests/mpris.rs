@@ -26,8 +26,8 @@ use ytmfast::innertube::{NextPage, NextRequest, SongItem};
 use ytmfast::mpris::{self, Bus, Mpris};
 use ytmfast::queue::{QueueItem, Repeat};
 use ytmfast::streams::{Resolver, Stream, TrackMeta};
-use zbus::zvariant::{ObjectPath, OwnedValue};
 use zbus::{Connection, Proxy};
+use zbus::{ObjectPath, OwnedVariant};
 
 const NAME: &str = "org.mpris.MediaPlayer2.ytmfast";
 const PATH: &str = "/org/mpris/MediaPlayer2";
@@ -293,7 +293,6 @@ async fn rig(initial: Status) -> Rig {
 
 async fn client(address: &str) -> Connection {
     zbus::connection::Builder::address(address)
-        .unwrap()
         .build()
         .await
         .unwrap()
@@ -303,11 +302,8 @@ async fn client(address: &str) -> Connection {
 async fn proxy(conn: &Connection, interface: &'static str) -> Proxy<'static> {
     zbus::proxy::Builder::new(conn)
         .destination(NAME)
-        .unwrap()
         .path(PATH)
-        .unwrap()
         .interface(interface)
-        .unwrap()
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
@@ -321,11 +317,11 @@ async fn call(p: &Proxy<'_>, method: &str) {
         .unwrap();
 }
 
-async fn metadata(p: &Proxy<'_>) -> HashMap<String, OwnedValue> {
+async fn metadata(p: &Proxy<'_>) -> HashMap<String, OwnedVariant> {
     p.get_property("Metadata").await.unwrap()
 }
 
-fn track_id(m: &HashMap<String, OwnedValue>) -> String {
+fn track_id(m: &HashMap<String, OwnedVariant>) -> String {
     let path: ObjectPath = m["mpris:trackid"].downcast_ref().unwrap();
     path.to_string()
 }
@@ -443,9 +439,7 @@ async fn metadata_follows_state_event() {
 
     let props = zbus::fdo::PropertiesProxy::builder(&r.client)
         .destination(NAME)
-        .unwrap()
         .path(PATH)
-        .unwrap()
         .build()
         .await
         .unwrap();
@@ -506,9 +500,7 @@ async fn position_is_read_on_demand_without_change_signals() {
     let r = rig(playing("dQw4w9WgXcQ", 1.0)).await;
     let props = zbus::fdo::PropertiesProxy::builder(&r.client)
         .destination(NAME)
-        .unwrap()
         .path(PATH)
-        .unwrap()
         .build()
         .await
         .unwrap();
@@ -611,9 +603,7 @@ async fn next_and_previous_send_the_commands() {
 async fn properties(client: &Connection) -> zbus::fdo::PropertiesProxy<'static> {
     zbus::fdo::PropertiesProxy::builder(client)
         .destination(NAME)
-        .unwrap()
         .path(PATH)
-        .unwrap()
         .build()
         .await
         .unwrap()
@@ -630,8 +620,8 @@ async fn can_go(p: &Proxy<'_>) -> (bool, bool) {
 /// that names it.
 async fn changed<T>(changes: &mut zbus::fdo::PropertiesChangedStream, prop: &str) -> T
 where
-    T: TryFrom<OwnedValue>,
-    <T as TryFrom<OwnedValue>>::Error: std::fmt::Debug,
+    T: TryFrom<OwnedVariant>,
+    <T as TryFrom<OwnedVariant>>::Error: std::fmt::Debug,
 {
     loop {
         let signal = tokio::time::timeout(WAIT, changes.next())
@@ -640,7 +630,7 @@ where
             .unwrap();
         let args = signal.args().unwrap();
         if let Some(v) = args.changed_properties().get(prop) {
-            let owned = OwnedValue::try_from(v.try_clone().unwrap()).unwrap();
+            let owned = OwnedVariant::try_from(v.try_clone().unwrap()).unwrap();
             return T::try_from(owned).unwrap();
         }
     }

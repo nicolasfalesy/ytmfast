@@ -34,7 +34,7 @@ pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<S
         .filter_map(|(scheme, sid)| {
             let sid = (*sid)?;
             let hash = Sha1::digest(format!("{now_unix} {sid} {origin}").as_bytes());
-            Some(format!("{scheme} {now_unix}_{hash:x}"))
+            Some(format!("{scheme} {now_unix}_{}", hex::encode(hash)))
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -57,7 +57,7 @@ mod tests {
     }
 
     fn sha1_hex(s: &str) -> String {
-        format!("{:x}", Sha1::digest(s.as_bytes()))
+        hex::encode(Sha1::digest(s.as_bytes()))
     }
 
     const ORIGIN: &str = "https://www.youtube.com";
@@ -69,13 +69,10 @@ mod tests {
             account: None,
             browser_stamp: None,
         };
-        let expected = format!(
-            "SAPISIDHASH 1700000000_{}",
-            sha1_hex("1700000000 abc https://www.youtube.com")
-        );
+        // The hash from `sha1sum`, not from the sha1/hex crates the code itself uses.
         assert_eq!(
-            authorization(&session, ORIGIN, 1_700_000_000),
-            Some(expected)
+            authorization(&session, ORIGIN, 1_700_000_000).as_deref(),
+            Some("SAPISIDHASH 1700000000_27b236f59d4ec583d7530f2c7055d2f9c6aecf92")
         );
     }
 
