@@ -473,6 +473,21 @@ mod tests {
     use rusqlite::{Connection, params};
     use std::path::PathBuf;
 
+    /// Known answers worked out outside this crate: the key with Python's
+    /// `hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)`, the value with
+    /// `openssl enc -aes-128-cbc -K <key> -iv 2020…20`. The other tests encrypt with the same
+    /// crates they decrypt with, so a crate update that broke both sides would pass them.
+    #[test]
+    fn v10_key_and_value_match_outside_tools() {
+        let key = derive_key(b"peanuts");
+        assert_eq!(hex::encode(key), "fd621fe5a2b402539dfa147ca9272778");
+        let ct = hex::decode("05f5608cad46e8079a9cf268dbb57729").unwrap();
+        assert_eq!(
+            open(&ct, &key, ".youtube.com", 0).as_deref(),
+            Some(&b"hello-cookie"[..])
+        );
+    }
+
     /// Chromium time for a Unix time: microseconds since 1601-01-01.
     fn chromium_time(unix: i64) -> i64 {
         (unix + 11_644_473_600) * 1_000_000

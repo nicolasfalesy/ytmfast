@@ -89,7 +89,7 @@ pkg-config = "0.3"
 [dev-dependencies]
 # Makes a brotli answer for the compression test (the same crate reqwest's brotli decoding uses).
 brotli = "9"
-# StreamExt for the MPRIS tests' signal streams (already in the tree through reqwest and zbus).
+# StreamExt for the MPRIS tests' signal streams (already in the tree through reqwest and oo7).
 futures-util = { version = "0.3", default-features = false }
 tempfile = "3"
 # net + io-util: a raw TCP test server for the endless chunked answer that wiremock can't send.
