@@ -441,7 +441,7 @@ fn has_sign_in(session: &Session) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    sidhash::authorization(session, clients::TV.origin, now).is_some()
+    sidhash::has_sid(session, clients::TV.origin, now)
 }
 
 /// What `import-session` did about a running engine.
