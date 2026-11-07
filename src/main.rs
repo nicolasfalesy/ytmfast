@@ -435,13 +435,18 @@ fn account_api(session: Arc<Mutex<Session>>, store: Arc<dyn SessionStore>) -> In
 /// The bar widget shows it as it is.
 const BRAVE_NOT_SIGNED_IN: &str = "Brave Origin isn't signed in to YouTube Music";
 
-/// True when the session can sign API requests: it holds a SAPISID cookie for the origin the
-/// `player` request is signed for. Without one every request would be `signed_out`.
+/// True when the session can sign API requests: it holds a SAPISID cookie for the origin of
+/// every client it signs for (`player` goes out as www.youtube.com, the music requests as
+/// music.youtube.com). Without one, that client's requests would all be `signed_out`. Checking
+/// only one origin would let an unusual host-only cookie (for www.youtube.com alone) pass, and
+/// the import would then replace a working session with one that fails every music request.
 fn has_sign_in(session: &Session) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    sidhash::has_sid(session, clients::TV.origin, now)
+    clients::ALL
+        .iter()
+        .all(|c| sidhash::has_sid(session, c.origin, now))
 }
 
 /// What `import-session` did about a running engine.
@@ -1000,6 +1005,20 @@ mod tests {
             browser_stamp: None,
         };
         assert!(has_sign_in(&signed_in));
+        // A host-only SAPISID (no leading dot) for www.youtube.com signs the `player` request
+        // but not the music.youtube.com ones, so it is not a sign-in.
+        let www_only = Session {
+            cookies: vec![cookie("www.youtube.com", "SAPISID")],
+            account: None,
+            browser_stamp: None,
+        };
+        assert!(!has_sign_in(&www_only));
+        let empty = Session {
+            cookies: vec![],
+            account: None,
+            browser_stamp: None,
+        };
+        assert!(!has_sign_in(&empty));
     }
 
     #[test]
