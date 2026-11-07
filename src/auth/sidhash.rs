@@ -3,6 +3,8 @@
 //! This follows yt-dlp's `_get_sid_authorization_header`: for each of three schemes whose
 //! cookie is present, `"{scheme} {ts}_{sha1_hex("{ts} {sid} {origin}")}"`, joined by spaces.
 
+use std::fmt::Write as _;
+
 use sha1::{Digest, Sha1};
 use url::Url;
 
@@ -29,15 +31,31 @@ pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<S
         ("SAPISID1PHASH", get("__Secure-1PAPISID")),
         ("SAPISID3PHASH", get("__Secure-3PAPISID")),
     ];
-    let parts: Vec<String> = schemes
-        .iter()
-        .filter_map(|(scheme, sid)| {
-            let sid = (*sid)?;
-            let hash = Sha1::digest(format!("{now_unix} {sid} {origin}").as_bytes());
-            Some(format!("{scheme} {now_unix}_{}", hex::encode(hash)))
-        })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" "))
+    // Every signed request runs this, so it writes into one output string and reuses one
+    // input buffer and a stack hex buffer, instead of a String per hash input, hex and part
+    // plus a Vec and a join (measured 2026-11-07, see the PR).
+    // Sized up front so neither grows: each part is a scheme (13 bytes), a space, a 10-digit
+    // time, "_" and 40 hex, plus the space between parts.
+    let mut out = String::with_capacity(3 * 66);
+    let mut input = String::with_capacity(origin.len() + 64);
+    for (scheme, sid) in schemes {
+        let Some(sid) = sid else { continue };
+        input.clear();
+        // Writing into a String cannot fail.
+        let _ = write!(input, "{now_unix} {sid} {origin}");
+        let mut hex = [0u8; 40];
+        // A SHA-1 is 20 bytes, so its hex fills the 40 exactly: this cannot fail either.
+        hex::encode_to_slice(Sha1::digest(input.as_bytes()), &mut hex).ok()?;
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let _ = write!(
+            out,
+            "{scheme} {now_unix}_{}",
+            std::str::from_utf8(&hex).ok()?
+        );
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
