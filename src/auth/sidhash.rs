@@ -3,31 +3,85 @@
 //! This follows yt-dlp's `_get_sid_authorization_header`: for each of three schemes whose
 //! cookie is present, `"{scheme} {ts}_{sha1_hex("{ts} {sid} {origin}")}"`, joined by spaces.
 
+use std::borrow::Cow;
+
 use sha1::{Digest, Sha1};
 use url::Url;
 
 use super::Session;
+
+/// The cookies the three schemes read, in the order `authorization` looks them up.
+const SID_NAMES: [&str; 3] = ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"];
+
+/// The host, path and `https` flag `Url::parse(origin)` gives, or `None` when `origin` is not a
+/// URL with a host. Every client origin is a plain `https://` + lowercase host, which comes out
+/// of `Url::parse` unchanged with path `/`, so that form is split by hand: every signed request
+/// runs this, and the parse cost an allocation and most of the time (measured 2026-11-07).
+/// Anything else (a port, upper case, an IP address, punycode, a path) still goes to `Url`.
+fn origin_parts(origin: &str) -> Option<(Cow<'_, str>, Cow<'_, str>, bool)> {
+    if let Some(host) = origin.strip_prefix("https://")
+        && is_plain_host(host)
+    {
+        return Some((host.into(), "/".into(), true));
+    }
+    let url = Url::parse(origin).ok()?;
+    let host = url.host_str()?.to_owned();
+    Some((
+        host.into(),
+        url.path().to_owned().into(),
+        url.scheme() == "https",
+    ))
+}
+
+/// Dot-separated non-empty labels of `a-z`, `0-9` and `-`, the last one starting with a letter
+/// (so it is never read as an IPv4 address) and none starting with `xn--` (punycode, which `Url`
+/// checks). Such a host is one `Url::parse` keeps exactly as written.
+fn is_plain_host(host: &str) -> bool {
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with("xn--")
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }) && host
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
+/// True when `authorization(session, origin, now_unix)` would be `Some`: the session holds a
+/// SAPISID cookie for the origin. Same rules, no hashing, no allocation for a client origin.
+pub fn has_sid(session: &Session, origin: &str, now_unix: u64) -> bool {
+    let Some((host, path, https)) = origin_parts(origin) else {
+        return false;
+    };
+    let Ok(now) = i64::try_from(now_unix) else {
+        return false;
+    };
+    session
+        .matching_host(&host, &path, https, now)
+        .any(|c| SID_NAMES.contains(&c.name.as_str()))
+}
 
 /// The `Authorization` value for a request sent with `Origin: origin` at `now_unix`, or
 /// `None` when the session holds none of the SAPISID cookies (or `origin` is not a URL).
 pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<String> {
     // The SID cookies are the ones the origin's own host would get (yt-dlp reads them for
     // `.youtube.com`), so a `.google.com` SAPISID never signs a youtube.com request.
-    let origin_url = Url::parse(origin).ok()?;
-    let cookies = session.matching(&origin_url, i64::try_from(now_unix).ok()?);
-    let get = |name: &str| {
-        cookies
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.value.as_str())
-    };
+    let (host, path, https) = origin_parts(origin)?;
+    let now = i64::try_from(now_unix).ok()?;
+    // One pass over the jar, keeping the first cookie of each name (as a `find` would).
+    let mut sids: [Option<&str>; 3] = [None; 3];
+    for c in session.matching_host(&host, &path, https, now) {
+        if let Some(i) = SID_NAMES.iter().position(|n| c.name == *n) {
+            sids[i].get_or_insert(c.value.as_str());
+        }
+    }
+    let [sapisid, three_p, one_p] = sids;
     let schemes = [
-        (
-            "SAPISIDHASH",
-            get("SAPISID").or_else(|| get("__Secure-3PAPISID")),
-        ),
-        ("SAPISID1PHASH", get("__Secure-1PAPISID")),
-        ("SAPISID3PHASH", get("__Secure-3PAPISID")),
+        ("SAPISIDHASH", sapisid.or(three_p)),
+        ("SAPISID1PHASH", one_p),
+        ("SAPISID3PHASH", three_p),
     ];
     // Every signed request runs this, so (measured 2026-11-07, ytmfast PR #5): the time is
     // formatted once, the hash takes its pieces directly, a cookie value seen before reuses
@@ -174,6 +228,88 @@ mod tests {
         assert_eq!(authorization(&session, ORIGIN, 1), None);
         assert_eq!(authorization(&Session::default(), ORIGIN, 1), None);
         assert_eq!(authorization(&session, "not a url", 1), None);
+    }
+
+    /// The hand split must give exactly what `Url::parse` does, and leave every origin it
+    /// can't vouch for to `Url`.
+    #[test]
+    fn origin_parts_matches_url_parse() {
+        for origin in crate::innertube::clients::ALL
+            .iter()
+            .map(|c| c.origin)
+            .chain([
+                "https://WWW.YouTube.com",
+                "https://www.youtube.com:443",
+                "https://www.youtube.com:8443",
+                "https://www.youtube.com/",
+                "https://www.youtube.com/youtubei",
+                "https://www.youtube.com.",
+                "https://1.2.3.4",
+                "https://a.123",
+                "https://a.0x1f",
+                "https://xn--nxasmq6b.com",
+                "https://a..b",
+                "https://-a-.b-c",
+                "http://www.youtube.com",
+                "https://",
+                "not a url",
+            ])
+        {
+            let want = Url::parse(origin).ok().and_then(|u| {
+                Some((
+                    u.host_str()?.to_owned(),
+                    u.path().to_owned(),
+                    u.scheme() == "https",
+                ))
+            });
+            let got = origin_parts(origin).map(|(h, p, s)| (h.into_owned(), p.into_owned(), s));
+            assert_eq!(got, want, "{origin}");
+        }
+        assert!(matches!(
+            origin_parts(ORIGIN),
+            Some((Cow::Borrowed(_), Cow::Borrowed(_), true))
+        ));
+    }
+
+    /// `has_sid` answers exactly `authorization(..).is_some()`, without hashing.
+    #[test]
+    fn has_sid_agrees_with_authorization() {
+        let mut google = yt("SAPISID", "google");
+        google.domain = ".google.com".into();
+        let mut expired = yt("SAPISID", "old");
+        expired.expires_utc = Some(1_000);
+        let sessions = [
+            vec![],
+            vec![yt("YSC", "visitor")],
+            vec![yt("SAPISID", "a")],
+            vec![yt("__Secure-3PAPISID", "a")],
+            vec![yt("__Secure-1PAPISID", "a")],
+            vec![google.clone()],
+            vec![google, yt("__Secure-1PAPISID", "a")],
+            vec![expired],
+        ];
+        let origins = [
+            "https://www.youtube.com",
+            "https://music.youtube.com",
+            "not a url",
+        ];
+        for cookies in sessions {
+            let session = Session {
+                cookies,
+                account: None,
+                browser_stamp: None,
+            };
+            for origin in origins {
+                for now in [1_000, 1_700_000_000, u64::MAX] {
+                    assert_eq!(
+                        has_sid(&session, origin, now),
+                        authorization(&session, origin, now).is_some(),
+                        "{:?} {origin} {now}",
+                        session.cookies
+                    );
+                }
+            }
+        }
     }
 
     #[test]
