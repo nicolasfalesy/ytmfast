@@ -14,15 +14,16 @@ use super::Session;
 const SID_NAMES: [&str; 3] = ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"];
 
 /// The host, path and `https` flag `Url::parse(origin)` gives, or `None` when `origin` is not a
-/// URL with a host. Every client origin is a plain `https://` + lowercase host, which comes out
-/// of `Url::parse` unchanged with path `/`, so that form is split by hand: every signed request
-/// runs this, and the parse cost an allocation and most of the time (measured 2026-11-07).
-/// Anything else (a port, upper case, an IP address, punycode, a path) still goes to `Url`.
+/// URL with a host. A client's own origin (every caller's) takes its host from the client
+/// table, checked against `Url::parse` by a test there, so no request parses it; any other
+/// origin still goes to `Url` (measured 2026-11-07: the parse was an allocation and most of
+/// the time per call).
 fn origin_parts(origin: &str) -> Option<(Cow<'_, str>, Cow<'_, str>, bool)> {
-    if let Some(host) = origin.strip_prefix("https://")
-        && is_plain_host(host)
+    if let Some(client) = crate::innertube::clients::ALL
+        .iter()
+        .find(|c| c.origin == origin)
     {
-        return Some((host.into(), "/".into(), true));
+        return Some((client.origin_host.into(), "/".into(), true));
     }
     let url = Url::parse(origin).ok()?;
     let host = url.host_str()?.to_owned();
@@ -33,34 +34,25 @@ fn origin_parts(origin: &str) -> Option<(Cow<'_, str>, Cow<'_, str>, bool)> {
     ))
 }
 
-/// Dot-separated non-empty labels of `a-z`, `0-9` and `-`, the last one starting with a letter
-/// (so it is never read as an IPv4 address) and none starting with `xn--` (punycode, which `Url`
-/// checks). Such a host is one `Url::parse` keeps exactly as written.
-fn is_plain_host(host: &str) -> bool {
-    host.split('.').all(|label| {
-        !label.is_empty()
-            && !label.starts_with("xn--")
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    }) && host
-        .rsplit('.')
-        .next()
-        .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
+/// The values of the cookies in [`SID_NAMES`] that apply to a request to `origin` at
+/// `now_unix`, the first of each name, or `None` when `origin` or the time is unusable. The
+/// one lookup both `authorization` and `has_sid` use, so the two cannot drift apart.
+fn sids<'a>(session: &'a Session, origin: &str, now_unix: u64) -> Option<[Option<&'a str>; 3]> {
+    let (host, path, https) = origin_parts(origin)?;
+    let now = i64::try_from(now_unix).ok()?;
+    let mut sids = [None; 3];
+    for c in session.matching_host(&host, &path, https, now) {
+        if let Some(i) = SID_NAMES.iter().position(|n| c.name == *n) {
+            sids[i].get_or_insert(c.value.as_str());
+        }
+    }
+    Some(sids)
 }
 
 /// True when `authorization(session, origin, now_unix)` would be `Some`: the session holds a
-/// SAPISID cookie for the origin. Same rules, no hashing, no allocation for a client origin.
+/// SAPISID cookie for the origin. Same lookup, no hashing.
 pub fn has_sid(session: &Session, origin: &str, now_unix: u64) -> bool {
-    let Some((host, path, https)) = origin_parts(origin) else {
-        return false;
-    };
-    let Ok(now) = i64::try_from(now_unix) else {
-        return false;
-    };
-    session
-        .matching_host(&host, &path, https, now)
-        .any(|c| SID_NAMES.contains(&c.name.as_str()))
+    sids(session, origin, now_unix).is_some_and(|s| s.iter().any(Option::is_some))
 }
 
 /// The `Authorization` value for a request sent with `Origin: origin` at `now_unix`, or
@@ -68,16 +60,7 @@ pub fn has_sid(session: &Session, origin: &str, now_unix: u64) -> bool {
 pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<String> {
     // The SID cookies are the ones the origin's own host would get (yt-dlp reads them for
     // `.youtube.com`), so a `.google.com` SAPISID never signs a youtube.com request.
-    let (host, path, https) = origin_parts(origin)?;
-    let now = i64::try_from(now_unix).ok()?;
-    // One pass over the jar, keeping the first cookie of each name (as a `find` would).
-    let mut sids: [Option<&str>; 3] = [None; 3];
-    for c in session.matching_host(&host, &path, https, now) {
-        if let Some(i) = SID_NAMES.iter().position(|n| c.name == *n) {
-            sids[i].get_or_insert(c.value.as_str());
-        }
-    }
-    let [sapisid, three_p, one_p] = sids;
+    let [sapisid, three_p, one_p] = sids(session, origin, now_unix)?;
     let schemes = [
         ("SAPISIDHASH", sapisid.or(three_p)),
         ("SAPISID1PHASH", one_p),
@@ -230,8 +213,8 @@ mod tests {
         assert_eq!(authorization(&session, "not a url", 1), None);
     }
 
-    /// The hand split must give exactly what `Url::parse` does, and leave every origin it
-    /// can't vouch for to `Url`.
+    /// The client-table shortcut and the `Url` fallback must give exactly what `Url::parse`
+    /// does, for the client origins and for anything else.
     #[test]
     fn origin_parts_matches_url_parse() {
         for origin in crate::innertube::clients::ALL
