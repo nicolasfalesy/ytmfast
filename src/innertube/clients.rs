@@ -15,6 +15,9 @@ pub struct ClientInfo {
     pub user_agent: &'static str,
     /// The `Origin` and `X-Origin` headers, and the origin the SAPISIDHASH is signed for.
     pub origin: &'static str,
+    /// `origin`'s host, as `Url::parse(origin)` gives it (a test checks). The SAPISIDHASH
+    /// matches cookies against it on every signed request, so it is not parsed each time.
+    pub origin_host: &'static str,
     /// The host the API requests go to.
     pub api_host: &'static str,
     /// Whether requests carry `X-Goog-AuthUser: 0`. The music web client sends it with a
@@ -48,6 +51,7 @@ pub const TV: ClientInfo = ClientInfo {
     name_id: 7,
     user_agent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1",
     origin: "https://www.youtube.com",
+    origin_host: "www.youtube.com",
     api_host: "www.youtube.com",
     sends_auth_user: false,
     device: Some(Device {
@@ -66,6 +70,7 @@ pub const WEB_REMIX: ClientInfo = ClientInfo {
     name_id: 67,
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     origin: "https://music.youtube.com",
+    origin_host: "music.youtube.com",
     api_host: "music.youtube.com",
     sends_auth_user: true,
     device: None,
@@ -73,3 +78,20 @@ pub const WEB_REMIX: ClientInfo = ClientInfo {
 
 /// Every client, so tests can check each one against the host allowlist.
 pub const ALL: &[ClientInfo] = &[TV, WEB_REMIX];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `origin_host` is what `Url::parse(origin)` gives, and the origin has path `/` and is
+    /// https: the SAPISIDHASH uses these instead of parsing the origin on every request.
+    #[test]
+    fn origin_host_is_what_url_parse_gives() {
+        for client in ALL {
+            let url = url::Url::parse(client.origin).unwrap();
+            assert_eq!(url.host_str(), Some(client.origin_host), "{}", client.name);
+            assert_eq!(url.path(), "/", "{}", client.name);
+            assert_eq!(url.scheme(), "https", "{}", client.name);
+        }
+    }
+}
