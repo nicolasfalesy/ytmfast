@@ -29,15 +29,46 @@ pub fn authorization(session: &Session, origin: &str, now_unix: u64) -> Option<S
         ("SAPISID1PHASH", get("__Secure-1PAPISID")),
         ("SAPISID3PHASH", get("__Secure-3PAPISID")),
     ];
-    let parts: Vec<String> = schemes
-        .iter()
-        .filter_map(|(scheme, sid)| {
-            let sid = (*sid)?;
-            let hash = Sha1::digest(format!("{now_unix} {sid} {origin}").as_bytes());
-            Some(format!("{scheme} {now_unix}_{}", hex::encode(hash)))
-        })
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" "))
+    // Every signed request runs this, so (measured 2026-11-07, ytmfast PR #5): the time is
+    // formatted once, the hash takes its pieces directly, a cookie value seen before reuses
+    // its hex (real jars often hold the same value in SAPISID and __Secure-3PAPISID), and the
+    // parts go straight into one string instead of a String each plus a Vec and a join.
+    let ts = now_unix.to_string();
+    // Room for three parts of the longest scheme (13 bytes), a space, the time, "_", 40 hex
+    // and a separating space. A guess for speed only: the string still grows if it must.
+    let mut out = String::with_capacity(3 * (13 + ts.len() + 43));
+    let mut seen = [("", [0u8; 40]); 3];
+    let mut n = 0;
+    for (scheme, sid) in schemes {
+        let Some(sid) = sid else { continue };
+        let hex = match seen[..n].iter().find(|(s, _)| *s == sid) {
+            Some(&(_, hex)) => hex,
+            None => {
+                let digest = Sha1::new()
+                    .chain_update(&ts)
+                    .chain_update(b" ")
+                    .chain_update(sid)
+                    .chain_update(b" ")
+                    .chain_update(origin)
+                    .finalize();
+                let mut hex = [0u8; 40];
+                hex::encode_to_slice(digest, &mut hex)
+                    .expect("a SHA-1's 20 bytes fill 40 hex digits exactly");
+                seen[n] = (sid, hex);
+                n += 1;
+                hex
+            }
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(scheme);
+        out.push(' ');
+        out.push_str(&ts);
+        out.push('_');
+        out.push_str(std::str::from_utf8(&hex).expect("hex digits are ASCII"));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
@@ -97,6 +128,21 @@ mod tests {
                 part("one"),
                 part("three")
             )
+        );
+    }
+
+    /// Only the 1P cookie: the first scheme is skipped, so the header must not start with a
+    /// space (the parts are joined by hand now, not by `join`). Hash from `sha1sum`.
+    #[test]
+    fn only_1papisid_has_no_stray_space() {
+        let session = Session {
+            cookies: vec![yt("__Secure-1PAPISID", "one")],
+            account: None,
+            browser_stamp: None,
+        };
+        assert_eq!(
+            authorization(&session, ORIGIN, 1_700_000_000).as_deref(),
+            Some("SAPISID1PHASH 1700000000_01ca8712a198105a3f0999f890c24137388b7fff")
         );
     }
 
