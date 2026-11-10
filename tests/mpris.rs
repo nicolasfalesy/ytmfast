@@ -93,7 +93,10 @@ fn private_bus() -> PrivateBus {
         .expect("dbus-daemon (the dbus package) must be installed to run these tests");
     let daemon = Reap(daemon);
     let start = Instant::now();
-    while !socket.exists() {
+    // Wait for a connect to succeed, not for the socket file: dbus-daemon creates the file at
+    // bind(), and the kernel refuses every connect until its listen(), so a client in that gap got
+    // "connection refused" (main CI run 42727710988, commands_count_as_activity).
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         assert!(start.elapsed() < WAIT, "the private bus never came up");
         std::thread::sleep(Duration::from_millis(10));
     }

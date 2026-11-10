@@ -135,7 +135,11 @@ async fn import_stops_the_running_engine() {
         .stderr(Stdio::null());
     private_env(&mut cmd, r, &bus);
     let _bus = Reap(cmd.spawn().expect("dbus-daemon"));
-    wait_for("the bus", || bus_socket.exists());
+    // A connect, not the socket file: dbus-daemon makes the file at bind() and connects are refused
+    // until its listen() (the race that failed tests/mpris.rs in main CI run 42727710988).
+    wait_for("the bus", || {
+        std::os::unix::net::UnixStream::connect(&bus_socket).is_ok()
+    });
 
     let mut cmd = Command::new("gnome-keyring-daemon");
     cmd.args(["--foreground", "--components=secrets", "--unlock"])
