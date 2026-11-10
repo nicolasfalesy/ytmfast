@@ -80,8 +80,8 @@ impl PrivateBus {
             .expect("dbus-daemon (the dbus package) must be installed to run these tests");
         self.daemon = Some(daemon);
         let start = Instant::now();
-        // Wait for a connect, not the socket file: dbus-daemon makes the file at bind() and accepts
-        // only after listen() (the race that failed tests/mpris.rs on main CI, 2026-11-10).
+        // Wait for a connect, not the socket file: dbus-daemon makes the file at bind() and connects
+        // are refused until its listen() (the race that failed tests/mpris.rs in main CI run 42727710988).
         while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(start.elapsed() < WAIT, "the private bus never came up");
             std::thread::sleep(Duration::from_millis(10));

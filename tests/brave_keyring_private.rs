@@ -151,7 +151,9 @@ fn brave_origin_import_reads_the_safe_storage_key() {
     private_env(&mut cmd, r, &bus);
     let _bus = Reap(cmd.spawn().expect("dbus-daemon"));
     let start = Instant::now();
-    while !socket.exists() {
+    // Wait for a connect, not the socket file: dbus-daemon makes the file at bind() and connects
+    // are refused until its listen() (the race that failed tests/mpris.rs in main CI run 42727710988).
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "bus never came up"
