@@ -56,8 +56,8 @@ use crate::error::Error;
 /// `vendor` list). `core` is 0.8.0 rebuilt (`deno install --frozen && deno task bundle`) with
 /// ejs commit 40b7a7d4 on top, which keeps the player's inheritance calls (see
 /// `prep::prototype_helpers`); no release had it yet on 2026-11-27. The same build of plain
-/// 0.8.0 matched the old file byte for byte. Take the next release whole when it comes; its
-/// `lib` exports changed shape (`lib.meriyah`), so the driver below changes with it.
+/// 0.8.0 matched the old file byte for byte. Take the next release whole when it comes; ejs
+/// master already exports `lib = { meriyah, astring }`, so the driver below will change with it.
 /// Bundled so the solver needs nothing at run time and can't be swapped on disk.
 const LIB_JS: &str = include_str!("../../assets/ejs/lib.min.js");
 const CORE_JS: &str = include_str!("../../assets/ejs/core.min.js");

@@ -1156,6 +1156,12 @@ async fn ytdlp_cookie_file_removed() {
     ] {
         assert!(args.iter().any(|a| a == want), "{want} in {args:?}");
     }
+    // The value alone would be read as a second URL: it needs its flag right before it.
+    let at = args
+        .iter()
+        .position(|a| a == "youtube:player_js_variant=tv")
+        .unwrap();
+    assert_eq!(args[at - 1], "--extractor-args");
 }
 
 #[tokio::test]

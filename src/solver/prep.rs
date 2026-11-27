@@ -1,7 +1,7 @@
 //! The cold solve's preprocessing, in Rust: what yt-dlp-ejs 0.8.0's `core.min.js` (with the
-//! 40b7a7d4 fix, see `prototype_helpers`) does to a
-//! new player version before its first solve (its function `u`), done with oxc's parser and
-//! a few text splices instead of meriyah + astring running inside QuickJS.
+//! 40b7a7d4 fix, see `prototype_helpers`) does to a new player version before its first
+//! solve (its function `u`), done with oxc's parser and a few text splices instead of
+//! meriyah + astring running inside QuickJS.
 //!
 //! Why: in QuickJS that step parses the 3 MB player into a syntax tree and prints all of it
 //! back out. It took 3.1 s and peaked at 205 MB on every new player version (measured
@@ -29,7 +29,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionBody, AssignmentOperator, AssignmentTarget, Expression, FunctionBody,
-    Statement,
+    MemberExpression, Statement,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType, Span};
@@ -264,36 +264,43 @@ enum Shape<'a> {
     Member(Box<Shape<'a>>, Box<Shape<'a>>),
 }
 
+/// How deep a name's shape may go. Real helper names are two or three levels (`g.z`); the
+/// cap keeps a hostile `a.b.b.b...` chain (one recursion per dot, and `nests_deeper_than`
+/// counts only brackets) from overflowing this thread's stack and ending the daemon.
+const MAX_SHAPE_DEPTH: usize = 64;
+
 /// The shape of an expression, or `None` for anything that isn't an identifier or a member
-/// of one (a call, `this`, a string key, ...).
+/// of one (a call, `this`, a string key, ...), or nests deeper than `MAX_SHAPE_DEPTH`.
 fn shape_of<'a>(e: &'a Expression<'a>) -> Option<Shape<'a>> {
+    shape_within(e, MAX_SHAPE_DEPTH)
+}
+
+fn shape_within<'a>(e: &'a Expression<'a>, depth: usize) -> Option<Shape<'a>> {
+    let depth = depth.checked_sub(1)?;
     match e {
         Expression::Identifier(id) => Some(Shape::Id(id.name.as_str())),
-        Expression::StaticMemberExpression(m) => Some(Shape::Member(
-            Box::new(shape_of(&m.object)?),
-            Box::new(Shape::Id(m.property.name.as_str())),
-        )),
-        Expression::ComputedMemberExpression(m) => Some(Shape::Member(
-            Box::new(shape_of(&m.object)?),
-            Box::new(shape_of(&m.expression)?),
-        )),
-        _ => None,
+        e => member_shape(e.as_member_expression()?, depth),
     }
 }
 
+/// The shape of an assignment's left side, as `shape_of`.
 fn target_shape<'a>(t: &'a AssignmentTarget<'a>) -> Option<Shape<'a>> {
     match t {
         AssignmentTarget::AssignmentTargetIdentifier(id) => Some(Shape::Id(id.name.as_str())),
-        AssignmentTarget::StaticMemberExpression(m) => Some(Shape::Member(
-            Box::new(shape_of(&m.object)?),
-            Box::new(Shape::Id(m.property.name.as_str())),
-        )),
-        AssignmentTarget::ComputedMemberExpression(m) => Some(Shape::Member(
-            Box::new(shape_of(&m.object)?),
-            Box::new(shape_of(&m.expression)?),
-        )),
-        _ => None,
+        t => member_shape(t.as_member_expression()?, MAX_SHAPE_DEPTH),
     }
+}
+
+fn member_shape<'a>(m: &'a MemberExpression<'a>, depth: usize) -> Option<Shape<'a>> {
+    let property = match m {
+        MemberExpression::StaticMemberExpression(s) => Shape::Id(s.property.name.as_str()),
+        MemberExpression::ComputedMemberExpression(c) => shape_within(&c.expression, depth)?,
+        MemberExpression::PrivateFieldExpression(_) => return None,
+    };
+    Some(Shape::Member(
+        Box::new(shape_within(m.object(), depth)?),
+        Box::new(property),
+    ))
 }
 
 /// `X.prototype = ...` (or `X[prototype] = ...`, which meriyah gives the same shape).
@@ -320,8 +327,9 @@ fn sets_prototype(statement: &Statement<'_>) -> bool {
 /// Sub` at the top level, and without the call `Sub` lacks its base's methods, so the cold
 /// solve threw `a.addOnDisposeCallback is not a function` (2026-11-27).
 ///
-/// `None` when a helper's name has no shape (`a[0].z = ...`): `core` then throws on the
-/// first top-level call it checks, so this leaves that player to `jsc` too.
+/// `None` when a helper's name has no shape (`a[0].z = ...`): `core` pushes `null` for it
+/// and throws on any top-level call that reaches that entry, so this hands the whole player
+/// to `jsc` rather than copy that.
 fn prototype_helpers<'a>(statements: &'a [Statement<'a>]) -> Option<Vec<Shape<'a>>> {
     let mut helpers = Vec::new();
     for statement in statements {
@@ -538,8 +546,60 @@ mod tests {
     /// A helper whose name has no shape makes `core` throw, so prep leaves it to `jsc`.
     #[test]
     fn an_unshaped_helper_name_is_left_to_jsc() {
-        let player = "(function () { g = {}; a[0].z = function (s, b) { s.prototype = b; }; g.mk = function (a) { a.x(\"alr\", \"yes\"); }; }).call(this);";
+        let player = "(function () { g = {}; a[0].z = function (s, b) { s.prototype = b; }; g.f(1); g.mk = function (a) { a.x(\"alr\", \"yes\"); }; }).call(this);";
         assert!(preprocess(player).is_none());
+    }
+
+    /// Which top-level calls step 2 keeps, by how the helper and the call are named: the
+    /// same rules as `core`'s `matchesStructure` (types and names only).
+    #[test]
+    fn helper_calls_match_by_shape() {
+        let kept = |define: &str, call: &str| {
+            let player = format!(
+                "(function () {{ g = {{}}; {define} = function (a, b) {{ a.prototype = b; }}; {call}; g.mk = function (a) {{ a.x(\"alr\", \"yes\"); }}; }}).call(this);"
+            );
+            preprocess(&player).unwrap().contains(&format!("{call};"))
+        };
+        assert!(kept("g.z", "g.z(S, B)"));
+        assert!(
+            kept("g[z]", "g.z(S, B)"),
+            "g[z] and g.z are one shape in meriyah"
+        );
+        assert!(kept("g.z", "g[z](S, B)"));
+        assert!(kept("z", "z(S, B)"));
+        assert!(kept("g.a.z", "g.a.z(S, B)"));
+        assert!(
+            !kept("g.z", "g[\"z\"](S, B)"),
+            "a string key is a Literal, not a name"
+        );
+        assert!(!kept("g.z", "g.y(S, B)"));
+        assert!(!kept("g.z", "z(S, B)"));
+        // Helper detection: `X[prototype] = ` counts, `X["prototype"] = ` does not.
+        let helper = |set: &str| {
+            let player = format!(
+                "(function () {{ g = {{}}; g.z = function (a, b) {{ {set}; }}; g.z(S, B); g.mk = function (a) {{ a.x(\"alr\", \"yes\"); }}; }}).call(this);"
+            );
+            preprocess(&player).unwrap().contains("g.z(S, B);")
+        };
+        assert!(helper("a.prototype = b"));
+        assert!(helper("a[prototype] = b"));
+        assert!(!helper("a[\"prototype\"] = b"));
+        assert!(
+            !helper("if (b) a.prototype = b"),
+            "only the body's own statements count"
+        );
+    }
+
+    /// A member chain far deeper than any real name has no shape, and doesn't recurse once
+    /// per dot (that would overflow the stack and end the daemon).
+    #[test]
+    fn a_very_long_member_chain_is_dropped_not_followed() {
+        let chain = format!("a{}", ".b".repeat(200_000));
+        let player = format!(
+            "(function () {{ g = {{}}; g.z = function (a, b) {{ a.prototype = b; }}; {chain}(1); g.mk = function (a) {{ a.x(\"alr\", \"yes\"); }}; }}).call(this);"
+        );
+        let pre = preprocess(&player).unwrap();
+        assert!(!pre.contains(".b.b.b"));
     }
 
     #[test]
