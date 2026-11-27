@@ -380,6 +380,13 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// played again (or gone back to) needs no new request.
 const LIKES_KEPT: usize = 100;
 
+/// Songs that may fail back to back before the skipping stops (sooner if a whole queue's
+/// worth failed first). On 2026-11-27 every song failed and the engine went on through 35 of
+/// a 145-song queue in two minutes, about a hundred requests on the user's session; that
+/// morning YouTube bot-checked the session. Five still skips a single bad song or two, and
+/// keeps a bad patch to about fifteen requests (the owner's pick).
+const MAX_FAILS_IN_A_ROW: usize = 5;
+
 /// How long a quit waits for its last save: long enough for any working disk, short enough
 /// that a hung one can't hold up `systemctl stop` (whose own limit is far longer).
 const LAST_SAVE_WAIT: Duration = Duration::from_secs(2);
@@ -645,7 +652,8 @@ pub struct Engine {
     waiting: bool,
     /// Stopped because the queue ran out (not by an error).
     at_end: bool,
-    /// Songs that failed in a row; a whole queue's worth stops the skipping.
+    /// Songs that failed in a row; `MAX_FAILS_IN_A_ROW` of them, or a whole queue's worth,
+    /// stops the skipping.
     skip_streak: usize,
     /// How long that queue was when the run of failures began (once its list was all there):
     /// the pass the run stops after. Fixed then, because radio refills grow the queue while
@@ -697,8 +705,8 @@ pub struct Engine {
     /// Position ticks since the last save; `SAVE_EVERY_TICKS` of them save again. The ticker
     /// only runs while playing, so this 30 s timer only exists then too.
     ticks_since_save: u32,
-    /// The current song comes from a saved state and was never loaded: a play loads it at
-    /// its saved second (`status.position`).
+    /// The current song is shown paused but was never loaded (a saved state, or the next song
+    /// held after a failure while paused, see `hold`): a play loads it at `status.position`.
     restored: bool,
     /// A seek's target, for the save it causes: the audio thread takes the seek a moment
     /// later, so until then its position is still the old one (a paused song would be saved
@@ -895,6 +903,18 @@ impl Engine {
         } else {
             0.0
         };
+        // Paused, never Playing: a restart (an update, an idle quit) must not start music by
+        // itself.
+        self.hold(&item, at);
+    }
+
+    /// Shows `item`, already the queue's current item, paused at `at` without loading it: a
+    /// play (`resume`) fetches its link and download then, from `status.position`. Sends no
+    /// events.
+    fn hold(&mut self, item: &QueueItem, at: f64) {
+        // A seek's target belongs to the song before; left set, the next save would write it
+        // as this song's second.
+        self.seeked_to = None;
         self.status.video_id = Some(item.song.video_id.clone());
         self.reset_liked();
         self.status.queue_id = Some(item.id);
@@ -903,8 +923,6 @@ impl Engine {
         self.status.meta = song_meta(&item.song, None);
         self.status.position = at;
         self.start_seconds = at;
-        // Paused, never Playing: a restart (an update, an idle quit) must not start music by
-        // itself. Nothing is loaded until a play (`resume`).
         self.status.state = PlayState::Paused;
         self.restored = true;
     }
@@ -1812,6 +1830,8 @@ impl Engine {
         self.started = false;
         self.replayed = false;
         self.restored = false;
+        // The old song's seek target: left set, the next save would give it to this song.
+        self.seeked_to = None;
         self.ticker = None;
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
@@ -1927,9 +1947,9 @@ impl Engine {
         self.emit_state();
     }
 
-    /// An unplayable song: report it and move on, unless a queue's worth of songs failed in a
-    /// row (a full pass, measured when the run began), which stops rather than skipping round
-    /// for ever.
+    /// An unplayable song: report it and move on, unless `MAX_FAILS_IN_A_ROW` songs or a
+    /// queue's worth (a full pass, measured when the run began) failed in a row, which stops
+    /// rather than skipping on. While paused, it moves to the next song but holds it unloaded until a play.
     fn skip_unplayable(&mut self, e: &Error) {
         eprintln!(
             "{}",
@@ -1948,14 +1968,32 @@ impl Engine {
         if self.loading.is_none() && self.skip_cap.is_none() {
             self.skip_cap = Some(self.queue.len());
         }
-        if self
+        let pass_done = self
             .skip_cap
-            .is_some_and(|cap| self.loading.is_none() && self.skip_streak >= cap)
-        {
+            .is_some_and(|cap| self.loading.is_none() && self.skip_streak >= cap);
+        if pass_done || self.skip_streak >= MAX_FAILS_IN_A_ROW {
             self.resume_from = None;
             self.status.state = PlayState::Stopped;
             self.emit_state();
             return;
+        }
+        // Paused by hand while it loaded: move on, but hold the next song unloaded until a
+        // play. Otherwise a run of failures walks the whole queue while nobody listens, a link
+        // lookup (and its yt-dlp fallback) every few seconds (2026-11-27: every song failed
+        // and a pause didn't stop it; the owner's pick: "pause stops it"). At the end of the
+        // queue `advance` waits for more songs, and loads the first that comes paused, as it
+        // always does: one fetch, then a failure holds the next.
+        if self.status.state == PlayState::Paused {
+            self.refill_hold = false;
+            if let Some(item) = self.queue.next(false).cloned() {
+                self.resolved_meta = None;
+                self.resume_from = None;
+                self.hold(&item, 0.0);
+                self.emit_queue();
+                self.emit_state();
+                self.maybe_refill();
+                return;
+            }
         }
         self.advance(false, true);
     }
@@ -2026,8 +2064,9 @@ impl Engine {
         if self.status.state != PlayState::Paused {
             return;
         }
-        // The saved song after a restart: only now is its link fetched and its download
-        // started, at the saved second (or where a seek since moved it).
+        // A held song (saved before a restart, or held after a failure while paused): only now
+        // is its link fetched and its download started, at its second (or where a seek since
+        // moved it).
         if self.restored {
             let at = self.status.position;
             self.start_current(at);
@@ -5342,6 +5381,106 @@ mod tests {
         assert_eq!(r.calls(), [vid('B'), vid('C'), vid('A')], "each tried once");
         assert_eq!(r.status().await.state, PlayState::Stopped);
         assert!(r.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_while_paused_holds_the_next_song() {
+        // Paused while A loads, and A fails: B becomes current, paused and not fetched (a
+        // pause must stop the skipping, 2026-11-27), and a play fetches and plays it.
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![("AAAAAAAAAAA", Error::Unavailable("not here".into()))],
+            delays: vec![("AAAAAAAAAAA", 200)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.send(EngineCmd::Pause).await;
+        r.until(PlayState::Paused).await;
+        let seen = r.until_song(&vid('B'), PlayState::Paused).await;
+        assert_eq!(errors(&seen), ["unavailable"]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), [vid('A')], "B is not fetched while paused");
+        assert_eq!(r.queue().await.current_id, Some(2));
+        let status = r.status().await;
+        assert_eq!(status.state, PlayState::Paused);
+        assert_eq!(status.meta.unwrap().title, "Title B");
+        r.send(EngineCmd::Toggle).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        // Calls after these are C's prefetch and preload while B plays.
+        assert_eq!(r.calls()[..2], [vid('A'), vid('B')]);
+        assert_eq!(r.started()[0], vid('B'));
+    }
+
+    #[tokio::test]
+    async fn five_failures_in_a_row_stop_a_long_queue() {
+        // Eight songs, none playable: it stops after five, not after a whole pass.
+        let gone = || Error::Unavailable("not here".into());
+        let letters = "ABCDEFGH";
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, letters, None)],
+            failures: letters
+                .chars()
+                .map(|c| (&*Box::leak(vid(c).into_boxed_str()), gone()))
+                .collect(),
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let seen = r.until_song(&vid('E'), PlayState::Stopped).await;
+        assert_eq!(errors(&seen), ["unavailable"; 5]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), "ABCDE".chars().map(vid).collect::<Vec<_>>());
+        assert_eq!(r.status().await.state, PlayState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn the_one_pass_stop_still_counts_across_a_hold() {
+        // Repeat all, every song unplayable, paused during A: B is held; a play goes on, and
+        // the run still stops after one pass, each song tried once.
+        let gone = || Error::Unavailable("not here".into());
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![
+                ("AAAAAAAAAAA", gone()),
+                ("BBBBBBBBBBB", gone()),
+                ("CCCCCCCCCCC", gone()),
+            ],
+            delays: vec![("AAAAAAAAAAA", 200)],
+            ..Setup::default()
+        })
+        .await;
+        r.send(EngineCmd::Repeat(Repeat::All)).await;
+        r.play_list("PLlist", None).await;
+        r.send(EngineCmd::Pause).await;
+        r.until_song(&vid('B'), PlayState::Paused).await;
+        r.send(EngineCmd::Toggle).await;
+        r.until_song(&vid('C'), PlayState::Stopped).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), [vid('A'), vid('B'), vid('C')], "each tried once");
+        assert_eq!(r.status().await.state, PlayState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_held_song_is_not_saved_at_the_last_songs_seek() {
+        let server = server().await;
+        let fake = Arc::new(Fake {
+            base: server.base.clone(),
+            delays: HashMap::new(),
+            failures: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+            known: Mutex::new(Vec::new()),
+        });
+        let Built { mut engine, .. } =
+            engine_for(&server, fake.clone(), Arc::default(), true, false);
+        engine.queue = Queue::restore(vec![song('A'), song('B')], Some(0), None, Repeat::Off);
+        engine.status.state = PlayState::Paused;
+        // A seek in A that no tick or save has cleared yet.
+        engine.seeked_to = Some(30.0);
+        let b = engine.queue.next(false).cloned().unwrap();
+        engine.hold(&b, 0.0);
+        let saved = engine.saved();
+        assert_eq!((saved.current_index, saved.position), (1, 0.0));
     }
 
     #[tokio::test]
