@@ -895,6 +895,14 @@ impl Engine {
         } else {
             0.0
         };
+        // Paused, never Playing: a restart (an update, an idle quit) must not start music by
+        // itself.
+        self.hold(&item, at);
+    }
+
+    /// Shows `item` paused at `at` without loading it: a play (`resume`) fetches its link
+    /// and download then, from `status.position`.
+    fn hold(&mut self, item: &QueueItem, at: f64) {
         self.status.video_id = Some(item.song.video_id.clone());
         self.reset_liked();
         self.status.queue_id = Some(item.id);
@@ -903,8 +911,6 @@ impl Engine {
         self.status.meta = song_meta(&item.song, None);
         self.status.position = at;
         self.start_seconds = at;
-        // Paused, never Playing: a restart (an update, an idle quit) must not start music by
-        // itself. Nothing is loaded until a play (`resume`).
         self.status.state = PlayState::Paused;
         self.restored = true;
     }
@@ -1956,6 +1962,22 @@ impl Engine {
             self.status.state = PlayState::Stopped;
             self.emit_state();
             return;
+        }
+        // Paused by hand while it loaded: move on, but hold the next song unloaded until a
+        // play. Otherwise a run of failures walks the whole queue while nobody listens, a
+        // yt-dlp run every few seconds (2026-11-27: every song failed and a pause didn't stop
+        // it; his pick: "pause stops it").
+        if self.status.state == PlayState::Paused {
+            self.refill_hold = false;
+            if let Some(item) = self.queue.next(false).cloned() {
+                self.resolved_meta = None;
+                self.resume_from = None;
+                self.hold(&item, 0.0);
+                self.emit_queue();
+                self.emit_state();
+                self.maybe_refill();
+                return;
+            }
         }
         self.advance(false, true);
     }
@@ -5342,6 +5364,35 @@ mod tests {
         assert_eq!(r.calls(), [vid('B'), vid('C'), vid('A')], "each tried once");
         assert_eq!(r.status().await.state, PlayState::Stopped);
         assert!(r.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_while_paused_holds_the_next_song() {
+        // Paused while A loads, and A fails: B becomes current, paused and not fetched (a
+        // pause must stop the skipping, 2026-11-27), and a play fetches and plays it.
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, "ABC", None)],
+            failures: vec![("AAAAAAAAAAA", Error::Unavailable("not here".into()))],
+            delays: vec![("AAAAAAAAAAA", 200)],
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        r.send(EngineCmd::Pause).await;
+        r.until(PlayState::Paused).await;
+        let seen = r.until_song(&vid('B'), PlayState::Paused).await;
+        assert_eq!(errors(&seen), ["unavailable"]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), [vid('A')], "B is not fetched while paused");
+        assert_eq!(r.queue().await.current_id, Some(2));
+        let status = r.status().await;
+        assert_eq!(status.state, PlayState::Paused);
+        assert_eq!(status.meta.unwrap().title, "Title B");
+        r.send(EngineCmd::Toggle).await;
+        r.until_song(&vid('B'), PlayState::Playing).await;
+        // C after each is the usual prefetch and preload of the next song while B plays.
+        assert_eq!(r.calls()[..2], [vid('A'), vid('B')]);
+        assert_eq!(r.started()[0], vid('B'));
     }
 
     #[tokio::test]
