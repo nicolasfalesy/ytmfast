@@ -150,6 +150,11 @@ impl YtDlp for YtDlpCommand {
             .args(["--no-warnings", "-q", "--cookies"])
             .arg(&cookies)
             .args(["-f", "774/141/bestaudio", "-j"])
+            // YouTube's TV player script, the default since yt-dlp 2026.11.23: older yt-dlp
+            // fetches the web one, whose new versions (b485e332 and others, 2026-11-23) its
+            // solver can't run, so every song failed (2026-11-27, Arch still on 2026.10.26).
+            // Harmless once yt-dlp is newer: it is the same setting.
+            .args(["--extractor-args", "youtube:player_js_variant=tv"])
             .arg(format!("https://music.youtube.com/watch?v={video_id}"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

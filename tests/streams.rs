@@ -1151,6 +1151,7 @@ async fn ytdlp_cookie_file_removed() {
         "-q",
         "774/141/bestaudio",
         "-j",
+        "youtube:player_js_variant=tv",
         "https://music.youtube.com/watch?v=testvideo01",
     ] {
         assert!(args.iter().any(|a| a == want), "{want} in {args:?}");
