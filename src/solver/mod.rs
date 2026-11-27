@@ -3,7 +3,7 @@
 //! A stream link carries up to two challenges that only YouTube's player script can answer:
 //! the `n` parameter (unsolved, the download is throttled to a crawl) and, for some formats,
 //! the signature in a `signatureCipher` (unsolved, the link is refused). yt-dlp answers them by
-//! running its `ejs` scripts (`assets/ejs`, yt-dlp-ejs 0.8.0, public domain) on the player
+//! running its `ejs` scripts (`assets/ejs`, yt-dlp-ejs 0.8.0 plus one fix, public domain) on the player
 //! script in a JS runtime; this module does the same in QuickJS (`rquickjs`, which bundles
 //! quickjs-ng), inside the engine instead of a separate process.
 //!
@@ -52,8 +52,13 @@ use tokio::sync::oneshot;
 
 use crate::error::Error;
 
-/// yt-dlp-ejs 0.8.0, unmodified; their SHA3-512 hashes match yt-dlp 2026.08.19's `vendor`
-/// list. Bundled so the solver needs nothing at run time and can't be swapped on disk.
+/// yt-dlp-ejs 0.8.0. `lib` is unmodified (its SHA3-512 hash matches yt-dlp 2026.08.19's
+/// `vendor` list). `core` is 0.8.0 rebuilt (`deno install --frozen && deno task bundle`) with
+/// ejs commit 40b7a7d4 on top, which keeps the player's inheritance calls (see
+/// `prep::prototype_helpers`); no release had it yet on 2026-11-27. The same build of plain
+/// 0.8.0 matched the old file byte for byte. Take the next release whole when it comes; ejs
+/// master already exports `lib = { meriyah, astring }`, so the driver below will change with it.
+/// Bundled so the solver needs nothing at run time and can't be swapped on disk.
 const LIB_JS: &str = include_str!("../../assets/ejs/lib.min.js");
 const CORE_JS: &str = include_str!("../../assets/ejs/core.min.js");
 
