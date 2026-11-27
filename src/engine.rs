@@ -380,6 +380,13 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// played again (or gone back to) needs no new request.
 const LIKES_KEPT: usize = 100;
 
+/// Songs that may fail back to back before the skipping stops (sooner if a whole queue's
+/// worth failed first). On 2026-11-27 every song failed and the engine went on through 35 of
+/// a 145-song queue in two minutes, about a hundred requests on the user's session; that
+/// morning YouTube bot-checked the session. Five still skips a single bad song or two, and
+/// keeps a bad patch to about fifteen requests (the owner's pick).
+const MAX_FAILS_IN_A_ROW: usize = 5;
+
 /// How long a quit waits for its last save: long enough for any working disk, short enough
 /// that a hung one can't hold up `systemctl stop` (whose own limit is far longer).
 const LAST_SAVE_WAIT: Duration = Duration::from_secs(2);
@@ -645,7 +652,8 @@ pub struct Engine {
     waiting: bool,
     /// Stopped because the queue ran out (not by an error).
     at_end: bool,
-    /// Songs that failed in a row; a whole queue's worth stops the skipping.
+    /// Songs that failed in a row; `MAX_FAILS_IN_A_ROW` of them, or a whole queue's worth,
+    /// stops the skipping.
     skip_streak: usize,
     /// How long that queue was when the run of failures began (once its list was all there):
     /// the pass the run stops after. Fixed then, because radio refills grow the queue while
@@ -1822,6 +1830,8 @@ impl Engine {
         self.started = false;
         self.replayed = false;
         self.restored = false;
+        // The old song's seek target: left set, the next save would give it to this song.
+        self.seeked_to = None;
         self.ticker = None;
         self.start_seconds = start;
         self.status.state = PlayState::Buffering;
@@ -1937,9 +1947,9 @@ impl Engine {
         self.emit_state();
     }
 
-    /// An unplayable song: report it and move on, unless a queue's worth of songs failed in a
-    /// row (a full pass, measured when the run began), which stops rather than skipping round
-    /// for ever. While paused, it moves to the next song but holds it unloaded until a play.
+    /// An unplayable song: report it and move on, unless `MAX_FAILS_IN_A_ROW` songs or a
+    /// queue's worth (a full pass, measured when the run began) failed in a row, which stops
+    /// rather than skipping on. While paused, it moves to the next song but holds it unloaded until a play.
     fn skip_unplayable(&mut self, e: &Error) {
         eprintln!(
             "{}",
@@ -1958,10 +1968,10 @@ impl Engine {
         if self.loading.is_none() && self.skip_cap.is_none() {
             self.skip_cap = Some(self.queue.len());
         }
-        if self
+        let pass_done = self
             .skip_cap
-            .is_some_and(|cap| self.loading.is_none() && self.skip_streak >= cap)
-        {
+            .is_some_and(|cap| self.loading.is_none() && self.skip_streak >= cap);
+        if pass_done || self.skip_streak >= MAX_FAILS_IN_A_ROW {
             self.resume_from = None;
             self.status.state = PlayState::Stopped;
             self.emit_state();
@@ -5400,6 +5410,28 @@ mod tests {
         // Calls after these are C's prefetch and preload while B plays.
         assert_eq!(r.calls()[..2], [vid('A'), vid('B')]);
         assert_eq!(r.started()[0], vid('B'));
+    }
+
+    #[tokio::test]
+    async fn five_failures_in_a_row_stop_a_long_queue() {
+        // Eight songs, none playable: it stops after five, not after a whole pass.
+        let gone = || Error::Unavailable("not here".into());
+        let letters = "ABCDEFGH";
+        let mut r = rig(Setup {
+            pages: vec![ok("PLlist", 0, letters, None)],
+            failures: letters
+                .chars()
+                .map(|c| (&*Box::leak(vid(c).into_boxed_str()), gone()))
+                .collect(),
+            ..Setup::default()
+        })
+        .await;
+        r.play_list("PLlist", None).await;
+        let seen = r.until_song(&vid('E'), PlayState::Stopped).await;
+        assert_eq!(errors(&seen), ["unavailable"; 5]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.calls(), "ABCDE".chars().map(vid).collect::<Vec<_>>());
+        assert_eq!(r.status().await.state, PlayState::Stopped);
     }
 
     #[tokio::test]
