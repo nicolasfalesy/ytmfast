@@ -95,8 +95,22 @@ impl Innertube {
     pub async fn player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error> {
         let client = &clients::TV;
         let body = request_body(client, video_id, sts);
-        let answer = self.post(client, "player", &body).await?;
-        let parsed = parse(&answer, video_id)?;
+        let mut answer = self.post(client, "player", &body).await?;
+        let seen = self.renewals();
+        let mut parsed = parse(&answer, video_id);
+        // The bot check hits the engine's copy of the sign-in, not the account: on 2026-11-27
+        // it stayed on the copy for hours while the browser played, and a fresh copy from the
+        // browser played at once. So it is renewed the way a sign-out is (same account, at most
+        // once per `RENEW_EVERY`) and the request sent again; the log names the cause, which
+        // `StreamFailed`'s code alone hid that day (the owner's picks).
+        if parsed.as_ref().is_err_and(is_bot_check) {
+            eprintln!("ytmfast: YouTube asked the session to confirm it is not a bot");
+            if self.renew(seen, "YouTube bot-checked the session").await {
+                answer = self.post(client, "player", &body).await?;
+                parsed = parse(&answer, video_id);
+            }
+        }
+        let parsed = parsed?;
         if parsed.title.is_empty() {
             // Once per run: which shape came back, so a missing title can be traced (keys
             // only; the resolver then asks oEmbed for the details).
@@ -481,6 +495,12 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
         formats,
         tracking,
     })
+}
+
+/// Whether `e` is YouTube's "Sign in to confirm you're not a bot" refusal (a `StreamFailed`
+/// carrying its reason; see `not_about_the_session`).
+pub(crate) fn is_bot_check(e: &Error) -> bool {
+    matches!(e, Error::StreamFailed(reason) if reason.to_lowercase().contains("not a bot"))
 }
 
 /// Whether a LOGIN_REQUIRED reason is about something other than the session: the "Sign in to

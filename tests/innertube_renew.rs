@@ -16,6 +16,9 @@ use ytmfast::error::Error;
 use ytmfast::innertube::{Innertube, Renew};
 
 const HOME: &str = include_str!("fixtures/browse/browse_home.json");
+/// A TV `player` answer that plays, and one with the "confirm you're not a bot" check.
+const PREMIUM: &str = include_str!("fixtures/player_tv_premium.json");
+const BOT_CHECK: &str = include_str!("fixtures/player_login_required.json");
 
 /// What YouTube answered every request of a dropped session with (2026-10-07), cut down to
 /// the part that says so.
@@ -273,4 +276,42 @@ async fn a_failed_follow_does_not_hold_back_a_sign_out_renewal() {
     // A sign-out right after still gets its own try (it fails here too, as the hook does).
     assert_eq!(home(&rig).await, Err(Error::SignedOut));
     assert_eq!(hook.calls(), 2);
+}
+
+/// The old session's `player` answer is the bot check, the new one's plays.
+async fn mount_player(rig: &Rig) {
+    for (cookie, body) in [("SAPISID=old", BOT_CHECK), ("SAPISID=new", PREMIUM)] {
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(header("cookie", cookie))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&rig.server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn a_bot_checked_session_is_renewed_and_the_player_asked_again() {
+    // 2026-11-27: the check stayed on the engine's copy of the sign-in for hours while the
+    // browser played; a fresh copy played at once.
+    let hook = Hook::new(true, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    mount_player(&rig).await;
+    assert!(rig.api.player("FAKEVID0001", 20000).await.is_ok());
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(*rig.session.lock().unwrap(), session("new"));
+}
+
+#[tokio::test]
+async fn a_bot_check_renews_at_most_once_per_interval() {
+    // The browser can't help (signed out there too): the song fails as before, and the next
+    // bot check within the interval doesn't read the browser again.
+    let hook = Hook::new(false, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    mount_player(&rig).await;
+    for _ in 0..2 {
+        let err = rig.api.player("FAKEVID0001", 20000).await.unwrap_err();
+        assert_eq!(err.code(), "stream_failed", "{err}");
+    }
+    assert_eq!(hook.calls(), 1);
 }

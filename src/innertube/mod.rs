@@ -296,7 +296,7 @@ impl Innertube {
             .post_once(client, endpoint, body, forbidden_is_signed_out)
             .await
         {
-            Err(Error::SignedOut) if self.renew(seen).await => {
+            Err(Error::SignedOut) if self.renew(seen, "YouTube signed the session out").await => {
                 self.post_once(client, endpoint, body, forbidden_is_signed_out)
                     .await
             }
@@ -311,9 +311,10 @@ impl Innertube {
     }
 
     /// Renews the session after a request that was sent when `seen` renewals had been made
-    /// came back signed out. True when the request should be sent again: this try renewed
-    /// the session, or another one did while the request was out.
-    async fn renew(&self, seen: u64) -> bool {
+    /// came back signed out (or bot-checked: `what` names which, for the log). True when the
+    /// request should be sent again: this try renewed the session, or another one did while
+    /// the request was out.
+    async fn renew(&self, seen: u64, what: &str) -> bool {
         let Some(r) = &self.renewal else {
             return false;
         };
@@ -333,21 +334,15 @@ impl Innertube {
         match tokio::time::timeout(RENEW_TIMEOUT, r.hook.renew(&current)).await {
             Ok(Ok(session)) => {
                 self.adopt(r, session);
-                eprintln!(
-                    "ytmfast: YouTube signed the session out; signed in again from the browser"
-                );
+                eprintln!("ytmfast: {what}; signed in again from the browser");
                 true
             }
             Ok(Err(why)) => {
-                eprintln!(
-                    "ytmfast: YouTube signed the session out; could not sign in again: {why}"
-                );
+                eprintln!("ytmfast: {what}; could not sign in again: {why}");
                 false
             }
             Err(_) => {
-                eprintln!(
-                    "ytmfast: YouTube signed the session out; signing in again took too long"
-                );
+                eprintln!("ytmfast: {what}; signing in again took too long");
                 false
             }
         }
