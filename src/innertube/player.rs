@@ -88,6 +88,8 @@ impl Innertube {
     /// The `player` answer for `video_id`. `sts` is the signature timestamp of the current
     /// player script; YouTube only hands out ciphers that script can solve.
     ///
+    /// A bot check first renews the session once, as a sign-out does, and asks again.
+    ///
     /// Errors: `SignedOut` for no session or a plain LOGIN_REQUIRED (not the bot check, a
     /// private video or an age check, which are `StreamFailed`),
     /// `StreamFailed(reason)` when the TV client won't play it or answers for another video
@@ -95,8 +97,10 @@ impl Innertube {
     pub async fn player(&self, video_id: &str, sts: u32) -> Result<PlayerResponse, Error> {
         let client = &clients::TV;
         let body = request_body(client, video_id, sts);
-        let mut answer = self.post(client, "player", &body).await?;
+        // Before the request, as `post_with` reads it: a renewal by another request while this
+        // one is out then counts as done, and this one is just sent again.
         let seen = self.renewals();
+        let mut answer = self.post(client, "player", &body).await?;
         let mut parsed = parse(&answer, video_id);
         // The bot check hits the engine's copy of the sign-in, not the account: on 2026-11-27
         // it stayed on the copy for hours while the browser played, and a fresh copy from the
@@ -108,6 +112,9 @@ impl Innertube {
             if self.renew(seen, "YouTube bot-checked the session").await {
                 answer = self.post(client, "player", &body).await?;
                 parsed = parse(&answer, video_id);
+                if parsed.as_ref().is_err_and(is_bot_check) {
+                    eprintln!("ytmfast: the new sign-in was bot-checked too");
+                }
             }
         }
         let parsed = parsed?;
@@ -413,8 +420,9 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     // `StreamFailed`, so the resolver asks yt-dlp (ruling S4, revising step 1's R26): this is
     // the TV client's answer alone, and yt-dlp asks other clients, which may play what the TV
     // client won't. The bot check, a private video and an age check come as LOGIN_REQUIRED
-    // too, but they are about this client or this song, not the session: calling them
-    // `signed_out` would stop the queue and send the user to re-import a session that is fine.
+    // too. The bot check hits the engine's copy of the session, which `player` renews itself;
+    // a private video or an age check is about the song. Calling any of them `signed_out`
+    // would stop the queue and send the user to the Sign in again screen.
     match status {
         "OK" => {}
         "LOGIN_REQUIRED" if !not_about_the_session(playability.reason.as_deref()) => {
@@ -497,21 +505,27 @@ fn parse(answer: &[u8], video_id: &str) -> Result<PlayerResponse, Error> {
     })
 }
 
-/// Whether `e` is YouTube's "Sign in to confirm you're not a bot" refusal (a `StreamFailed`
-/// carrying its reason; see `not_about_the_session`).
+/// The fragment of YouTube's bot-check reason ("Sign in to confirm you're not a bot") both
+/// checks below match, lowercased.
+const BOT_CHECK: &str = "not a bot";
+
+/// Whether `e` is YouTube's bot-check refusal (a `StreamFailed` carrying its reason; see
+/// `not_about_the_session`). shortcut: it reads the reason after `reason()`, which swaps a
+/// reason holding a URL for the status, so such a bot check would not renew; none has been
+/// seen, upgrade by carrying a flag out of `parse` if one is.
 pub(crate) fn is_bot_check(e: &Error) -> bool {
-    matches!(e, Error::StreamFailed(reason) if reason.to_lowercase().contains("not a bot"))
+    matches!(e, Error::StreamFailed(reason) if reason.to_lowercase().contains(BOT_CHECK))
 }
 
-/// Whether a LOGIN_REQUIRED reason is about something other than the session: the "Sign in to
-/// confirm you're not a bot" check, a private video ("This is a private video…", "This video
+/// Whether a LOGIN_REQUIRED reason should not count as signed out: the bot check (`player`
+/// renews the session for it, see `is_bot_check`), a private video ("This is a private video…", "This video
 /// is private", "Private video"), or an age check ("Sign in to confirm your age",
 /// "age-restricted", "inappropriate for some users"). Matched on fragments in any case, so
 /// either apostrophe YouTube uses (and any text around them) fits. A bare LOGIN_REQUIRED, or a
 /// plain "sign in" reason, is the session.
 fn not_about_the_session(reason: Option<&str>) -> bool {
     const FRAGMENTS: [&str; 5] = [
-        "not a bot",
+        BOT_CHECK,
         "confirm your age",
         "age-restricted",
         "age restricted",

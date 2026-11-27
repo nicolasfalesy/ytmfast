@@ -45,10 +45,13 @@ enum Target {
     Fixed(Url),
 }
 
-/// The shortest time between two tries at renewing a signed-out session (the user's pick,
-/// 2026-10-07: once per 10 minutes). One try reads the browser's cookies and asks YouTube who
-/// they sign in; when that fails, every request until the next try is signed out at once, and
-/// the bar shows its Sign in again screen, whose button imports by hand at any time.
+/// The shortest time between two tries at renewing a signed-out or bot-checked session (the
+/// user's pick, 2026-10-07: once per 10 minutes; bot checks since 2026-11-27, same rules). One
+/// try reads the browser's cookies and asks YouTube who they sign in; when that fails, every
+/// signed-out request until the next try is signed out at once, and the bar shows its Sign in
+/// again screen, whose button imports by hand at any time (a bot-checked song just fails, as
+/// before). Both causes share the one interval: a second read of the same browser copy within
+/// it would not help.
 pub const RENEW_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// How often the engine checks whether the browser refreshed its sign-in (`follow_browser`).
@@ -64,8 +67,8 @@ const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// YouTube can drop a copied browser session at any time, and it does it silently: the
 /// answers stay 200, as a guest's (2026-10-07: home page generic, library and history empty,
-/// the music looked like "another Google account"). `Innertube` notices that (`SignedOut`)
-/// and asks this once per `RENEW_EVERY`.
+/// the music looked like "another Google account"). `Innertube` notices that (`SignedOut`, or
+/// a `player` bot check) and asks this once per `RENEW_EVERY`.
 #[async_trait]
 pub trait Renew: Send + Sync {
     /// A session for the same account as `current` (`Session::account`), checked to sign it
@@ -110,8 +113,8 @@ pub struct Innertube {
     /// Held across "copy the session, save it" by each background save, so two answers that
     /// both rotate a cookie can't save out of order and leave the older copy in the store.
     save_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Renews a session YouTube signed out; `None` never renews (the import's own account
-    /// check, and tests that don't ask for it).
+    /// Renews a session YouTube signed out or bot-checked; `None` never renews (the import's
+    /// own account check, and tests that don't ask for it).
     renewal: Option<Renewal>,
 }
 
@@ -145,7 +148,7 @@ impl Innertube {
         }
     }
 
-    /// Renews a session YouTube signed out with `hook`, at most once per `every`
+    /// Renews a session YouTube signed out (or bot-checked) with `hook`, at most once per `every`
     /// (`RENEW_EVERY` in production; tests pass their own).
     pub fn with_renew(mut self, hook: Arc<dyn Renew>, every: Duration) -> Self {
         self.renewal = Some(Renewal {

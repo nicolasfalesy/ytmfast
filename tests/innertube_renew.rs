@@ -280,7 +280,11 @@ async fn a_failed_follow_does_not_hold_back_a_sign_out_renewal() {
 
 /// The old session's `player` answer is the bot check, the new one's plays.
 async fn mount_player(rig: &Rig) {
-    for (cookie, body) in [("SAPISID=old", BOT_CHECK), ("SAPISID=new", PREMIUM)] {
+    mount_player_with(rig, BOT_CHECK, PREMIUM).await;
+}
+
+async fn mount_player_with(rig: &Rig, old: &'static str, new: &'static str) {
+    for (cookie, body) in [("SAPISID=old", old), ("SAPISID=new", new)] {
         Mock::given(method("POST"))
             .and(path("/youtubei/v1/player"))
             .and(header("cookie", cookie))
@@ -314,4 +318,34 @@ async fn a_bot_check_renews_at_most_once_per_interval() {
         assert_eq!(err.code(), "stream_failed", "{err}");
     }
     assert_eq!(hook.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_private_video_does_not_renew() {
+    // Only the bot check is about the session copy: a private video's LOGIN_REQUIRED fails the
+    // song without reading the browser.
+    const PRIVATE: &str =
+        r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"This video is private"}}"#;
+    let hook = Hook::new(true, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    mount_player_with(&rig, PRIVATE, PREMIUM).await;
+    let err = rig.api.player("FAKEVID0001", 20000).await.unwrap_err();
+    assert_eq!(err.code(), "stream_failed", "{err}");
+    assert_eq!(hook.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_renewed_session_still_bot_checked_fails_after_one_more_try() {
+    let hook = Hook::new(true, Duration::ZERO);
+    let rig = rig(Some((hook.clone(), Duration::from_secs(600)))).await;
+    mount_player_with(&rig, BOT_CHECK, BOT_CHECK).await;
+    let err = rig.api.player("FAKEVID0001", 20000).await.unwrap_err();
+    assert_eq!(err.code(), "stream_failed", "{err}");
+    assert_eq!(hook.calls(), 1);
+    let sent = rig.server.received_requests().await.unwrap();
+    assert_eq!(
+        sent.len(),
+        2,
+        "the first request and one more with the new session"
+    );
 }
